@@ -302,6 +302,10 @@ pub(crate) fn detect_api_changes(
     let (removed_kept, removed_dead) =
         partition_removed_dead_candidates(dir, removed, &ambiguous_relation_keys);
 
+    // cfg の相補的な 2 分岐は公開名として 1 件。同一ファイルの新規候補だけを
+    // move 照合が終わった後に畳み、シグネチャ別の対応付け材料は保持する。
+    let added = collapse_exclusive_rust_const_additions(dir, added);
+
     // api.add に確定した候補にだけ同一ファイル内参照数を添える。move 相殺 (`moved`) で
     // 抜けた候補には算出しないよう、reconcile 後のこの位置で 1 度だけ数える
     // (Issue 2026-08-04-review-add-scope-naming)。参照集合は既に構築済みの ref_index から
@@ -338,6 +342,50 @@ pub(crate) fn detect_api_changes(
         callback_body_changes: buckets.callback_body_changes,
         compatible_modified: buckets.compatible_modified,
     }
+}
+
+fn collapse_exclusive_rust_const_additions(
+    dir: &str,
+    added: Vec<ApiSymbolCandidate>,
+) -> Vec<ApiSymbolCandidate> {
+    use std::collections::HashMap;
+
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    for candidate in &added {
+        if candidate.kind == "constant" && candidate.file.ends_with(".rs") {
+            *counts
+                .entry((candidate.file.clone(), candidate.name.clone()))
+                .or_default() += 1;
+        }
+    }
+
+    let mut cache: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut seen = HashSet::new();
+    added
+        .into_iter()
+        .filter(|candidate| {
+            let key = (candidate.file.clone(), candidate.name.clone());
+            if counts.get(&key).copied().unwrap_or(0) != 2 {
+                return true;
+            }
+            let equivalent_names = cache.entry(candidate.file.clone()).or_insert_with(|| {
+                let full_path = std::path::Path::new(dir).join(&candidate.file);
+                let Some(path) = full_path.to_str() else {
+                    return HashSet::new();
+                };
+                let path = camino::Utf8Path::new(path);
+                let Ok(source) = parser::read_file(path) else {
+                    return HashSet::new();
+                };
+                let Ok((tree, crate::language::LangId::Rust)) = parser::parse_file(path, &source)
+                else {
+                    return HashSet::new();
+                };
+                crate::engine::rust_cfg::exclusive_const_names(tree.root_node(), &source)
+            });
+            !equivalent_names.contains(&candidate.name) || seen.insert(key)
+        })
+        .collect()
 }
 
 /// `(name, kind, signature)` — 削除側と追加側を突き合わせる対応付けキー。

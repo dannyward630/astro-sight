@@ -177,7 +177,13 @@ impl RouteDecisionContext<'_> {
                 .reexport_moves
                 .covers(self.path_str, symbol_name, &file_context.new_path);
 
-        let route_informational = fn_value_informational
+        // old/new のフルソース AST で透過的な root type alias 導入だけと証明できた
+        // シグネチャ変更は、caller を消さず informational に残す。
+        let transparent_alias_informational =
+            file_context.compatible_signature_keys.contains(symbol_name);
+
+        let route_informational = transparent_alias_informational
+            || fn_value_informational
             || reexport_move_informational
             || (event.is_import
                 && !(event.unproven_module_ref
@@ -725,6 +731,7 @@ mod tests {
             rust_function_names: super::super::rust_function_names(LangId::Rust, &affected),
             affected,
             sig_changes,
+            compatible_signature_keys: Default::default(),
             hunks: Vec::new(),
             call_edges: Vec::new(),
             cross_file_symbol_keys: Default::default(),
@@ -840,6 +847,16 @@ mod tests {
         assert_eq!(
             decide_route(&function_value, &changed_arity, false),
             CallerRoute::Normal
+        );
+
+        let mut transparent_alias = file_context(Vec::new(), Vec::new());
+        transparent_alias
+            .compatible_signature_keys
+            .insert("target".to_string());
+        assert_eq!(
+            decide_route(&ev(0, 0), &transparent_alias, true),
+            CallerRoute::Informational,
+            "証明済み alias 導入は low/high より優先して informational に残す"
         );
     }
 }

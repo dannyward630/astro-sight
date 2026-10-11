@@ -1110,9 +1110,5 @@ pub(crate) fn collect_parameter_object_pattern_ranges(
 /// signature bytes を whitespace で分割して 1 つの space で結合し正規化する。
 /// 改行・タブ・連続スペース・末尾の `{` 直前空白を一括で潰す。
 pub(crate) fn normalize_signature_whitespace(bytes: &[u8]) -> String {
-    std::str::from_utf8(bytes)
-        .unwrap_or("")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    crate::engine::normalize_whitespace(bytes)
 }

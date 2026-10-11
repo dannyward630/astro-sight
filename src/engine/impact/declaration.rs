@@ -13,7 +13,7 @@
 //! の宣言のヘッダをトークン列で比較する。行ベースの検出が結論を出せる場合 (1 行の
 //! ヘッダで変更前後の行が揃っている) はそちらを優先し、ここは補完に徹する。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tree_sitter::Node;
 
@@ -331,6 +331,7 @@ pub(super) struct DeclarationChangeInput<'a> {
     pub(super) source: &'a [u8],
     pub(super) lang_id: LangId,
     pub(super) facts: &'a diff::ChangedLineFacts,
+    pub(super) reexport_moves: &'a super::ReexportMoveIndex,
 }
 
 /// 復元した変更前ソースの解析結果。
@@ -379,6 +380,88 @@ fn same_identity(a: &Symbol, b: &Symbol) -> bool {
     a.name == b.name && a.kind == b.kind && a.container == b.container
 }
 
+/// ファイル直下の旧側 use が束縛する名前を一度だけ索引化する。
+/// glob や未知の use tree があれば追加判定を保留する。
+fn collect_old_rust_use_bindings(
+    root: Node<'_>,
+    source: &[u8],
+    names: &mut HashSet<String>,
+    uncertain: &mut bool,
+) {
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() == "use_declaration" {
+            if let Some(argument) = child.child_by_field_name("argument") {
+                collect_rust_use_tree_bindings(argument, source, names, uncertain);
+            } else {
+                *uncertain = true;
+            }
+        }
+    }
+}
+
+/// 入れ子の module / impl 内の宣言は旧側の束縛スコープを確定できないため保留する。
+pub(super) fn is_rust_file_root_symbol(root: Node<'_>, symbol: &Symbol) -> bool {
+    let start = tree_sitter::Point::new(symbol.range.start.line, symbol.range.start.column);
+    let Some(mut node) = root.named_descendant_for_point_range(start, start) else {
+        return false;
+    };
+    while let Some(parent) = node.parent() {
+        if parent.id() == root.id() {
+            return node.start_position() == start;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn collect_rust_use_tree_bindings(
+    node: Node<'_>,
+    source: &[u8],
+    names: &mut HashSet<String>,
+    uncertain: &mut bool,
+) {
+    match node.kind() {
+        "identifier" => match node.utf8_text(source) {
+            Ok(name) => {
+                names.insert(name.to_string());
+            }
+            Err(_) => *uncertain = true,
+        },
+        "scoped_identifier" => {
+            if let Some(leaf) = node.child_by_field_name("name") {
+                collect_rust_use_tree_bindings(leaf, source, names, uncertain);
+            } else {
+                *uncertain = true;
+            }
+        }
+        "use_as_clause" => {
+            let mut cursor = node.walk();
+            if let Some(alias) = node.named_children(&mut cursor).last() {
+                collect_rust_use_tree_bindings(alias, source, names, uncertain);
+            } else {
+                *uncertain = true;
+            }
+        }
+        "scoped_use_list" => {
+            if let Some(list) = node.child_by_field_name("list") {
+                collect_rust_use_tree_bindings(list, source, names, uncertain);
+            } else {
+                *uncertain = true;
+            }
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_rust_use_tree_bindings(child, source, names, uncertain);
+            }
+        }
+        "use_wildcard" => *uncertain = true,
+        // `self` は親モジュール名を束縛するが、ここでは名前を解決しない。
+        _ => *uncertain = true,
+    }
+}
+
 impl OldSide {
     /// `symbol` と同じ識別を持つ変更前の宣言ヘッダ。
     fn counterpart_headers(&self, symbol: &Symbol, lang_id: LangId) -> Vec<DeclarationHeader> {
@@ -420,6 +503,118 @@ impl OldSide {
 pub(super) struct DeclarationProof {
     pub(super) rust_function_names: HashSet<String>,
     pub(super) rust_kind_changes: HashSet<String>,
+    pub(super) rust_alias_changes: HashSet<String>,
+}
+
+/// モジュール直下の type alias だけを対象にする。trait / impl の関連型は同じ
+/// `type_item` でも名前の所属先が異なり、名前だけの cross-file 探索に流さない。
+pub(super) fn rust_module_alias<'a>(root: Node<'a>, symbol: &Symbol) -> Option<Node<'a>> {
+    if symbol.kind != SymbolKind::Type {
+        return None;
+    }
+    let start = tree_sitter::Point::new(symbol.range.start.line, symbol.range.start.column);
+    let end = tree_sitter::Point::new(symbol.range.end.line, symbol.range.end.column);
+    let node = root.descendant_for_point_range(start, end)?;
+    if node.kind() != "type_item" || node.has_error() {
+        return None;
+    }
+    let parent = node.parent()?;
+    if parent.kind() == "source_file"
+        || (parent.kind() == "declaration_list"
+            && parent
+                .parent()
+                .is_some_and(|grandparent| grandparent.kind() == "mod_item"))
+    {
+        Some(node)
+    } else {
+        None
+    }
+}
+
+fn rust_alias_tokens(node: Node<'_>, source: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if node.has_error() {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    let mut cursor = node.walk();
+    let mut descend = true;
+    loop {
+        let current = cursor.node();
+        if !current.is_extra() && current.child_count() == 0 {
+            tokens.push(source.get(current.byte_range())?.to_vec());
+        }
+        if descend && !current.is_extra() && cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            descend = true;
+            continue;
+        }
+        if !cursor.goto_parent() || cursor.node().id() == node.id() {
+            break;
+        }
+        descend = false;
+    }
+    Some(tokens)
+}
+
+fn rust_modified_alias_names(
+    input: &DeclarationChangeInput<'_>,
+    affected: &[AffectedSymbol],
+    old_side: &mut LazyOldSide,
+) -> HashSet<String> {
+    let candidates: Vec<_> = input
+        .syms
+        .iter()
+        .filter(|symbol| {
+            affected.iter().any(|change| {
+                change.name == symbol.name
+                    && change.kind == "type"
+                    && change.change_type == "modified"
+            }) && rust_module_alias(input.root, symbol).is_some()
+        })
+        .collect();
+    if candidates.is_empty() {
+        return HashSet::new();
+    }
+    let old = old_side.get(input);
+    let mut changed = HashSet::new();
+    for symbol in candidates {
+        let name = &symbol.name;
+        let same = old.is_some_and(|old| {
+            if old.tree.root_node().has_error() {
+                return false;
+            }
+            let new_aliases: Vec<_> = input
+                .syms
+                .iter()
+                .filter(|candidate| {
+                    candidate.name == *name && rust_module_alias(input.root, candidate).is_some()
+                })
+                .collect();
+            let old_aliases: Vec<_> = old
+                .symbols
+                .iter()
+                .filter(|candidate| {
+                    candidate.name == *name
+                        && rust_module_alias(old.tree.root_node(), candidate).is_some()
+                })
+                .collect();
+            if new_aliases.len() != 1 || old_aliases.len() != 1 {
+                return false;
+            }
+            let new_node = rust_module_alias(input.root, new_aliases[0]);
+            let old_node = rust_module_alias(old.tree.root_node(), old_aliases[0]);
+            new_node
+                .and_then(|node| rust_alias_tokens(node, input.source))
+                .zip(old_node.and_then(|node| rust_alias_tokens(node, &old.source)))
+                .is_some_and(|(new_tokens, old_tokens)| new_tokens == old_tokens)
+        });
+        if !same {
+            changed.insert(name.clone());
+        }
+    }
+    changed
 }
 
 /// 行ベースのシグネチャ検出を AST の宣言ヘッダ比較で補う。
@@ -441,6 +636,66 @@ pub(super) fn reconcile_declaration_changes(
 ) -> DeclarationProof {
     let file_has_removed_lines = !input.facts.deletion_gaps.is_empty();
     let mut old_side = LazyOldSide::Pending;
+    // 混在 hunk 内の新規宣言は行だけでは modified になる。旧側の同名宣言と
+    // diff 全体の削除名が無いと証明できる場合に限り added へ戻す。
+    // 同名複数・復元失敗では AffectedSymbol を位置へ一意に対応付けられない。
+    if input.lang_id == LangId::Rust && file_has_removed_lines && !input.root.has_error() {
+        let mut new_by_key: HashMap<(&str, &str), Option<&Symbol>> = HashMap::new();
+        for symbol in input.syms {
+            new_by_key
+                .entry((&symbol.name, super::symbol_kind_str(symbol.kind)))
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(symbol));
+        }
+        let candidates: Vec<(usize, &Symbol)> = affected
+            .iter()
+            .enumerate()
+            .filter(|(_, change)| change.change_type == "modified")
+            .filter_map(|(index, change)| {
+                new_by_key
+                    .get(&(change.name.as_str(), change.kind.as_str()))
+                    .and_then(|symbol| *symbol)
+                    .filter(|symbol| {
+                        is_rust_file_root_symbol(input.root, symbol)
+                            && super::symbol_lines_all_added(
+                                symbol.range.start.line,
+                                symbol.range.end.line,
+                                &input.facts.added_lines,
+                            )
+                    })
+                    .map(|symbol| (index, symbol))
+            })
+            .collect();
+        if !candidates.is_empty()
+            && let Some(old) = old_side.get(input)
+            && !old.tree.root_node().has_error()
+        {
+            let old_names: HashSet<&str> = old
+                .symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect();
+            let mut old_use_names = HashSet::new();
+            let mut old_use_uncertain = false;
+            collect_old_rust_use_bindings(
+                old.tree.root_node(),
+                &old.source,
+                &mut old_use_names,
+                &mut old_use_uncertain,
+            );
+            for (index, symbol) in candidates {
+                if !old_names.contains(symbol.name.as_str())
+                    && !input
+                        .reexport_moves
+                        .might_have_removed_identity(&symbol.name)
+                    && !old_use_uncertain
+                    && !old_use_names.contains(&symbol.name)
+                {
+                    affected[index].change_type = "added".to_string();
+                }
+            }
+        }
+    }
     // 行ベースの検出が変更前後のシグネチャ行を揃えられたかを判定するための変更行。
     let mut changed_line_texts: Option<(Vec<String>, Vec<String>)> = None;
 
@@ -555,6 +810,9 @@ pub(super) fn reconcile_declaration_changes(
         }
     }
     let mut proof = DeclarationProof::default();
+    if input.lang_id == LangId::Rust {
+        proof.rust_alias_changes = rust_modified_alias_names(input, affected, &mut old_side);
+    }
     if input.lang_id != LangId::Rust || affected.is_empty() || input.root.has_error() {
         return proof;
     }
@@ -566,11 +824,16 @@ pub(super) fn reconcile_declaration_changes(
     }
     let mut old_kinds = std::collections::HashMap::<&str, Vec<SymbolKind>>::new();
     let mut new_kinds = std::collections::HashMap::<&str, Vec<SymbolKind>>::new();
-    for (symbols, kinds) in [
-        (&old.symbols[..], &mut old_kinds),
-        (input.syms, &mut new_kinds),
+    for (symbols, root, kinds) in [
+        (&old.symbols[..], old.tree.root_node(), &mut old_kinds),
+        (input.syms, input.root, &mut new_kinds),
     ] {
         for symbol in symbols {
+            // impl owner は container 解決用の合成 Type で、宣言の種類ではない。
+            // 旧新の両側で除外し、型エイリアス等の実際の種類変更を隠さない。
+            if super::rust_impl_owner::is_impl_owner(root, symbol) {
+                continue;
+            }
             let entry = kinds.entry(symbol.name.as_str()).or_default();
             let category = match symbol.kind {
                 SymbolKind::Function | SymbolKind::Method => SymbolKind::Function,
@@ -620,6 +883,125 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rust_module_alias_excludes_impl_associated_type() {
+        let source = b"pub trait T { type Item; }\npub struct X;\nimpl T for X { type Item = u32; }\npub type Alias = u8;\n";
+        let tree = parser::parse_source(source, LangId::Rust).unwrap();
+        let root = tree.root_node();
+        let syms = symbols::extract_symbols(root, source, LangId::Rust).unwrap();
+        let associated = syms.iter().find(|symbol| symbol.name == "Item").unwrap();
+        let alias = syms.iter().find(|symbol| symbol.name == "Alias").unwrap();
+        assert!(rust_module_alias(root, associated).is_none());
+        assert!(rust_module_alias(root, alias).is_some());
+    }
+
+    #[test]
+    fn mixed_hunk_new_declarations_are_added_when_old_tree_has_no_identity() {
+        let old = "pub fn stable() -> u8 { 1 }\npub fn changed() -> u8 { 1 }\n";
+        let new = "pub fn stable() -> u8 { 1 }\npub struct NewState;\npub const NEW_VALUE: u8 = 3;\npub fn fresh() -> u8 { 3 }\npub fn changed() -> u8 { 2 }\n";
+        let (before, _) = run_pass1(LangId::Rust, "api.rs", old, new, false);
+        assert_eq!(change_type_of(&before, "fresh"), Some("modified"));
+
+        let (after, _) = run_pass1(LangId::Rust, "api.rs", old, new, true);
+        for name in ["NewState", "NEW_VALUE", "fresh"] {
+            assert_eq!(change_type_of(&after, name), Some("added"), "{name}");
+        }
+        assert_eq!(change_type_of(&after, "changed"), Some("modified"));
+        assert_eq!(change_type_of(&after, "stable"), None);
+
+        let old_with_test_glob = "pub fn changed() -> u8 { 1 }\nmod tests { use super::*; }\n";
+        let new_with_test_glob =
+            "pub struct NewState;\npub fn changed() -> u8 { 2 }\nmod tests { use super::*; }\n";
+        let (with_test_glob, _) = run_pass1(
+            LangId::Rust,
+            "api.rs",
+            old_with_test_glob,
+            new_with_test_glob,
+            true,
+        );
+        assert_eq!(change_type_of(&with_test_glob, "NewState"), Some("added"));
+
+        // 同名の宣言が移動しただけなら、追加行だけでは新規 API と証明できない。
+        let moved = "pub fn changed() -> u8 { 2 }\npub fn stable() -> u8 { 1 }\n";
+        let (after_move, _) = run_pass1(LangId::Rust, "api.rs", old, moved, true);
+        assert_ne!(change_type_of(&after_move, "changed"), Some("added"));
+
+        // 行番号は 0 始まり。空行の後に増えた root 宣言も、旧側に同名が無ければ added。
+        let old_after_blank = "pub fn stable() -> u8 { 1 }\n\npub fn changed() -> u8 { 1 }\n";
+        let new_after_blank =
+            "pub fn stable() -> u8 { 1 }\n\npub struct Fresh;\npub fn changed() -> u8 { 2 }\n";
+        let (after_blank, _) = run_pass1(
+            LangId::Rust,
+            "api.rs",
+            old_after_blank,
+            new_after_blank,
+            true,
+        );
+        assert_eq!(change_type_of(&after_blank, "Fresh"), Some("added"));
+    }
+
+    #[test]
+    fn removed_use_or_definition_keeps_new_declaration_modified() {
+        let new = "pub struct Shape(pub String);\npub fn changed() -> u8 { 2 }\n";
+        for old in [
+            "pub use crate::inner::Shape;\npub fn changed() -> u8 { 1 }\n",
+            "pub use crate::inner::*;\npub fn changed() -> u8 { 1 }\n",
+            "pub use crate::inner::Other as Shape;\npub fn changed() -> u8 { 1 }\n",
+            "pub use crate::inner::{\n    Other,\n    Shape,\n};\npub fn changed() -> u8 { 1 }\n",
+        ] {
+            let (affected, _) = run_pass1(LangId::Rust, "api.rs", old, new, true);
+            assert_eq!(
+                change_type_of(&affected, "Shape"),
+                Some("modified"),
+                "{old}"
+            );
+        }
+
+        let old = "pub use crate::inner::*;\npub fn changed() -> u8 { 1 }\n";
+        let new_with_glob = format!("pub use crate::inner::*;\n{new}");
+        let (affected, _) = run_pass1(LangId::Rust, "api.rs", old, &new_with_glob, true);
+        assert_eq!(change_type_of(&affected, "Shape"), Some("modified"));
+
+        let old = "pub fn changed() -> u8 { 1 }\n";
+        let other = unified_diff("other.rs", "pub struct Shape;\n", "");
+        let (affected, _) =
+            run_pass1_with_extra_diff(LangId::Rust, "api.rs", old, new, true, &other);
+        assert_eq!(change_type_of(&affected, "Shape"), Some("modified"));
+
+        for old_other in [
+            "pub struct A; pub struct Shape;\n",
+            "pub struct\n    Shape;\n",
+            "pub mod m { pub struct Shape(pub u8); }\n",
+        ] {
+            let other = unified_diff("other.rs", old_other, "");
+            let (affected, _) =
+                run_pass1_with_extra_diff(LangId::Rust, "api.rs", old, new, true, &other);
+            assert_eq!(
+                change_type_of(&affected, "Shape"),
+                Some("modified"),
+                "{old_other}"
+            );
+        }
+
+        let other = unified_diff(
+            "other.rs",
+            "pub use crate::inner::{\n    Other,\n    Shape,\n};\n",
+            "pub use crate::inner::{\n    Other,\n};\n",
+        );
+        let (affected, _) =
+            run_pass1_with_extra_diff(LangId::Rust, "api.rs", old, new, true, &other);
+        assert_eq!(change_type_of(&affected, "Shape"), Some("modified"));
+
+        let other = unified_diff(
+            "other.rs",
+            "pub use crate::{\n    inner::Other,\n    inner::Shape,\n};\n",
+            "pub use crate::{\n    inner::Other,\n};\n",
+        );
+        let (affected, _) =
+            run_pass1_with_extra_diff(LangId::Rust, "api.rs", old, new, true, &other);
+        assert_eq!(change_type_of(&affected, "Shape"), Some("modified"));
+    }
+
+    #[test]
     fn rust_scope_old_kind_proof_requires_both_sides_and_valid_reconstruction() {
         let proof = |old: &str, new: &str, mismatched_diff: bool| {
             let diff_text = unified_diff(
@@ -642,6 +1024,7 @@ mod tests {
                 }
             }
             let facts = diff::extract_changed_line_facts(&diff_text, "api.rs");
+            let reexport_moves = super::super::ReexportMoveIndex::build(&diff_text);
             let mut affected = super::super::find_affected_symbols(&syms, &hunks, Some(&facts));
             let mut sig_changes = Vec::new();
             reconcile_declaration_changes(
@@ -654,6 +1037,7 @@ mod tests {
                     source: new.as_bytes(),
                     lang_id: LangId::Rust,
                     facts: &facts,
+                    reexport_moves: &reexport_moves,
                 },
                 &mut affected,
                 &mut sig_changes,
@@ -815,6 +1199,17 @@ mod tests {
         new: &str,
         reconcile: bool,
     ) -> (Vec<AffectedSymbol>, Vec<SignatureChange>) {
+        run_pass1_with_extra_diff(lang_id, path, old, new, reconcile, "")
+    }
+
+    fn run_pass1_with_extra_diff(
+        lang_id: LangId,
+        path: &str,
+        old: &str,
+        new: &str,
+        reconcile: bool,
+        extra_diff: &str,
+    ) -> (Vec<AffectedSymbol>, Vec<SignatureChange>) {
         let diff_text = unified_diff(path, old, new);
         let hunks = diff::parse_unified_diff(&diff_text)
             .into_iter()
@@ -825,6 +1220,8 @@ mod tests {
         let root = tree.root_node();
         let syms = symbols::extract_symbols(root, new.as_bytes(), lang_id).expect("syms");
         let facts = diff::extract_changed_line_facts(&diff_text, path);
+        let reexport_moves =
+            super::super::ReexportMoveIndex::build(&format!("{diff_text}{extra_diff}"));
         let mut affected = super::super::find_affected_symbols(&syms, &hunks, Some(&facts));
         let mut sig_changes =
             super::super::signature::detect_signature_changes(&diff_text, path, &affected, lang_id);
@@ -839,6 +1236,7 @@ mod tests {
                     source: new.as_bytes(),
                     lang_id,
                     facts: &facts,
+                    reexport_moves: &reexport_moves,
                 },
                 &mut affected,
                 &mut sig_changes,

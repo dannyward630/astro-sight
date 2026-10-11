@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::engine::diff::{HunkBodyLine, HunkProgress, parse_hunk_header, strip_header_path};
 use crate::language::{LangId, normalize_identifier};
 use crate::models::impact::{AffectedSymbol, SignatureChange};
@@ -34,6 +36,44 @@ pub(crate) fn detect_signature_changes(
     }
 
     changes
+}
+
+/// 宣言比較を含めて確定したシグネチャ差分のうち、追加された公開 type alias の
+/// 透過的な展開だけで実体型が同じと証明できる Rust 関数名。
+pub(crate) fn compatible_rust_alias_signature_names(
+    diff_input: &str,
+    file_path: &str,
+    new_root: tree_sitter::Node<'_>,
+    new_source: &[u8],
+    affected: &[AffectedSymbol],
+    signatures: &[SignatureChange],
+) -> HashSet<String> {
+    if signatures.is_empty() {
+        return HashSet::new();
+    }
+    let Some(prepared) = crate::engine::rust_signature::RustTypeAliasEquivalence::prepare_new_tree(
+        new_root, new_source,
+    ) else {
+        return HashSet::new();
+    };
+    let Some(old_source) =
+        crate::engine::diff::reconstruct_old_source(diff_input, file_path, new_source)
+    else {
+        return HashSet::new();
+    };
+    let Some(context) = prepared.with_old_source(&old_source.source) else {
+        return HashSet::new();
+    };
+    signatures
+        .iter()
+        .filter(|change| {
+            affected
+                .iter()
+                .any(|symbol| symbol.name == change.name && symbol.kind == "function")
+                && context.prove_function(&change.name)
+        })
+        .map(|change| change.name.clone())
+        .collect()
 }
 
 /// 対象ファイルの削除行 (`-`) と追加行 (`+`) の本文を出現順に集める。

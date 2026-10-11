@@ -50,6 +50,8 @@ Output:
 }
 ```
 
+For Rust, `affected_symbols[].kind` is `impl` when an impl header changes, an impl without methods is added, or deleted lines may include a method declaration. Adding a method without deleting lines reports the method without reporting its owning type as changed. Edits with deleted lines keep the `impl` record because a removed method cannot be ruled out from the new tree alone. An attribute-only change also keeps the `impl` record because the method symbol does not include attributes. The `symbols` command still includes the impl owner for method ownership.
+
 Callers fall into 3 groups by confidence and by how breaking they are. "Blocking" here means a finding that makes `impact` or `review --hook` return exit 1.
 
 - `impacted_callers`: actual call sites. Those left outside the diff are blocking for `impact`. References to symbols whose number of arguments changed, and references that cannot be decided, also stay here

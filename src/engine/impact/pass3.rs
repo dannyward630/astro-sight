@@ -76,7 +76,7 @@ pub(super) fn build_file_impact(
     ctx: FileContext,
     mut caller_map: CallerMap,
     low_caller_map: CallerMap,
-    informational_caller_map: CallerMap,
+    mut informational_caller_map: CallerMap,
 ) -> FileImpact {
     // 同一ファイル内の call_edges をマージ
     for sym in &ctx.affected {
@@ -90,7 +90,12 @@ pub(super) fn build_file_impact(
                     .any(|a| ci_key(ctx.lang_id, &a.name) == ci_key(ctx.lang_id, &edge.caller.name))
                 {
                     let key = (ctx.new_path.clone(), caller_line);
-                    let entry = caller_map
+                    let target_map = if ctx.compatible_signature_keys.contains(&sym_key) {
+                        &mut informational_caller_map
+                    } else {
+                        &mut caller_map
+                    };
+                    let entry = target_map
                         .entry(key)
                         .or_insert_with(|| (edge.caller.name.clone(), Vec::new()));
                     if !entry.1.contains(&sym.name) {
@@ -214,6 +219,7 @@ mod tests {
             lang_id: LangId::Php,
             affected: Vec::new(),
             sig_changes: Vec::new(),
+            compatible_signature_keys: std::collections::HashSet::new(),
             hunks: Vec::new(),
             call_edges: Vec::new(),
             cross_file_symbol_keys: std::collections::HashSet::new(),

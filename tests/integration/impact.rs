@@ -361,6 +361,334 @@ fn impact_python_signature_reformat_keeps_real_changes() {
 }
 
 #[test]
+fn impact_rust_type_alias_rhs_change_blocks_cross_file_callers() {
+    for visibility in ["", "pub(crate) ", "pub "] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "src/lib.rs",
+            format!("mod consumer;\n\n{visibility}type Id = u32;\n"),
+        );
+        repo.write(
+            "src/consumer.rs",
+            "use crate::Id;\npub fn read() -> Id { 1_u32 }\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/lib.rs",
+            format!("mod consumer;\n\n{visibility}type Id = u64;\n"),
+        );
+
+        let context = repo.run_json("context", &["--git"]);
+        let change = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == "src/lib.rs")
+            .expect("alias change should be visible");
+        assert!(
+            change["impacted_callers"]
+                .as_array()
+                .is_some_and(|callers| callers.iter().any(|caller| {
+                    caller["path"] == "src/consumer.rs"
+                        && caller["symbols"]
+                            .as_array()
+                            .is_some_and(|names| names.iter().any(|name| name == "Id"))
+                })),
+            "{visibility}: {context}"
+        );
+
+        for command in ["impact", "review"] {
+            let output = cargo_bin()
+                .args([
+                    command,
+                    "--dir",
+                    repo.root().to_str().unwrap(),
+                    "--git",
+                    "--hook",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{visibility} {command}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        repo.write(
+            "src/consumer.rs",
+            "use crate::Id;\npub fn read() -> Id { 1_u64 }\n",
+        );
+        let output = cargo_bin()
+            .args([
+                "impact",
+                "--dir",
+                repo.root().to_str().unwrap(),
+                "--git",
+                "--hook",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{visibility}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn impact_rust_type_alias_requires_a_contract_change() {
+    for (old, new, blocking) in [
+        (
+            "pub type Id = u32; // old\n",
+            "pub type Id = u32; // new\n",
+            false,
+        ),
+        (
+            "pub type Id =\n    u32;\n",
+            "pub type Id =\n    u64;\n",
+            true,
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write("src/lib.rs", format!("mod consumer;\n{old}"));
+        repo.write(
+            "src/consumer.rs",
+            "use crate::Id;\npub fn read() -> Id { 1_u32 }\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("src/lib.rs", format!("mod consumer;\n{new}"));
+
+        let context = repo.run_json("context", &["--git"]);
+        let impacted = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == "src/lib.rs")
+            .and_then(|change| change["impacted_callers"].as_array())
+            .is_some_and(|callers| {
+                callers
+                    .iter()
+                    .any(|caller| caller["path"] == "src/consumer.rs")
+            });
+        assert_eq!(impacted, blocking, "{context}");
+        let output = cargo_bin()
+            .args([
+                "impact",
+                "--dir",
+                repo.root().to_str().unwrap(),
+                "--git",
+                "--hook",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(blocking)),
+            "{context}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn impact_suppresses_only_proven_rust_type_alias_equivalence() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "src/lib.rs",
+        "pub mod consumer;\n\npub fn collect() -> Vec<(u64, String)> { vec![] }\npub fn changed() -> Vec<(u64, String)> { vec![] }\npub fn local() { let _ = collect(); }\n",
+    );
+    repo.write(
+        "src/consumer.rs",
+        "use crate::{changed, collect};\n\npub fn run() {\n    let _ = collect();\n    let _ = changed();\n}\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+
+    repo.write(
+        "src/lib.rs",
+        "pub mod consumer;\n\npub type Entry = (u64, String);\npub type ChangedEntry = (u32, String);\n\npub fn collect() -> Vec<Entry> { vec![] }\npub fn changed() -> Vec<ChangedEntry> { vec![] }\npub fn local() { let _ = collect(); }\n",
+    );
+    let output = cargo_bin()
+        .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run alias impact");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "異なる alias RHS の対照ケースは unresolved impact を維持すべき"
+    );
+    let source_header = stderr
+        .lines()
+        .find(|line| line.starts_with("src/lib.rs changed ["))
+        .expect("changed source header should be present");
+    assert_eq!(
+        source_header, "src/lib.rs changed [changed]:",
+        "同値 alias の collect を source header に混ぜるべきでない: {stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains("src/consumer.rs:5 [changed]")),
+        "異なる型契約の caller は報告すべき: {stderr}"
+    );
+
+    let diff_output = Command::new("git")
+        .args(["diff", "--no-ext-diff"])
+        .current_dir(repo.root())
+        .output()
+        .expect("git diff should run");
+    assert!(diff_output.status.success());
+    let diff = String::from_utf8(diff_output.stdout).expect("git diff should be utf-8");
+    let result = astro_sight::service::AppService::new()
+        .analyze_context(
+            &diff,
+            repo.root().to_str().expect("utf-8 path"),
+            &astro_sight::models::impact::ContextAnalysisOptions::default(),
+        )
+        .expect("context analysis should succeed");
+    let change = result
+        .changes
+        .iter()
+        .find(|change| change.path == "src/lib.rs")
+        .expect("lib.rs impact should remain visible");
+    assert!(
+        change
+            .signature_changes
+            .iter()
+            .any(|signature| signature.name == "collect"),
+        "証明済み alias 導入も signature change の痕跡を残すべき"
+    );
+    assert!(
+        change.informational_callers.iter().any(|caller| {
+            caller.path.ends_with("src/consumer.rs")
+                && caller.symbols == vec!["collect".to_string()]
+        }),
+        "証明済み alias 導入の caller は informational に残すべき: {:?}",
+        change.informational_callers
+    );
+    assert!(
+        change.informational_callers.iter().any(|caller| {
+            caller.path == "src/lib.rs" && caller.symbols == vec!["collect".to_string()]
+        }),
+        "同一ファイル内 caller も消さず informational に残すべき: {:?}",
+        change.informational_callers
+    );
+    assert!(
+        change
+            .impacted_callers
+            .iter()
+            .all(|caller| !caller.symbols.contains(&"collect".to_string())),
+        "証明済み alias 導入は blocking caller に残すべきでない: {:?}",
+        change.impacted_callers
+    );
+}
+
+#[test]
+fn impact_rust_alias_equivalence_fails_closed_for_rebound_prelude_name() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "src/lib.rs",
+        "pub mod consumer;\npub struct SA; pub struct SB;\nuse crate::SA as String;\npub fn collect() -> (u64, String) { unimplemented!() }\n",
+    );
+    repo.write(
+        "src/consumer.rs",
+        "use crate::collect;\npub fn run() { let _ = collect(); }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/lib.rs",
+        "pub mod consumer;\npub struct SA; pub struct SB;\nuse crate::SB as String;\npub type Entry = (u64, String);\npub fn collect() -> Entry { unimplemented!() }\n",
+    );
+
+    let output = cargo_bin()
+        .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run rebound-name impact");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "String という字面が同じでも import が別型へ変われば blocking を維持すべき"
+    );
+    assert!(
+        stderr.contains("src/consumer.rs:2 [collect]"),
+        "破壊的な import 再束縛の caller を報告すべき: {stderr}"
+    );
+}
+
+#[test]
+fn impact_rust_alias_equivalence_requires_root_level_function() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "src/lib.rs",
+        "pub mod consumer;\npub struct ExtA; pub struct ExtB;\nuse crate::ExtA as Ext;\npub type Entry = (Ext, String);\npub mod inner { use crate::ExtB as Ext; pub fn collect() -> Vec<(Ext, String)> { vec![] } }\n",
+    );
+    repo.write(
+        "src/consumer.rs",
+        "pub fn run() { let _ = crate::inner::collect(); }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/lib.rs",
+        "pub mod consumer;\npub struct ExtA; pub struct ExtB;\nuse crate::ExtA as Ext;\npub type Entry = (Ext, String);\npub mod inner { use crate::ExtB as Ext; use super::Entry; pub fn collect() -> Vec<Entry> { vec![] } }\n",
+    );
+
+    let output = cargo_bin()
+        .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run nested-scope impact");
+    assert!(
+        !output.status.success(),
+        "nested function へ root alias の証明を流用せず blocking を維持すべき: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn impact_rust_alias_const_expression_keeps_callers_blocking() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "src/lib.rs",
+        "pub const fn size() -> usize { 4 }\npub fn collect() -> [u8; size()] { [0; size()] }\n",
+    );
+    repo.write(
+        "src/consumer.rs",
+        "pub fn run() { let _ = crate::collect(); }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/lib.rs",
+        "pub const fn size() -> usize { 8 }\npub type Entry = [u8; size()];\npub fn collect() -> Entry { [0; size()] }\n",
+    );
+
+    let output = cargo_bin()
+        .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run const-expression impact");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "caller must stay blocking");
+    assert!(
+        stderr.contains("src/consumer.rs:1 [collect]"),
+        "value-dependent alias must not suppress the caller: {stderr}"
+    );
+}
+
+#[test]
 fn impact_distinguishes_rust_binding_mut_from_type_mutability() {
     let repo = TestRepo::new();
     repo.create_dir_all("src");
@@ -3175,5 +3503,424 @@ fn review_hook_reexport_move_with_type_change_stays_blocking() {
         refs.iter()
             .any(|r| r["p"] == "src/game/consumer.rs" && r["ln"] == 8),
         "未変更の利用行が blocking 側に残るべき: {stderr}"
+    );
+}
+
+#[test]
+fn impact_removed_reexport_replaced_by_incompatible_type_stays_blocking() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "src/lib.rs",
+        "pub mod api;\npub mod inner;\npub mod user;\n",
+    );
+    repo.write("src/inner.rs", "pub struct Shape(pub u8);\n");
+    repo.write(
+        "src/api.rs",
+        "pub use crate::inner::Shape;\npub fn changed() -> u8 { 1 }\n",
+    );
+    repo.write(
+        "src/user.rs",
+        "use crate::api::Shape;\npub fn consume() -> Shape { Shape(1) }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/api.rs",
+        "pub struct Shape(pub String);\npub fn changed() -> u8 { 2 }\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == "src/api.rs")
+        .unwrap();
+    assert!(
+        change["affected_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "Shape" && symbol["change_type"] == "modified"),
+        "{context}"
+    );
+    assert!(
+        change["impacted_callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|caller| caller["path"] == "src/user.rs"),
+        "{context}"
+    );
+    let output = cargo_bin()
+        .args([
+            "impact",
+            "--dir",
+            repo.root().to_str().unwrap(),
+            "--git",
+            "--hook",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "破壊的な型置換は blocking であるべき: {context}"
+    );
+}
+
+#[test]
+fn impact_grouped_use_removal_and_unchanged_glob_stay_blocking() {
+    for (base_api, new_api) in [
+        (
+            "pub use crate::inner::{\n    Other,\n    Shape,\n};\npub fn changed() -> u8 { 1 }\n",
+            "pub use crate::inner::{\n    Other,\n};\npub struct Shape(pub String);\npub fn changed() -> u8 { 2 }\n",
+        ),
+        (
+            "pub use crate::inner::*;\npub fn changed() -> u8 { 1 }\n",
+            "pub use crate::inner::*;\npub struct Shape(pub String);\npub fn changed() -> u8 { 2 }\n",
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "src/lib.rs",
+            "pub mod api;\npub mod inner;\npub mod user;\n",
+        );
+        repo.write(
+            "src/inner.rs",
+            "pub struct Shape(pub u8);\npub struct Other;\n",
+        );
+        repo.write("src/api.rs", base_api);
+        repo.write(
+            "src/user.rs",
+            "use crate::api::Shape;\npub fn consume() -> Shape { Shape(1) }\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("src/api.rs", new_api);
+
+        let context = repo.run_json("context", &["--git"]);
+        let change = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == "src/api.rs")
+            .unwrap();
+        assert!(
+            change["affected_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol["name"] == "Shape" && symbol["change_type"] == "modified"),
+            "{context}"
+        );
+        let output = cargo_bin()
+            .args([
+                "impact",
+                "--dir",
+                repo.root().to_str().unwrap(),
+                "--git",
+                "--hook",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{context}");
+    }
+}
+
+#[test]
+fn impact_deleted_rust_file_keeps_moved_name_modified() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write("src/lib.rs", "pub mod api;\npub mod old;\npub mod user;\n");
+    repo.write("src/old.rs", "pub struct Shape(pub u8);\n");
+    repo.write("src/api.rs", "pub fn changed() -> u8 { 1 }\n");
+    repo.write(
+        "src/user.rs",
+        "use crate::old::Shape;\npub fn consume() -> Shape { Shape(1) }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    std::fs::remove_file(repo.root().join("src/old.rs")).unwrap();
+    repo.write(
+        "src/api.rs",
+        "pub struct Shape(pub String);\npub fn changed() -> u8 { 2 }\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == "src/api.rs")
+        .unwrap();
+    assert!(
+        change["affected_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "Shape" && symbol["change_type"] == "modified"),
+        "{context}"
+    );
+}
+
+#[test]
+fn complementary_rust_cfg_constants_have_one_public_record() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write("src/lib.rs", "pub fn baseline() {}\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/lib.rs",
+        "pub fn baseline() {}\n\
+         #[cfg(target_os = \"macos\")]\n\
+         pub const MESSAGE: &str = \"a\";\n\
+         #[cfg(not(target_os = \"macos\"))]\n\
+         pub const MESSAGE: &str = \"b\";\n\
+         #[cfg(feature = \"alternate\")]\n\
+         pub const DIFFERENT_TYPE: u8 = 1;\n\
+         #[cfg(not(feature = \"alternate\"))]\n\
+         pub const DIFFERENT_TYPE: u16 = 2;\n\
+         #[cfg(feature = \"one\")]\n\
+         const NESTED: u8 = 1;\n\
+         #[cfg(not(feature = \"one\"))]\n\
+         const NESTED: u8 = 2;\n\
+         pub mod first { pub const NESTED: u8 = 3; }\n\
+         pub mod second { pub const NESTED: u8 = 4; }\n",
+    );
+
+    let review = repo.run_json("review", &["--git"]);
+    let added = review["api_changes"]["added"].as_array().unwrap();
+    let affected = review["impact"]["changes"][0]["affected_symbols"]
+        .as_array()
+        .unwrap();
+    for (name, expected_api, expected_impact) in [
+        ("MESSAGE", 1, 1),
+        ("DIFFERENT_TYPE", 2, 2),
+        ("NESTED", 2, 4),
+    ] {
+        assert_eq!(
+            added.iter().filter(|symbol| symbol["name"] == name).count(),
+            expected_api,
+            "{review}"
+        );
+        assert_eq!(
+            affected
+                .iter()
+                .filter(|symbol| symbol["name"] == name)
+                .count(),
+            expected_impact,
+            "{review}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_impl_method_additions_do_not_change_the_owner_type() {
+    let repo = TestRepo::new();
+    repo.write(
+        "lib.rs",
+        "pub struct Foo;\nimpl Foo {\n    pub fn stable(&self) {}\n}\n\n\
+         pub struct Bar;\n\n\
+         pub trait Contract { fn required(&self); }\n\n\
+         pub struct Holder<T>(pub T);\n\n\
+         pub fn other() -> u8 { 1 }\n",
+    );
+    repo.write(
+        "consumer.rs",
+        "use crate::Foo;\npub fn make() -> Foo { Foo }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "lib.rs",
+        "pub struct Foo;\nimpl Foo {\n    pub fn stable(&self) {}\n    /// A new operation.\n    #[inline]\n    pub fn fresh(&self) {}\n}\n\n\
+         pub struct Bar;\n\n\
+         impl Bar { pub fn bar_method(&self) {} }\n\n\
+         pub trait Contract { fn required(&self); }\n\n\
+         impl Contract for Bar { fn required(&self) {} }\n\n\
+         pub struct Holder<T>(pub T);\n\n\
+         impl<T> Holder<T> { pub fn generic_method(&self) {} }\n\n\
+         pub fn other() -> u8 { 1 }\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    let affected = context["changes"][0]["affected_symbols"]
+        .as_array()
+        .unwrap();
+    for owner in ["Foo", "Bar", "Holder"] {
+        assert!(
+            !affected.iter().any(|symbol| symbol["name"] == owner),
+            "{owner}: {context}"
+        );
+    }
+    for method in ["fresh", "bar_method", "required", "generic_method"] {
+        assert!(
+            affected
+                .iter()
+                .any(|symbol| { symbol["name"] == method && symbol["change_type"] == "added" }),
+            "{method}: {context}"
+        );
+    }
+
+    // impl 外に削除行を含む変更があっても、メソッド追加の owner は出さない。
+    let with_methods = std::fs::read_to_string(repo.root().join("lib.rs")).unwrap();
+    let with_other_change =
+        with_methods.replace("pub fn other() -> u8 { 1 }", "pub fn other() -> u8 { 2 }");
+    repo.write("lib.rs", &with_other_change);
+    let context = repo.run_json("context", &["--git"]);
+    let affected = context["changes"][0]["affected_symbols"]
+        .as_array()
+        .unwrap();
+    assert!(
+        !affected.iter().any(|symbol| symbol["name"] == "Foo"),
+        "{context}"
+    );
+    assert!(
+        affected
+            .iter()
+            .any(|symbol| { symbol["name"] == "other" && symbol["change_type"] == "modified" }),
+        "{context}"
+    );
+
+    // 型宣言自体を変えた場合は、その影響を残す。
+    repo.write(
+        "lib.rs",
+        with_other_change.replacen("pub struct Foo;", "pub struct Foo(pub u8);", 1),
+    );
+    let context = repo.run_json("context", &["--git"]);
+    let affected = context["changes"][0]["affected_symbols"]
+        .as_array()
+        .unwrap();
+    assert!(
+        affected.iter().any(|symbol| {
+            symbol["name"] == "Foo"
+                && symbol["kind"] == "struct"
+                && symbol["change_type"] == "modified"
+        }),
+        "{context}"
+    );
+    assert!(
+        !affected
+            .iter()
+            .any(|symbol| { symbol["name"] == "Foo" && symbol["kind"] == "type" }),
+        "{context}"
+    );
+    assert!(
+        context["changes"][0]["impacted_callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|caller| caller["path"] == "consumer.rs"),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_impl_header_and_method_removal_remain_visible_as_impl() {
+    for (before, after) in [
+        (
+            "pub struct Foo;\nimpl Foo {\n    pub fn first(&self) {}\n}\n",
+            "pub struct Foo;\nimpl Foo where Foo: Send {\n    pub fn first(&self) {}\n}\n",
+        ),
+        (
+            "pub struct Foo;\nimpl Foo {\n    pub fn first(&self) {}\n    pub fn second(&self) {}\n}\n",
+            "pub struct Foo;\nimpl Foo {\n    pub fn second(&self) {}\n}\n",
+        ),
+        (
+            "pub struct Foo;\nimpl Foo { pub fn first(&self) {} }\n",
+            "pub struct Foo;\nimpl Foo { pub fn first(&self) {} pub fn second(&self) {} }\n",
+        ),
+        (
+            "pub struct Foo;\nimpl Foo {\n    pub fn first(&self) {}\n}\n",
+            "pub struct Foo;\nimpl Foo {\n    #[cfg(feature = \"special\")]\n    pub fn first(&self) {}\n}\n",
+        ),
+        (
+            "pub struct Foo;\nimpl Foo {\n    /// Doc A\n    pub fn first(&self) {}\n    /// Doc B\n    pub fn second(&self) {}\n}\n",
+            "pub struct Foo;\nimpl Foo {\n    /// Doc A\n    /// Doc B\n    pub fn second(&self) {}\n}\n",
+        ),
+        (
+            "pub struct Foo;\nimpl Foo {\n    pub fn first(&self, value: u8) {}\n}\n",
+            "pub struct Foo;\nimpl Foo {\n    pub fn first(&self, value: u16) {}\n}\n",
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", before);
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("lib.rs", after);
+        let context = repo.run_json("context", &["--git"]);
+        let affected = context["changes"][0]["affected_symbols"]
+            .as_array()
+            .unwrap();
+        assert!(
+            affected.iter().any(|symbol| {
+                symbol["name"] == "Foo"
+                    && symbol["kind"] == "impl"
+                    && symbol["change_type"] == "modified"
+            }),
+            "{before} -> {after}: {context}"
+        );
+        assert!(
+            !affected
+                .iter()
+                .any(|symbol| { symbol["name"] == "Foo" && symbol["kind"] == "type" }),
+            "{before} -> {after}: {context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_impl_keeps_owner_when_removed_method_merges_into_neighbor() {
+    let repo = TestRepo::new();
+    repo.write(
+        "lib.rs",
+        "pub struct Foo;\nfn x() {}\nfn y() {}\nimpl Foo {\n    pub fn b(&self) {\n        x();\n    }\n    pub fn a(&self) {\n        y();\n    }\n}\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "lib.rs",
+        "pub struct Foo;\nfn x() {}\nfn y() {}\nimpl Foo {\n    pub fn b(&self) {\n        x();\n        y();\n    }\n}\n",
+    );
+    let context = repo.run_json("context", &["--git"]);
+    let affected = context["changes"][0]["affected_symbols"]
+        .as_array()
+        .unwrap();
+    assert!(
+        affected.iter().any(|symbol| {
+            symbol["name"] == "Foo"
+                && symbol["kind"] == "impl"
+                && symbol["change_type"] == "modified"
+        }),
+        "{context}"
+    );
+    assert!(
+        affected.iter().any(|symbol| symbol["name"] == "b"),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_new_marker_impl_keeps_its_owner() {
+    let repo = TestRepo::new();
+    repo.write("lib.rs", "pub struct Foo;\npub unsafe trait Marker {}\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "lib.rs",
+        "pub struct Foo;\npub unsafe trait Marker {}\nunsafe impl Marker for Foo {}\n",
+    );
+    let context = repo.run_json("context", &["--git"]);
+    let affected = context["changes"][0]["affected_symbols"]
+        .as_array()
+        .unwrap();
+    assert!(
+        affected.iter().any(|symbol| {
+            symbol["name"] == "Foo" && symbol["kind"] == "impl" && symbol["change_type"] == "added"
+        }),
+        "{context}"
     );
 }

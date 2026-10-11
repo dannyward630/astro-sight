@@ -7,10 +7,12 @@ mod pass2;
 mod pass3;
 mod python_imports;
 mod reexport_move;
+mod rust_impl_owner;
 mod signature;
 pub(crate) mod test_context;
 mod types;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -21,7 +23,7 @@ use crate::engine::{calls, diff, parser, symbols};
 use crate::language::{LangId, normalize_identifier};
 use crate::models::call::CallEdge;
 use crate::models::impact::{AffectedSymbol, DiffFile, FileImpact, HunkInfo, SignatureChange};
-use crate::models::symbol::SymbolKind;
+use crate::models::symbol::{Symbol, SymbolKind};
 
 use pass2::stream_caller_maps_and_defs;
 use pass3::{apply_stage4b_single, build_file_impact, compute_has_parent_by_ix};
@@ -34,6 +36,9 @@ struct FileContext {
     lang_id: LangId,
     affected: Vec<AffectedSymbol>,
     sig_changes: Vec<SignatureChange>,
+    /// 透過的な Rust type alias 導入だけと old/new AST で証明できたシグネチャ変更。
+    /// cross-file / same-file の caller は消さず informational へ振り分ける。
+    compatible_signature_keys: HashSet<String>,
     hunks: Vec<HunkInfo>,
     call_edges: Vec<CallEdge>,
     /// この FileContext に対して cross-file 参照検索結果を流し込んでよい
@@ -139,10 +144,18 @@ where
         return Ok(());
     }
 
+    // 再輸出の移動と削除済み宣言・use の索引を diff 全体から一度だけ構築する。
+    let reexport_moves = ReexportMoveIndex::build(diff_input);
     let t = std::time::Instant::now();
     log_phase("context.pass1", "start", 0);
     let (file_contexts, all_symbol_names, method_parent_types, included_symbols) =
-        collect_affected_symbols(diff_input, &diff_files, dir, options.new_side);
+        collect_affected_symbols(
+            diff_input,
+            &diff_files,
+            dir,
+            options.new_side,
+            &reexport_moves,
+        );
     log_phase("context.pass1", "end", t.elapsed().as_millis());
     log_phase(
         &format!(
@@ -184,11 +197,6 @@ where
     // Pass 2: per-file で Definition 集合と References を同時収集し、caller_maps に即流す。
     // Phase 4: 低確信度 caller (BareNameOnly + generic name) は別バケット
     // (`typed_low_caller_maps`) へ振り分けて強い impact 信号を汚染しない。
-    // 「定義を別モジュールへ移動し旧公開パスを `pub use` で維持した」変更の索引。
-    // diff 全体から 1 度だけ構築し、Pass 2 の routing で旧パス側の未変更参照を
-    // informational へ降格するために使う。
-    let reexport_moves = ReexportMoveIndex::build(diff_input);
-
     let t = std::time::Instant::now();
     log_phase("context.pass2", "start", 0);
     let pass2_maps = stream_caller_maps_and_defs(
@@ -329,6 +337,7 @@ fn collect_affected_symbols(
     diff_files: &[DiffFile],
     dir: &Path,
     new_side: crate::models::impact::DiffNewSide,
+    reexport_moves: &ReexportMoveIndex,
 ) -> (
     Vec<FileContext>,
     Vec<String>,
@@ -404,7 +413,54 @@ fn collect_affected_symbols(
         // (Issue 2026-05-14-private-const-and-unchanged-export-noise) を排除する。
         let changed_line_facts = diff::extract_changed_line_facts(file_diff, &df.new_path);
         let changed_new_lines = &changed_line_facts.added_lines;
-        let affected_raw = find_affected_symbols(&syms, &df.hunks, Some(&changed_line_facts));
+        // symbols には method の container 解決用の合成 impl owner が含まれる。
+        // メンバーだけの変更では owner を影響の起点にしないが、impl ヘッダ変更や
+        // メンバー削除は情報を失わないよう "impl" として残す。
+        let impact_syms: Cow<'_, [Symbol]> = if lang_id == LangId::Rust {
+            Cow::Owned(
+                syms.iter()
+                    .filter(|sym| {
+                        !classify_symbol_change(sym, &df.hunks, Some(&changed_line_facts))
+                            .is_some_and(|change_type| {
+                                rust_impl_owner::is_member_only_change(
+                                    root,
+                                    &source,
+                                    sym,
+                                    change_type,
+                                    &changed_line_facts,
+                                )
+                            })
+                    })
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            Cow::Borrowed(&syms)
+        };
+        let affected_raw: Vec<_> = impact_syms
+            .iter()
+            .filter_map(|sym| {
+                classify_symbol_change(sym, &df.hunks, Some(&changed_line_facts)).map(
+                    |change_type| {
+                        (
+                            sym,
+                            AffectedSymbol {
+                                name: sym.name.clone(),
+                                kind: if lang_id == LangId::Rust
+                                    && rust_impl_owner::is_impl_owner(root, sym)
+                                {
+                                    "impl"
+                                } else {
+                                    symbol_kind_str(sym.kind)
+                                }
+                                .to_string(),
+                                change_type: change_type.to_string(),
+                            },
+                        )
+                    },
+                )
+            })
+            .collect();
         log_phase(
             &format!("context.pass1.find_affected n={}", affected_raw.len()),
             "end",
@@ -417,18 +473,21 @@ fn collect_affected_symbols(
         let t = std::time::Instant::now();
         let mut affected: Vec<AffectedSymbol> = affected_raw
             .into_iter()
-            .filter(|sym| {
-                if let Some(s) = find_overlapping_symbol(&syms, &sym.name, &df.hunks) {
-                    // テストコンテキスト内のシンボルを除外
-                    if is_in_test_context(root, &source, &s.range, lang_id, &df.new_path) {
-                        return false;
-                    }
-                    // 関数内で宣言されたローカルシンボルを除外する。
-                    if symbols::is_local_scope_symbol(root, &source, lang_id, &s.range) {
-                        return false;
-                    }
+            .filter_map(|(original, affected)| {
+                // Rust の同名型宣言と impl owner は名前で引き直すと取り違える。
+                // 他言語は既存の名前引き規則を維持する。
+                let matched = if lang_id == LangId::Rust {
+                    Some(original)
+                } else {
+                    find_overlapping_symbol(&syms, &affected.name, &df.hunks)
+                };
+                if let Some(sym) = matched
+                    && (is_in_test_context(root, &source, &sym.range, lang_id, &df.new_path)
+                        || symbols::is_local_scope_symbol(root, &source, lang_id, &sym.range))
+                {
+                    return None;
                 }
-                true
+                Some(affected)
             })
             .collect();
         log_phase(
@@ -439,8 +498,7 @@ fn collect_affected_symbols(
 
         let t = std::time::Instant::now();
         let mut sig_changes = detect_signature_changes(file_diff, &df.new_path, &affected, lang_id);
-        // 行ベースの検出が取りこぼす「複数行の引数リストの変更」と「同一ファイル内での移動 +
-        // シグネチャ変更」を、変更前の同じ宣言との AST ヘッダ比較で補う。
+        // 複数行ヘッダや宣言移動の差分は、旧側 AST と突き合わせて補う。
         let declaration_proof = declaration::reconcile_declaration_changes(
             &declaration::DeclarationChangeInput {
                 file_diff,
@@ -451,12 +509,43 @@ fn collect_affected_symbols(
                 source: &source,
                 lang_id,
                 facts: &changed_line_facts,
+                reexport_moves,
             },
             &mut affected,
             &mut sig_changes,
         );
+        if lang_id == LangId::Rust {
+            let equivalent_names = crate::engine::rust_cfg::exclusive_const_names(root, &source);
+            if !equivalent_names.is_empty() {
+                let mut seen = HashSet::new();
+                affected.retain(|symbol| {
+                    symbol.kind != "constant"
+                        || !equivalent_names.contains(&symbol.name)
+                        || seen.insert((symbol.name.clone(), symbol.change_type.clone()))
+                });
+            }
+        }
+        let compatible_signature_keys: HashSet<String> = if lang_id == LangId::Rust {
+            signature::compatible_rust_alias_signature_names(
+                file_diff,
+                &df.new_path,
+                root,
+                &source,
+                &affected,
+                &sig_changes,
+            )
+            .into_iter()
+            .map(|name| ci_key(lang_id, &name))
+            .collect()
+        } else {
+            HashSet::new()
+        };
         log_phase(
-            &format!("context.pass1.detect_sig n={}", sig_changes.len()),
+            &format!(
+                "context.pass1.detect_sig n={} compatible={}",
+                sig_changes.len(),
+                compatible_signature_keys.len()
+            ),
             "end",
             t.elapsed().as_millis(),
         );
@@ -476,10 +565,11 @@ fn collect_affected_symbols(
         // 判定材料のうち sym 以外は本ファイルに固定なので、コンテキストは
         // ループの外で 1 度だけ組み立てる。
         let cross_file_filter = filters::CrossFileFilterContext {
-            syms: &syms,
+            syms: &impact_syms,
             hunks: &df.hunks,
             sig_changes: &sig_changes,
             rust_kind_changes: &declaration_proof.rust_kind_changes,
+            rust_alias_changes: &declaration_proof.rust_alias_changes,
             diff_input: file_diff,
             file_path: &df.new_path,
             root,
@@ -547,6 +637,7 @@ fn collect_affected_symbols(
             rust_kind_changes: declaration_proof.rust_kind_changes,
             affected,
             sig_changes,
+            compatible_signature_keys,
             hunks,
             call_edges,
             cross_file_symbol_keys,
@@ -618,6 +709,7 @@ fn symbol_range_has_deletion(
 /// 行削除だけの hunk でも `new_count > 0` になる。追加行のみを見ると「range 内に `+` 行が
 /// 無い」を理由に削除と重なった全シンボルが捨てられ、利用中の object literal メンバー削除の
 /// ような破壊的変更が review / api / dead-code すべてで無音になる。
+#[cfg(test)]
 fn find_affected_symbols(
     syms: &[crate::models::symbol::Symbol],
     hunks: &[HunkInfo],

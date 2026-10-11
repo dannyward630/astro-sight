@@ -508,6 +508,7 @@ mod tests {
             lang_id,
             affected: Vec::new(),
             sig_changes: Vec::new(),
+            compatible_signature_keys: std::collections::HashSet::new(),
             hunks: Vec::new(),
             call_edges: Vec::new(),
             cross_file_symbol_keys: std::collections::HashSet::new(),

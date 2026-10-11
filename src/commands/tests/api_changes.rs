@@ -13,4 +13,5 @@ mod rust_crate_kind;
 mod rust_module_visibility;
 mod rust_parameter_binding;
 mod rust_reexport;
+mod rust_type_alias;
 mod typescript;

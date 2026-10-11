@@ -36,7 +36,7 @@
 //!
 //! 別名 (`as OTHER`) と glob (`use x::*`) は解決先を静的に確定できないため成立させない
 //! (fail-closed)。対象は Rust のみで、他言語は常に `false` を返す。
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::engine::diff::{HunkBodyLine, HunkProgress, parse_hunk_header};
 
@@ -103,6 +103,9 @@ struct MoveCandidate {
 /// 保持量は diff のサイズで抑えられる (追加された `use` 行と定義行の名前のみ)。
 #[derive(Debug, Default)]
 pub(super) struct ReexportMoveIndex {
+    /// 削除された Rust 行に現れた識別子。同名の追加は旧宣言・再輸出・
+    /// マクロ等からの置換かもしれないため、Pass 1 で added と断定しない。
+    removed_identities: HashSet<String>,
     /// 参照ファイルパス → シンボル名 → 移動候補。
     /// 条件 1 (自前定義の削除) を満たしたものだけを登録する。
     ///
@@ -122,8 +125,20 @@ impl ReexportMoveIndex {
 
         let mut added_defs: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
         let mut moves: HashMap<String, HashMap<String, Vec<MoveCandidate>>> = HashMap::new();
+        let mut removed_identities = HashSet::new();
 
         for (path, lines) in &per_file {
+            for line in &lines.removed {
+                let scan = strip_literals(line);
+                // 行構造から旧 identity を完全には列挙できない。リテラルと
+                // 行末コメントを除いた識別子を過大に保持し、同名だけ保守側に倒す。
+                let code = scan.split("//").next().unwrap_or(&scan);
+                for token in code.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                    if !token.is_empty() {
+                        removed_identities.insert(token.to_string());
+                    }
+                }
+            }
             // 条件 3 の材料: このファイルで定義が追加されたシンボル名と宣言ヘッダ。
             let mut defs: HashMap<String, Vec<String>> = HashMap::new();
             for line in &lines.added {
@@ -164,7 +179,15 @@ impl ReexportMoveIndex {
             }
         }
 
-        Self { moves, added_defs }
+        Self {
+            removed_identities,
+            moves,
+            added_defs,
+        }
+    }
+
+    pub(super) fn might_have_removed_identity(&self, name: &str) -> bool {
+        self.removed_identities.contains(name)
     }
 
     /// `ref_path` の `symbol` 参照が、`source_path` への定義移動 + 再輸出で
@@ -238,30 +261,34 @@ struct ChangedLines {
 /// 切り替わるのを防ぐ)。
 fn collect_rust_changed_lines(input: &str) -> HashMap<String, ChangedLines> {
     let mut result: HashMap<String, ChangedLines> = HashMap::new();
-    let mut current_path: Option<String> = None;
+    let mut added_path: Option<String> = None;
+    let mut removed_path: Option<String> = None;
+    let mut old_path: Option<String> = None;
     let mut active_hunk: Option<HunkProgress> = None;
 
     for line in input.lines() {
         if let Some(progress) = active_hunk.as_mut() {
             let consumed = progress.consume(line);
-            if let Some(path) = current_path.as_ref() {
-                match consumed {
-                    HunkBodyLine::Added(text) => {
+            match consumed {
+                HunkBodyLine::Added(text) => {
+                    if let Some(path) = added_path.as_ref() {
                         result
                             .entry(path.clone())
                             .or_default()
                             .added
                             .push(text.to_string());
                     }
-                    HunkBodyLine::Removed(text) => {
+                }
+                HunkBodyLine::Removed(text) => {
+                    if let Some(path) = removed_path.as_ref() {
                         result
                             .entry(path.clone())
                             .or_default()
                             .removed
                             .push(text.to_string());
                     }
-                    HunkBodyLine::Context | HunkBodyLine::Metadata => {}
                 }
+                HunkBodyLine::Context | HunkBodyLine::Metadata => {}
             }
             if progress.is_complete() {
                 active_hunk = None;
@@ -269,13 +296,25 @@ fn collect_rust_changed_lines(input: &str) -> HashMap<String, ChangedLines> {
             continue;
         }
 
-        if line.starts_with("--- ") {
-            current_path = None;
+        if let Some(path) = crate::engine::diff::strip_header_path(line, "--- a/") {
+            old_path = path.ends_with(".rs").then(|| path.to_string());
+            added_path = None;
+            removed_path = None;
+        } else if line.starts_with("--- ") {
+            old_path = None;
+            added_path = None;
+            removed_path = None;
         } else if let Some(path) = crate::engine::diff::strip_header_path(line, "+++ b/") {
-            // Rust 以外は解析対象外 (本索引は Rust 限定)。
-            current_path = path.ends_with(".rs").then(|| path.to_string());
+            // Rust から別拡張子への rename も旧側の削除名は保持する。
+            added_path = path.ends_with(".rs").then(|| path.to_string());
+            removed_path = added_path.clone().or_else(|| old_path.clone());
+        } else if line == "+++ /dev/null" {
+            // 削除ファイルには新側のパスが無い。旧側の宣言名を索引へ残す。
+            added_path = None;
+            removed_path = old_path.clone();
         } else if line.starts_with("+++ ") {
-            current_path = None;
+            added_path = None;
+            removed_path = None;
         } else if line.starts_with("@@ ")
             && let Some(hunk) = parse_hunk_header(line)
         {
@@ -905,6 +944,13 @@ mod tests {
             rust_defined_names("pub unsafe fn raw() {"),
             vec!["raw".to_string()]
         );
+    }
+
+    #[test]
+    fn removed_name_survives_rename_out_of_rust() {
+        let diff = "--- a/src/old.rs\n+++ b/src/old.rs.bak\n@@ -1 +1 @@\n-pub struct Shape(pub u8);\n+archived\n";
+        let index = ReexportMoveIndex::build(diff);
+        assert!(index.might_have_removed_identity("Shape"));
     }
 
     // `const fn` の移動でも降格が成立する (上のトークン走査バグの E2E 相当)。

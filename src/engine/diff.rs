@@ -886,6 +886,31 @@ mod tests {
     }
 
     #[test]
+    fn reconstruct_old_source_strictly_reverses_multiple_hunks() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n one\n-two\n+changed-two\n@@ -4,2 +4,2 @@\n four\n-five\n+changed-five\n";
+        let new = b"one\nchanged-two\nthree\nfour\nchanged-five\n";
+        assert_eq!(
+            reconstruct_old_source(diff, "src/lib.rs", new).map(|old| old.source),
+            Some(b"one\ntwo\nthree\nfour\nfive\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn reconstruct_old_source_rejects_mismatched_new_content() {
+        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+expected\n";
+        assert!(reconstruct_old_source(diff, "src/lib.rs", b"different\n").is_none());
+    }
+
+    #[test]
+    fn reconstruct_old_source_handles_zero_width_new_hunk() {
+        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -2 +1,0 @@\n-two\n";
+        assert_eq!(
+            reconstruct_old_source(diff, "src/lib.rs", b"one\nthree\n").map(|old| old.source),
+            Some(b"one\ntwo\nthree\n".to_vec())
+        );
+    }
+
+    #[test]
     fn parse_simple_diff() {
         let diff = r#"diff --git a/src/main.rs b/src/main.rs
 index abc1234..def5678 100644

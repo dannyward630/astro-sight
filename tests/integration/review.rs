@@ -910,6 +910,46 @@ fn review_hook_distinguishes_independent_names_from_removed_function_calls() {
 }
 
 #[test]
+fn review_hook_same_name_added_does_not_hide_modified_impact() {
+    let before = format!(
+        "pub mod consumer;\npub struct A;\nimpl A {{\n    pub fn new(value: u8) -> Self {{ Self }}\n}}\n{}pub struct B;\n{}",
+        "\n".repeat(12),
+        "\n".repeat(12)
+    );
+    let after = format!(
+        "{}impl B {{\n    pub fn new() -> Self {{ Self }}\n}}\n",
+        before.replacen("new(value: u8)", "new(value: u8, extra: u8)", 1)
+    );
+    let output = a3_review_hook(
+        |root| std::fs::write(root.join("src/lib.rs"), &after).unwrap(),
+        &[
+            ("src/lib.rs", &before),
+            (
+                "src/consumer.rs",
+                "use crate::A;\npub fn run() { let _ = A::new(1); }\n",
+            ),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert!(
+        json["impacts"].as_array().is_some_and(|impacts| {
+            impacts
+                .iter()
+                .any(|impact| impact["syms"] == serde_json::json!(["new"]))
+        }),
+        "後続の同名 added が modified の caller を消してはならない: {stderr}"
+    );
+    assert!(
+        json["api"]["mod"]
+            .as_array()
+            .is_some_and(|mods| mods.iter().any(|change| change["n"] == "A.new")),
+        "対照として破壊的な契約変更も残す: {stderr}"
+    );
+}
+
+#[test]
 fn review_hook_ignores_rust_cfg_keys_when_public_method_is_removed() {
     let manifest = "[package]\nname = \"cfg-key-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n";
     let before = "pub struct Lang;\nimpl Lang { pub fn feature(&self) -> bool { true } }\n";

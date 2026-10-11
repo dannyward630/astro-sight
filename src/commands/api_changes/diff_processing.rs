@@ -609,6 +609,11 @@ fn collect_modified_symbols(
     // 値バインディングの value-only 変更を const_value_changes へ振り分けるための言語判定。
     let lang_id_for_file =
         crate::language::LangId::from_path(camino::Utf8Path::new(df.new_path.as_str())).ok();
+    // Rust の同一ファイル内 public type alias は、最初の候補で old/new source を 1 回だけ
+    // 読み込んで以降の候補へ再利用する。候補ごとの git show + parse を避ける。
+    let mut rust_type_aliases: Option<
+        Option<crate::engine::rust_signature::RustTypeAliasEquivalence>,
+    > = None;
 
     // 同一 (file, qualname) の modified を重複排除するためのキーセット
     let mut seen_modified: std::collections::HashSet<(String, String)> =
@@ -722,6 +727,46 @@ fn collect_modified_symbols(
                 && !may_be_python_typed_dict_total_change(kind, old_sig, new_sig, lang_id_for_file)
             {
                 continue;
+            }
+
+            // Rust の透過的な root public type alias 導入だけで説明できる表記変更は非 blocking。
+            // working tree 側を先に読み、利用可能な alias がある場合だけ base blob を `git show`
+            // する。同一ファイルの候補間では old/new alias index を再利用する。
+            if lang_id_for_file == Some(crate::language::LangId::Rust) && kind == "function" {
+                let context = rust_type_aliases.get_or_insert_with(|| {
+                    let new_source = super::source_pair::load_new_source(dir, &df.new_path)?;
+                    let prepared = crate::engine::rust_signature::RustTypeAliasEquivalence::prepare_new_source(
+                        &new_source,
+                    )?;
+                    let sources = super::source_pair::load_old_source_with_new(
+                        base_blobs,
+                        &df.old_path,
+                        &df.new_path,
+                        new_source,
+                    )?;
+                    prepared.with_old_source(&sources.old)
+                });
+                if context
+                    .as_ref()
+                    .is_some_and(|context| context.prove_function(name))
+                {
+                    let site = CompatibleModSite {
+                        dir,
+                        base: inputs.base,
+                        old_path: &df.old_path,
+                        new_path: &df.new_path,
+                        name,
+                        kind,
+                        old_sig,
+                        new_sig,
+                        lang_id: lang_id_for_file,
+                    };
+                    state
+                        .buckets
+                        .compatible_modified
+                        .push(site.compatible("transparent_rust_type_alias"));
+                    continue;
+                }
             }
 
             let change = ApiSymbolChange {

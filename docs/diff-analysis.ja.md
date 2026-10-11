@@ -50,6 +50,8 @@ astro-sight context --dir . --diff-file /tmp/changes.diff
 }
 ```
 
+Rust の `affected_symbols[].kind` は、impl ヘッダの変更・メソッドのない impl の追加・メソッド宣言を削除した可能性のある差分では `impl` になる。行削除を伴わないメソッド追加はメソッドだけを報告し、所有型の宣言変更としては報告しない。削除行がある場合は変更後の構文木だけではメソッド削除を否定できないため、`impl` の記録を残す。属性だけの変更もメソッドシンボルの範囲外なので `impl` として残す。`symbols` コマンドには、メソッドの所有元を解決するための impl owner を引き続き含める。
+
 呼び出し元は、確信度と破壊性によって 3 系統に分かれる。ここでの blocking 対象とは、`impact` や `review --hook` が exit 1 を返す原因になる検出を指す。
 
 - `impacted_callers`: 実際の呼び出し位置。diff 外に残れば `impact` の blocking 対象になる。引数個数が変わったシンボルへの参照や、判定不能な参照もここに残す

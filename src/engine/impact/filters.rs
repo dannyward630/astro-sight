@@ -14,6 +14,7 @@ use crate::language::LangId;
 use crate::models::impact::{AffectedSymbol, HunkInfo, SignatureChange};
 use crate::models::symbol::Symbol;
 
+use super::declaration;
 use super::find_overlapping_symbol;
 use super::signature::is_symbol_in_changed_lines;
 use super::test_context::is_in_test_context;
@@ -29,6 +30,7 @@ pub(super) struct CrossFileFilterContext<'a> {
     pub(super) hunks: &'a [HunkInfo],
     pub(super) sig_changes: &'a [SignatureChange],
     pub(super) rust_kind_changes: &'a HashSet<String>,
+    pub(super) rust_alias_changes: &'a HashSet<String>,
     /// 対象ファイルの diff 区間 (`diff::FileSections`。シンボル名が変更行に出現するかの
     /// 照合に使う)。diff 全体を渡しても結果は同じだが、シンボルごとに走査するため遅い。
     pub(super) diff_input: &'a str,
@@ -54,12 +56,23 @@ impl CrossFileFilterContext<'_> {
         // 1. impl ブロックの型名とモジュール宣言をスキップ
         // モジュール宣言（例: `pub mod tensor`）は API サーフェスを変更しない。
         // 実際の内容変更は diff 内のモジュール自身のファイルから検出される。
-        if sym.kind == "type" || sym.kind == "module" {
+        if matches!(sym.kind.as_str(), "impl" | "module")
+            || (sym.kind == "type"
+                && (self.lang_id != LangId::Rust || !self.rust_alias_changes.contains(&sym.name)))
+        {
             return false;
         }
         // hunks と重なる定義シンボルは (syms, sym.name, hunks) が不変なので 1 回だけ引く。
         // Option<&Symbol> は Copy のため以降の各判定で使い回せる (旧実装は 3 回線形スキャンしていた)。
-        let overlapping = find_overlapping_symbol(self.syms, &sym.name, self.hunks);
+        let overlapping = if self.lang_id == LangId::Rust && sym.kind == "type" {
+            self.syms.iter().find(|candidate| {
+                candidate.name == sym.name
+                    && super::symbol_overlaps_hunks(candidate, self.hunks)
+                    && declaration::rust_module_alias(self.root, candidate).is_some()
+            })
+        } else {
+            find_overlapping_symbol(self.syms, &sym.name, self.hunks)
+        };
         // 2. テストコンテキスト内のシンボルをスキップ
         if overlapping.is_some_and(|s| {
             is_in_test_context(
@@ -126,7 +139,19 @@ impl CrossFileFilterContext<'_> {
         }
         // 4. エクスポートされていないシンボルをスキップ
         if !overlapping.is_some_and(|s| {
-            symbols::is_symbol_exported(self.root, self.source, self.lang_id, s.identity_range())
+            (self.lang_id == LangId::Rust
+                && sym.kind == "type"
+                && (self.file_path == "src/lib.rs"
+                    || self.file_path.ends_with("/src/lib.rs")
+                    || self.file_path == "src/main.rs"
+                    || self.file_path.ends_with("/src/main.rs"))
+                && declaration::is_rust_file_root_symbol(self.root, s))
+                || symbols::is_symbol_exported(
+                    self.root,
+                    self.source,
+                    self.lang_id,
+                    s.identity_range(),
+                )
         }) {
             return false;
         }
@@ -135,6 +160,7 @@ impl CrossFileFilterContext<'_> {
         // 引数追加 (`+    b: u32,`) は変更行に名前が出ないが、宣言ヘッダの比較で呼び出し
         // 契約の変更と確定している (`declaration::reconcile_declaration_changes`)。
         if !self.sig_changes.iter().any(|sc| sc.name == sym.name)
+            && !self.rust_alias_changes.contains(&sym.name)
             && !is_symbol_in_changed_lines(self.diff_input, self.file_path, &sym.name, self.lang_id)
         {
             return false;
@@ -326,6 +352,16 @@ mod tests {
         sig_changes: &[SignatureChange],
         changed_lines: &[usize],
     ) -> bool {
+        include_for_rust_with_alias_changes(source, sym, sig_changes, changed_lines, &[])
+    }
+
+    fn include_for_rust_with_alias_changes(
+        source: &str,
+        sym: &AffectedSymbol,
+        sig_changes: &[SignatureChange],
+        changed_lines: &[usize],
+        alias_changes: &[&str],
+    ) -> bool {
         let bytes = source.as_bytes();
         let tree = crate::engine::parser::parse_source(bytes, LangId::Rust).expect("parse");
         let root = tree.root_node();
@@ -338,9 +374,14 @@ mod tests {
         }];
         let diff_input = one_line_diff(source.lines().next().unwrap_or_default());
         let changed_new_lines: HashSet<usize> = changed_lines.iter().copied().collect();
+        let rust_alias_changes: HashSet<String> = alias_changes
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
         let ctx = CrossFileFilterContext {
             syms: &syms,
             rust_kind_changes: &HashSet::new(),
+            rust_alias_changes: &rust_alias_changes,
             hunks: &hunks,
             sig_changes,
             diff_input: &diff_input,
@@ -361,13 +402,13 @@ mod tests {
         }
     }
 
-    // 1. impl ブロックの型名 / モジュール宣言は AST を見る前に除外される
+    // 1. impl owner / モジュール宣言は AST を見る前に除外される
     #[test]
-    fn cross_file_filter_skips_type_and_module_kind() {
+    fn cross_file_filter_skips_impl_and_module_kind() {
         let source = "pub fn foo(a: usize) -> usize { a }\n";
         assert!(!include_for_rust(
             source,
-            &affected("Foo", "type", "modified"),
+            &affected("Foo", "impl", "modified"),
             &[sig_change("Foo")],
             &[0]
         ));
@@ -377,6 +418,29 @@ mod tests {
             &[sig_change("foo")],
             &[0]
         ));
+    }
+
+    #[test]
+    fn cross_file_filter_includes_rust_type_alias_without_pub() {
+        assert!(!include_for_rust(
+            "pub type Id = u64;\n",
+            &affected("Id", "type", "modified"),
+            &[],
+            &[0]
+        ));
+        for source in [
+            "type Id = u64;\n",
+            "pub(crate) type Id = u64;\n",
+            "pub type Id = u64;\n",
+        ] {
+            assert!(include_for_rust_with_alias_changes(
+                source,
+                &affected("Id", "type", "modified"),
+                &[],
+                &[0],
+                &["Id"]
+            ));
+        }
     }
 
     // シグネチャ変更のある exported fn は cross-file 検索に含める
@@ -443,6 +507,7 @@ mod tests {
         let ctx = CrossFileFilterContext {
             syms: &syms,
             rust_kind_changes: &HashSet::new(),
+            rust_alias_changes: &HashSet::new(),
             hunks: &hunks,
             sig_changes: &[],
             diff_input,
@@ -537,6 +602,7 @@ mod tests {
             CrossFileFilterContext {
                 syms: &syms,
                 rust_kind_changes: &HashSet::new(),
+                rust_alias_changes: &HashSet::new(),
                 hunks: &hunks,
                 sig_changes,
                 diff_input: diff,

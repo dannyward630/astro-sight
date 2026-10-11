@@ -1515,6 +1515,12 @@ fn build_review_hook_json_mixed_added_and_modified_keeps_only_modified() {
                         kind: "constant".to_string(),
                         change_type: "added".to_string(),
                     },
+                    // 別 owner の同名追加が後続しても、先の modified を失わない。
+                    crate::models::impact::AffectedSymbol {
+                        name: "modified_fn".to_string(),
+                        kind: "function".to_string(),
+                        change_type: "added".to_string(),
+                    },
                 ],
                 signature_changes: Vec::new(),
                 impacted_callers: vec![crate::models::impact::ImpactedCaller {

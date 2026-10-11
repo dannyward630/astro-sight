@@ -41,6 +41,12 @@ struct HookImpactGroup {
     refs: Vec<(String, usize, Vec<String>)>,
 }
 
+#[derive(Default)]
+struct HookChangeFlags {
+    has_non_added: bool,
+    has_modified: bool,
+}
+
 #[derive(Serialize)]
 struct HookImpactRef<'a> {
     p: &'a str,
@@ -530,11 +536,17 @@ pub(crate) fn build_review_hook_json_for_diff(
         // として価値はあるが、breaking change ではないため除外する。通常 `review` の
         // `impact.changes[].impacted_callers` には引き続き残る (情報価値を維持)。
         // (Issue: 2026-05-27-added-symbol-initial-reference)
-        let affected_change_types: std::collections::HashMap<&str, &str> = change
-            .affected_symbols
-            .iter()
-            .map(|s| (s.name.as_str(), s.change_type.as_str()))
-            .collect();
+        // caller 側は名前だけを持つ。同名の別 owner に added と modified が混在しても、
+        // 後から現れた added で breaking な変更を上書きしない。
+        let mut affected_change_types: std::collections::HashMap<&str, HookChangeFlags> =
+            std::collections::HashMap::new();
+        for symbol in &change.affected_symbols {
+            let flags = affected_change_types
+                .entry(symbol.name.as_str())
+                .or_default();
+            flags.has_non_added |= symbol.change_type != "added";
+            flags.has_modified |= symbol.change_type == "modified";
+        }
         // impacted: breaking causal シンボル (modified / removed) だけを残す。
         // `added` 由来と informational 扱いの modified api シンボルは hook blocking から除外する。
         accumulate_hook_impacts(
@@ -544,12 +556,10 @@ pub(crate) fn build_review_hook_json_for_diff(
             &resolution,
             dir,
             |sym| {
-                matches!(
-                    affected_change_types.get(sym).copied(),
-                    Some(ct) if ct != "added"
-                        && !informational_modified_api_symbols
-                            .contains(&(change.path.as_str(), sym))
-                )
+                affected_change_types
+                    .get(sym)
+                    .is_some_and(|flags| flags.has_non_added)
+                    && !informational_modified_api_symbols.contains(&(change.path.as_str(), sym))
             },
         );
         // 型注釈変更と省略可能引数削除の参照を、確認箇所として残す。
@@ -560,7 +570,9 @@ pub(crate) fn build_review_hook_json_for_diff(
             &resolution,
             dir,
             |sym| {
-                affected_change_types.get(sym).copied() == Some("modified")
+                affected_change_types
+                    .get(sym)
+                    .is_some_and(|flags| flags.has_modified)
                     && (annotation_info_symbols.contains(&(change.path.as_str(), sym))
                         || optional_removal_info_symbols.contains(&(change.path.as_str(), sym)))
             },
@@ -572,7 +584,11 @@ pub(crate) fn build_review_hook_json_for_diff(
             &change.informational_callers,
             &resolution,
             dir,
-            |sym| matches!(affected_change_types.get(sym).copied(), Some("modified")),
+            |sym| {
+                affected_change_types
+                    .get(sym)
+                    .is_some_and(|flags| flags.has_modified)
+            },
         );
     }
 

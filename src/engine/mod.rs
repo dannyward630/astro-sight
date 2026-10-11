@@ -21,9 +21,19 @@ pub(crate) mod python_scope;
 pub(crate) mod python_signature;
 pub mod query_cache;
 pub mod refs;
+pub(crate) mod rust_cfg;
 pub(crate) mod rust_scope;
 pub(crate) mod rust_signature;
 pub mod sequence;
 pub mod snippet;
 pub mod symbols;
 pub mod xml_refs;
+
+/// signature 文字列の改行・タブ・連続空白を単一 space に正規化する。
+pub(crate) fn normalize_whitespace(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes)
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
