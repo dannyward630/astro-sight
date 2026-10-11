@@ -133,11 +133,23 @@ impl RustStdOriginIndex {
                 ..Scope::default()
             },
         );
-        index.walk(node, source, node.id());
+        index.walk(node, source);
         Some(index)
     }
 
-    fn walk(&mut self, node: Node<'_>, source: &[u8], scope_id: usize) {
+    fn walk(&mut self, root: Node<'_>, source: &[u8]) {
+        let mut pending = vec![(root, root.id())];
+        while let Some((node, scope_id)) = pending.pop() {
+            let active = self.visit_node(node, source, scope_id);
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            for child in children.into_iter().rev() {
+                pending.push((child, active));
+            }
+        }
+    }
+
+    fn visit_node(&mut self, node: Node<'_>, source: &[u8], scope_id: usize) -> usize {
         let mut active = scope_id;
         if node.kind() == "block"
             || (node.kind() == "declaration_list"
@@ -203,10 +215,7 @@ impl RustStdOriginIndex {
             }
             _ => {}
         }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            self.walk(child, source, active);
-        }
+        active
     }
 
     fn collect_use(&mut self, node: Node<'_>, source: &[u8], scope: usize, prefix: &[String]) {
@@ -696,6 +705,48 @@ mod tests {
             pending.extend(node.named_children(&mut cursor));
         }
         assert_eq!(found, 4);
+    }
+
+    #[test]
+    fn deeply_nested_expression_does_not_overflow_origin_index() {
+        let source = format!(
+            "use std::ops::Range;\nfn f(r: Range<usize>) {{ let _ = {}{{ use crate::local::Range; Range {{ start: 0, end: 1 }} }}{}; }}\n",
+            "(".repeat(2_000),
+            ")".repeat(2_000)
+        );
+        let tree = parser::parse_source(source.as_bytes(), LangId::Rust).unwrap();
+        assert!(!tree.root_node().has_error());
+        let index = RustStdOriginIndex::build(tree.root_node(), source.as_bytes()).unwrap();
+        let function = tree.root_node().named_child(1).unwrap();
+        let parameter = function.child_by_field_name("parameters").unwrap();
+        let range = parameter
+            .named_child(0)
+            .unwrap()
+            .child_by_field_name("type")
+            .unwrap()
+            .named_child(0)
+            .unwrap();
+        assert!(index.proves_std_owner(range, source.as_bytes()));
+
+        let deep_offset = source.rfind("Range { start:").unwrap();
+        let deep_range = tree
+            .root_node()
+            .named_descendant_for_byte_range(deep_offset, deep_offset + "Range".len())
+            .unwrap();
+        assert_eq!(deep_range.kind(), "type_identifier");
+        assert!(!index.proves_std_owner(deep_range, source.as_bytes()));
+    }
+
+    #[test]
+    fn very_deep_tree_builds_origin_index() {
+        let source = format!(
+            "use std::ops::Range;\nfn f() {{ let _ = {}1{}; }}\n",
+            "(".repeat(12_000),
+            ")".repeat(12_000)
+        );
+        let tree = parser::parse_source(source.as_bytes(), LangId::Rust).unwrap();
+        assert!(!tree.root_node().has_error());
+        assert!(RustStdOriginIndex::build(tree.root_node(), source.as_bytes()).is_some());
     }
 
     #[test]

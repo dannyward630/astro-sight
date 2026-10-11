@@ -276,38 +276,42 @@ impl TypeAliasIndex {
     }
 
     fn block_nested_aliases(&mut self, node: Node<'_>, source: &[u8]) {
-        if matches!(node.kind(), "type_item" | "associated_type") {
-            if let Some(name) = node
-                .child_by_field_name("name")
-                .and_then(|name| name.utf8_text(source).ok())
-            {
-                self.aliases.remove(name);
-                self.blocked.insert(name.to_string());
+        let mut pending = vec![node];
+        while let Some(node) = pending.pop() {
+            if matches!(node.kind(), "type_item" | "associated_type") {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok())
+                {
+                    self.aliases.remove(name);
+                    self.blocked.insert(name.to_string());
+                }
+                continue;
             }
-            return;
-        }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            self.block_nested_aliases(child, source);
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            pending.extend(children.into_iter().rev());
         }
     }
 }
 
 fn collect_function_counts(
-    node: Node<'_>,
+    root: Node<'_>,
     source: &[u8],
     counts: &mut HashMap<String, usize>,
 ) -> Option<()> {
-    if matches!(node.kind(), "function_item" | "function_signature_item")
-        && let Some(name) = node.child_by_field_name("name")
-    {
-        *counts
-            .entry(name.utf8_text(source).ok()?.to_string())
-            .or_default() += 1;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_function_counts(child, source, counts)?;
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "function_item" | "function_signature_item")
+            && let Some(name) = node.child_by_field_name("name")
+        {
+            *counts
+                .entry(name.utf8_text(source).ok()?.to_string())
+                .or_default() += 1;
+        }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        pending.extend(children.into_iter().rev());
     }
     Some(())
 }
@@ -643,6 +647,19 @@ fn normalize_whitespace(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_nested_body_does_not_overflow_alias_index() {
+        let source = format!(
+            "pub type Alias = u64;\nmod inner {{ type Alias = u32; fn deep() {{ let _ = {}1{}; }} }}\npub fn outer(x: Alias) -> Alias {{ x }}\n",
+            "(".repeat(12_000),
+            ")".repeat(12_000)
+        );
+        let index = TypeAliasIndex::from_source(source.as_bytes()).unwrap();
+        assert_eq!(index.function_counts.get("deep"), Some(&1));
+        assert!(index.blocked.contains("Alias"));
+        assert!(index.aliases.is_empty());
+    }
 
     #[test]
     fn removes_parameter_binding_mut_but_keeps_type_mutability() {

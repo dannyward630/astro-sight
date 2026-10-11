@@ -76,11 +76,28 @@ fn is_ts_family(lang_id: LangId) -> bool {
     )
 }
 
+fn walk_named_nodes<'tree>(
+    root: tree_sitter::Node<'tree>,
+    mut visit: impl FnMut(tree_sitter::Node<'tree>),
+) {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        visit(node);
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        pending.extend(children.into_iter().rev());
+    }
+}
+
 fn walk_for_import_specifiers(
-    node: tree_sitter::Node<'_>,
+    root: tree_sitter::Node<'_>,
     source: &[u8],
     out: &mut HashSet<String>,
 ) {
+    walk_named_nodes(root, |node| collect_import_specifier(node, source, out));
+}
+
+fn collect_import_specifier(node: tree_sitter::Node<'_>, source: &[u8], out: &mut HashSet<String>) {
     let kind = node.kind();
     match kind {
         "import_statement" | "export_statement" => {
@@ -120,10 +137,6 @@ fn walk_for_import_specifiers(
             }
         }
         _ => {}
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        walk_for_import_specifiers(child, source, out);
     }
 }
 
@@ -270,6 +283,17 @@ fn collect_qualified_path_names(source: &[u8], names: &mut HashSet<String>) {
 }
 
 fn walk_for_rust_evidence(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    names: &mut HashSet<String>,
+    has_glob: &mut bool,
+) {
+    walk_named_nodes(root, |node| {
+        collect_rust_evidence(node, source, names, has_glob)
+    });
+}
+
+fn collect_rust_evidence(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     names: &mut HashSet<String>,
@@ -318,10 +342,6 @@ fn walk_for_rust_evidence(
             }
         }
         _ => {}
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        walk_for_rust_evidence(child, source, names, has_glob);
     }
 }
 
@@ -741,6 +761,21 @@ const m = import(/* a */ expr /* b */, './surrounding_decoy');
         ));
     }
 
+    #[test]
+    fn deep_typescript_expression_keeps_import_facts() {
+        let source = format!(
+            "import {{ handler }} from './handlers';\nconst value = {}require('./deep'){};\n",
+            "(".repeat(12_000),
+            ")".repeat(12_000)
+        );
+        let tree = parser::parse_source(source.as_bytes(), LangId::Typescript).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut names = HashSet::new();
+        walk_for_import_specifiers(tree.root_node(), source.as_bytes(), &mut names);
+        assert!(names.contains("handlers"));
+        assert!(names.contains("deep"));
+    }
+
     // ---- Rust 経路 (Issue 2026-06-13-ai-status-json-symbol-fp) ----
 
     #[test]
@@ -764,6 +799,23 @@ fn a() { let x = render::table(); }
     fn extract_rust_ref_facts_detects_glob_use() {
         let (_, glob) = extract_rust_ref_facts(b"use crate::render::*;\n").expect("parse ok");
         assert!(glob, "glob import を検出");
+    }
+
+    #[test]
+    fn deep_rust_expression_keeps_import_facts() {
+        let source = format!(
+            "use crate::module::helper;\nfn f() {{ let _ = {}render::table(){}; }}\n",
+            "(".repeat(12_000),
+            ")".repeat(12_000)
+        );
+        let tree = parser::parse_source(source.as_bytes(), LangId::Rust).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut names = HashSet::new();
+        let mut glob = false;
+        walk_for_rust_evidence(tree.root_node(), source.as_bytes(), &mut names, &mut glob);
+        assert!(names.contains("helper"));
+        assert!(names.contains("table"));
+        assert!(!glob);
     }
 
     #[test]
