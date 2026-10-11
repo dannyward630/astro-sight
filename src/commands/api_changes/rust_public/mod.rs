@@ -451,8 +451,6 @@ impl RustPublicApiContext {
 /// パース失敗時は **保守的に true (= library 宣言ありとみなす)** を返す。`api.rm` 側で
 /// false negative (公開 API 削除の見逃し) を起こさない方向に倒すための既定値。
 pub(crate) fn cargo_toml_text_declares_lib(text: &str) -> bool {
-    match toml::from_str::<toml::Table>(text) {
-        Ok(parsed) => parsed.contains_key("lib"),
-        Err(_) => true,
-    }
+    crate::engine::rust_targets::RustTargets::parse(text, std::path::Path::new(""))
+        .is_none_or(|targets| targets.declares_lib)
 }

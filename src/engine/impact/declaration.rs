@@ -10,8 +10,9 @@
 //!
 //! どちらも「変更前の同じ宣言」と比べれば判定できる。変更前のソースは diff を new 側へ
 //! 逆適用して復元し (`diff::reconstruct_old_source`)、同じ識別 (名前 / 種別 / container)
-//! の宣言のヘッダをトークン列で比較する。行ベースの検出が結論を出せる場合 (1 行の
-//! ヘッダで変更前後の行が揃っている) はそちらを優先し、ここは補完に徹する。
+//! の宣言のヘッダをトークン列で比較する。Rust の 1 行関数では本体が行比較に混ざるため、
+//! 宣言が一意でヘッダが同じと証明できた場合だけ行比較の誤検出を取り消す。
+//! 他の 1 行ヘッダでは行比較を優先し、ここは補完に徹する。
 
 use std::collections::{HashMap, HashSet};
 
@@ -142,6 +143,8 @@ pub(super) struct DeclarationHeader {
     tokens: Vec<String>,
     /// 出力用のヘッダ文字列 (コメントを除き空白を畳んだもの)。
     display: String,
+    /// 本体の byte 範囲。Rust の行比較を取り消す際、ほかの変更が無い証拠に使う。
+    body_bytes: Option<(usize, usize)>,
 }
 
 impl DeclarationHeader {
@@ -191,6 +194,7 @@ pub(super) fn declaration_header(
         None => (decl.end_byte(), decl.end_position().row),
     };
     let body_id = body.map(|b| b.id());
+    let body_bytes = body.map(|body| (body.start_byte(), body.end_byte()));
 
     if lang_id == LangId::Python {
         let display = crate::engine::python_signature::normalize_function_header(decl, source)?;
@@ -199,6 +203,7 @@ pub(super) fn declaration_header(
             last_line,
             tokens: vec![display.clone()],
             display,
+            body_bytes,
         });
     }
 
@@ -258,6 +263,7 @@ pub(super) fn declaration_header(
         last_line,
         tokens,
         display: header_display(source, line_start, header_end, &omitted),
+        body_bytes,
     })
 }
 
@@ -502,6 +508,8 @@ impl OldSide {
 #[derive(Default)]
 pub(super) struct DeclarationProof {
     pub(super) rust_function_names: HashSet<String>,
+    /// 旧新とも同名宣言が自由関数だけの名前。メソッド位置の参照は指し得ない。
+    pub(super) rust_free_function_names: HashSet<String>,
     pub(super) rust_kind_changes: HashSet<String>,
     pub(super) rust_alias_changes: HashSet<String>,
 }
@@ -529,6 +537,29 @@ pub(super) fn rust_module_alias<'a>(root: Node<'a>, symbol: &Symbol) -> Option<N
     } else {
         None
     }
+}
+
+/// impl / trait の関数は symbols 上で `Function` のことがあるため、宣言の親まで見る。
+fn rust_is_free_function(root: Node<'_>, symbol: &Symbol) -> bool {
+    if symbol.kind != SymbolKind::Function || symbol.container.is_some() {
+        return false;
+    }
+    let start = tree_sitter::Point::new(symbol.range.start.line, symbol.range.start.column);
+    let end = tree_sitter::Point::new(symbol.range.end.line, symbol.range.end.column);
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+    if node.kind() != "function_item" || node.has_error() {
+        return false;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.kind() == "source_file"
+        || (parent.kind() == "declaration_list"
+            && parent
+                .parent()
+                .is_some_and(|ancestor| ancestor.kind() == "mod_item"))
 }
 
 fn rust_alias_tokens(node: Node<'_>, source: &[u8]) -> Option<Vec<Vec<u8>>> {
@@ -627,8 +658,8 @@ fn rust_modified_alias_names(
 /// - `"modified"` の関数でヘッダの行範囲に変更があるのに行ベースの検出が結論を出せなかった
 ///   もの (複数行のヘッダ、関数名の行が無変更) は、変更前の同じ宣言とヘッダを比べる。
 ///
-/// 1 行のヘッダで変更前後の行が揃っている場合は行ベースの結果を優先する (既存の検出と
-/// 正規化 (Rust の束縛側 `mut` など) を変えないため)。
+/// Rust の 1 行関数は行比較に本体が混ざるため、一意な旧新ヘッダが一致するときだけ
+/// 行ベースのシグネチャ変更を取り消す。他言語の 1 行ヘッダは行ベースの結果を優先する。
 pub(super) fn reconcile_declaration_changes(
     input: &DeclarationChangeInput<'_>,
     affected: &mut [AffectedSymbol],
@@ -716,28 +747,33 @@ pub(super) fn reconcile_declaration_changes(
         // Python は単一の宣言を新旧とも確認できる場合、共通のトークン比較を正本にする。
         // 行比較の空白誤検出を打ち消す一方、文字列内部の空白変更の見逃しも補う。
         // 同名の別メソッド・overload や構文エラーがあれば従来の検出を維持する。
-        if !is_added && input.lang_id == LangId::Python && !input.root.has_error() {
-            let mut matching = input.syms.iter().filter(|s| s.name == symbol_change.name);
-            if let Some(symbol) = matching.next()
-                && matching.next().is_none()
-                && let Some(old) = old_side.get(input)
-                && !old.tree.root_node().has_error()
-                && old.symbols.iter().filter(|s| s.name == symbol.name).count() == 1
-                && let [old_header] = old.counterpart_headers(symbol, input.lang_id).as_slice()
-                && let Some(new_header) =
-                    declaration_header(input.root, input.source, symbol, input.lang_id)
-            {
-                if old_header.same_contract(&new_header) {
-                    sig_changes.retain(|sc| sc.name != symbol_change.name);
-                } else if !has_text_sig_change {
-                    sig_changes.push(SignatureChange {
-                        name: symbol_change.name.clone(),
-                        old_signature: old_header.display.clone(),
-                        new_signature: new_header.display,
-                    });
-                }
-                continue;
+        if !is_added
+            && input.lang_id == LangId::Python
+            && let Some((old_header, new_header)) =
+                unique_header_pair(input, &symbol_change.name, &mut old_side)
+        {
+            if old_header.same_contract(&new_header) {
+                sig_changes.retain(|sc| sc.name != symbol_change.name);
+            } else if !has_text_sig_change {
+                sig_changes.push(SignatureChange {
+                    name: symbol_change.name.clone(),
+                    old_signature: old_header.display,
+                    new_signature: new_header.display,
+                });
             }
+            continue;
+        }
+        // ヘッダだけでなく本体の外側が byte 単位で不変と証明する。
+        // 属性・import・外側の impl 等を同時に変えた場合は取り消さない。
+        if !is_added
+            && has_text_sig_change
+            && input.lang_id == LangId::Rust
+            && let Some((old, new)) = unique_header_pair(input, &symbol_change.name, &mut old_side)
+            && old.same_contract(&new)
+            && rust_only_body_changed(input, &mut old_side, &old, &new)
+        {
+            sig_changes.retain(|sc| sc.name != symbol_change.name);
+            continue;
         }
         if !is_added && has_text_sig_change {
             continue;
@@ -852,6 +888,30 @@ pub(super) fn reconcile_declaration_changes(
                 .all(|kind| matches!(kind, SymbolKind::Function | SymbolKind::Method))
         })
     });
+    let mut old_free = HashMap::<&str, bool>::new();
+    let mut new_free = HashMap::<&str, bool>::new();
+    for (symbols, root, free) in [
+        (&old.symbols[..], old.tree.root_node(), &mut old_free),
+        (input.syms, input.root, &mut new_free),
+    ] {
+        for symbol in symbols {
+            if !proof.rust_function_names.contains(&symbol.name) {
+                continue;
+            }
+            let is_free = rust_is_free_function(root, symbol);
+            free.entry(symbol.name.as_str())
+                .and_modify(|all_free| *all_free &= is_free)
+                .or_insert(is_free);
+        }
+    }
+    proof.rust_free_function_names = proof
+        .rust_function_names
+        .iter()
+        .filter(|name| {
+            old_free.get(name.as_str()) == Some(&true) && new_free.get(name.as_str()) == Some(&true)
+        })
+        .cloned()
+        .collect();
     for symbol in affected {
         if let (Some(old), Some(new)) = (
             old_kinds.get(symbol.name.as_str()),
@@ -862,6 +922,66 @@ pub(super) fn reconcile_declaration_changes(
         }
     }
     proof
+}
+
+/// 旧新ソースから対象の本体だけを抜いた残りが完全一致するときに限る。
+/// 同じファイルの別の変更も保守側に残す。
+fn rust_only_body_changed(
+    input: &DeclarationChangeInput<'_>,
+    old_side: &mut LazyOldSide,
+    old_header: &DeclarationHeader,
+    new_header: &DeclarationHeader,
+) -> bool {
+    let (Some((old_start, old_end)), Some((new_start, new_end))) =
+        (old_header.body_bytes, new_header.body_bytes)
+    else {
+        return false;
+    };
+    let Some(old) = old_side.get(input) else {
+        return false;
+    };
+    let (Some(old_prefix), Some(new_prefix), Some(old_suffix), Some(new_suffix)) = (
+        old.source.get(..old_start),
+        input.source.get(..new_start),
+        old.source.get(old_end..),
+        input.source.get(new_end..),
+    ) else {
+        return false;
+    };
+    old_prefix == new_prefix && old_suffix == new_suffix
+}
+
+/// 同名宣言が新旧とも一意で、両側を解析できるときだけヘッダを対応付ける。
+fn unique_header_pair(
+    input: &DeclarationChangeInput<'_>,
+    name: &str,
+    old_side: &mut LazyOldSide,
+) -> Option<(DeclarationHeader, DeclarationHeader)> {
+    if input.root.has_error() {
+        return None;
+    }
+    let mut new_matches = input.syms.iter().filter(|symbol| symbol.name == name);
+    let symbol = new_matches.next()?;
+    if new_matches.next().is_some() {
+        return None;
+    }
+    let old = old_side.get(input)?;
+    if old.tree.root_node().has_error()
+        || old
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == name)
+            .count()
+            != 1
+    {
+        return None;
+    }
+    let [old_header]: [DeclarationHeader; 1] = old
+        .counterpart_headers(symbol, input.lang_id)
+        .try_into()
+        .ok()?;
+    let new_header = declaration_header(input.root, input.source, symbol, input.lang_id)?;
+    Some((old_header, new_header))
 }
 
 /// 行ベースの検出 (`detect_signature_changes`) が `name` の変更前後のシグネチャ行を
@@ -892,6 +1012,22 @@ mod tests {
         let alias = syms.iter().find(|symbol| symbol.name == "Alias").unwrap();
         assert!(rust_module_alias(root, associated).is_none());
         assert!(rust_module_alias(root, alias).is_some());
+    }
+
+    #[test]
+    fn rust_free_function_shape_excludes_impl_methods() {
+        let source = b"pub fn collect() {}\npub struct X;\nimpl X { pub fn collect(&self) {} }\nmod inner { pub fn collect() {} }\n";
+        let tree = parser::parse_source(source, LangId::Rust).unwrap();
+        let root = tree.root_node();
+        let syms = symbols::extract_symbols(root, source, LangId::Rust).unwrap();
+        let collect: Vec<_> = syms
+            .iter()
+            .filter(|symbol| symbol.name == "collect")
+            .collect();
+        assert_eq!(collect.len(), 3);
+        assert!(rust_is_free_function(root, collect[0]));
+        assert!(!rust_is_free_function(root, collect[1]));
+        assert!(rust_is_free_function(root, collect[2]));
     }
 
     #[test]
@@ -1062,6 +1198,17 @@ mod tests {
         assert_eq!(
             proof("pub fn comments() -> usize { 1 }\n", new, false).rust_function_names,
             HashSet::from(["comments".to_owned()])
+        );
+        assert_eq!(
+            proof("pub fn comments() -> usize { 1 }\n", new, false).rust_free_function_names,
+            HashSet::from(["comments".to_owned()])
+        );
+        let old_method = "pub struct B;\nimpl B { pub fn comments(&self) -> usize { 1 } }\n";
+        let new_method = "pub struct B;\nimpl B { pub fn comments(&self, value: u32) -> usize { value as usize } }\n";
+        assert!(
+            proof(old_method, new_method, false)
+                .rust_free_function_names
+                .is_empty()
         );
         for (old, new) in [
             ("pub const comments: usize = 1;\n", new),
@@ -1507,6 +1654,80 @@ mod tests {
                 annotated,
                 "helper"
             ))
+        );
+    }
+
+    #[test]
+    fn rust_one_line_body_change_cancels_only_proven_signature_noise() {
+        let old = "pub fn helper() -> u8 { 1 }\n";
+        let body_only = "pub fn helper() -> u8 { 2 }\n";
+        let (_, raw) = run_pass1(LangId::Rust, "src/lib.rs", old, body_only, false);
+        assert!(raw.iter().any(|change| change.name == "helper"), "{raw:?}");
+        let (affected, reconciled) = run_pass1(LangId::Rust, "src/lib.rs", old, body_only, true);
+        assert_eq!(change_type_of(&affected, "helper"), Some("modified"));
+        assert!(reconciled.is_empty(), "{reconciled:?}");
+
+        let attributed_old = "#[cfg(feature = \"same\")]\npub fn helper() -> u8 { 1 }\n";
+        let attributed_new = "#[cfg(feature = \"same\")]\npub fn helper() -> u8 { 2 }\n";
+        let (_, signatures) = run_pass1(
+            LangId::Rust,
+            "src/lib.rs",
+            attributed_old,
+            attributed_new,
+            true,
+        );
+        assert!(signatures.is_empty(), "{signatures:?}");
+
+        for changed in [
+            "pub fn helper() -> u16 { 2 }\n",
+            "pub fn helper(value: u8) -> u8 { value }\n",
+            "#[cfg(feature = \"new\")] pub fn helper() -> u8 { 2 }\n",
+            "#[cfg(feature = \"new\")]\npub fn helper() -> u8 { 2 }\n",
+            "#![cfg(feature = \"new\")]\npub fn helper() -> u8 { 2 }\n",
+        ] {
+            let (_, signatures) = run_pass1(LangId::Rust, "src/lib.rs", old, changed, true);
+            assert!(
+                signatures.iter().any(|change| change.name == "helper"),
+                "{changed}: {signatures:?}"
+            );
+        }
+
+        for (old, changed) in [
+            (
+                "#[cfg(feature = \"old\")] impl Owner { pub fn helper() -> u8 { 1 } }\n",
+                "#[cfg(feature = \"new\")] impl Owner { pub fn helper() -> u8 { 2 } }\n",
+            ),
+            (
+                "#[cfg(feature = \"old\")] mod inner { pub fn helper() -> u8 { 1 } }\n",
+                "#[cfg(feature = \"new\")] mod inner { pub fn helper() -> u8 { 2 } }\n",
+            ),
+        ] {
+            let (_, signatures) = run_pass1(LangId::Rust, "src/lib.rs", old, changed, true);
+            assert!(
+                signatures.iter().any(|change| change.name == "helper"),
+                "{changed}: {signatures:?}"
+            );
+        }
+
+        let duplicate_old = "pub struct A;\nimpl A { pub fn helper(&self) -> u8 { 1 } }\npub fn helper() -> u8 { 1 }\n";
+        let duplicate_new = "pub struct A;\nimpl A { pub fn helper(&self) -> u8 { 1 } }\npub fn helper() -> u8 { 2 }\n";
+        let (_, signatures) = run_pass1(
+            LangId::Rust,
+            "src/lib.rs",
+            duplicate_old,
+            duplicate_new,
+            true,
+        );
+        assert!(
+            signatures.iter().any(|change| change.name == "helper"),
+            "{signatures:?}"
+        );
+
+        let malformed = "pub fn helper() -> u8 { 2 }\nfn broken(\n";
+        let (_, signatures) = run_pass1(LangId::Rust, "src/lib.rs", old, malformed, true);
+        assert!(
+            signatures.iter().any(|change| change.name == "helper"),
+            "{signatures:?}"
         );
     }
 

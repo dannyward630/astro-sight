@@ -499,6 +499,1856 @@ fn impact_rust_type_alias_requires_a_contract_change() {
 }
 
 #[test]
+fn impact_rust_free_function_excludes_same_named_method_calls() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write("src/lib.rs", "pub mod walk;\nmod stats;\nmod caller;\n");
+    repo.write(
+        "src/walk.rs",
+        "pub fn collect() -> (usize, usize) { (0, 0) }\n",
+    );
+    repo.write(
+        "src/stats.rs",
+        "pub fn values() -> Vec<i32> { vec![1].into_iter().collect() }\n",
+    );
+    repo.write(
+        "src/caller.rs",
+        "pub fn run() -> (usize, usize) { crate::walk::collect() }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/walk.rs",
+        "pub struct Found { pub count: usize }\npub fn collect() -> Found { Found { count: 0 } }\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == "src/walk.rs")
+        .unwrap();
+    let callers = change["impacted_callers"].as_array().unwrap();
+    assert!(
+        callers
+            .iter()
+            .any(|caller| caller["path"] == "src/caller.rs"),
+        "{context}"
+    );
+    assert!(
+        callers
+            .iter()
+            .all(|caller| caller["path"] != "src/stats.rs"),
+        "{context}"
+    );
+    let output = cargo_bin()
+        .args([
+            "impact",
+            "--dir",
+            repo.root().to_str().unwrap(),
+            "--git",
+            "--hook",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+
+    repo.write(
+        "src/caller.rs",
+        "pub fn run() -> usize { crate::walk::collect().count }\n",
+    );
+    let output = cargo_bin()
+        .args([
+            "impact",
+            "--dir",
+            repo.root().to_str().unwrap(),
+            "--git",
+            "--hook",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn impact_rust_changed_method_keeps_receiver_calls() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write("src/lib.rs", "pub mod walk;\nmod consumer;\n");
+    repo.write(
+        "src/walk.rs",
+        "pub struct Collector;\nimpl Collector { pub fn collect(&self) -> usize { 0 } }\n",
+    );
+    repo.write(
+        "src/consumer.rs",
+        "use crate::walk::Collector;\npub fn run() -> usize { Collector.collect() }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/walk.rs",
+        "pub struct Collector;\nimpl Collector { pub fn collect(&self, value: usize) -> usize { value } }\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == "src/walk.rs")
+        .unwrap();
+    assert!(
+        change["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "src/consumer.rs")),
+        "{context}"
+    );
+    let output = cargo_bin()
+        .args([
+            "impact",
+            "--dir",
+            repo.root().to_str().unwrap(),
+            "--git",
+            "--hook",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn impact_rust_std_import_does_not_claim_local_type_change() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\n[workspace.package]\nedition = \"2021\"\n[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition.workspace = true\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "pub mod out;\nmod other;\nmod real;\nmod mixed;\n",
+    );
+    repo.write(
+        "src/out.rs",
+        "pub struct Range { pub start: usize, pub end: usize }\n",
+    );
+    repo.write(
+        "src/other.rs",
+        "use std::ops::Range;\n#[derive(Debug)]\nstruct Holder;\n#[cfg(test)]\nmod tests {}\npub fn len(r: Range<usize>) -> usize { r.end - r.start }\npub fn explicit(r: std::ops::Range<usize>) -> usize { r.end - r.start }\n",
+    );
+    repo.write(
+        "src/real.rs",
+        "use crate::out::Range;\npub fn end(r: Range) -> usize { r.end }\n",
+    );
+    repo.write(
+        "src/mixed.rs",
+        "use std::ops::Range;\npub fn local(r: crate::out::Range) -> usize { r.end }\npub fn standard(r: Range<usize>) -> usize { r.end }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/out.rs",
+        "pub struct Range { pub start: usize, pub end: u64 }\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == "src/out.rs")
+        .unwrap();
+    let callers = change["impacted_callers"].as_array().unwrap();
+    assert!(
+        callers.iter().any(|caller| caller["path"] == "src/real.rs"),
+        "{context}"
+    );
+    assert!(
+        callers
+            .iter()
+            .any(|caller| caller["path"] == "src/mixed.rs" && caller["name"] == "local"),
+        "{context}"
+    );
+    assert!(
+        callers
+            .iter()
+            .all(|caller| caller["path"] != "src/other.rs"),
+        "{context}"
+    );
+    assert!(
+        callers
+            .iter()
+            .all(|caller| { caller["path"] != "src/mixed.rs" || caller["name"] == "local" }),
+        "{context}"
+    );
+    assert!(
+        change["informational_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .all(|caller| caller["path"] != "src/other.rs")),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_std_result_keeps_local_alias_usage() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "pub mod out;\nmod other;\nmod real;\n");
+    repo.write(
+        "src/out.rs",
+        "pub type Result<T> = std::result::Result<T, ()>;\n",
+    );
+    repo.write(
+        "src/other.rs",
+        "use std::io::Result;\nfn standard(value: Result<u64>) -> std::io::Result<u64> { value }\n",
+    );
+    repo.write(
+        "src/real.rs",
+        "use crate::out::Result;\nfn local(value: Result<u64>) -> Result<u64> { value }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/out.rs",
+        "pub type Result<T> = std::result::Result<T, String>;\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == "src/out.rs")
+        .unwrap();
+    let callers = change["impacted_callers"].as_array().unwrap();
+    assert!(
+        callers.iter().any(|caller| caller["path"] == "src/real.rs"),
+        "{context}"
+    );
+    assert!(
+        callers
+            .iter()
+            .all(|caller| caller["path"] != "src/other.rs"),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_cargo_target_roots_keep_private_alias_callers() {
+    for (root_path, target_section) in [
+        ("src/bin/tool.rs", ""),
+        (
+            "tools/tool.rs",
+            "[[bin]]\nname = \"tool\"\npath = \"tools/tool.rs\"\n",
+        ),
+        ("core/lib.rs", "[lib]\npath = \"core/lib.rs\"\n"),
+    ] {
+        let repo = TestRepo::new();
+        let root_dir = std::path::Path::new(root_path).parent().unwrap();
+        repo.create_dir_all(root_dir.join("consumer"));
+        repo.write(
+            "Cargo.toml",
+            format!(
+                "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{target_section}"
+            ),
+        );
+        repo.write(
+            root_path,
+            "mod consumer;\ntype Result<T> = std::result::Result<T, ()>;\nfn main() {}\n",
+        );
+        let consumer_path = root_dir.join("consumer/mod.rs");
+        repo.write(
+            &consumer_path,
+            "fn caller(value: super::Result<u8>) -> super::Result<u8> { value }\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            root_path,
+            "mod consumer;\ntype Result<T> = std::result::Result<T, String>;\nfn main() {}\n",
+        );
+
+        let context = repo.run_json("context", &["--git"]);
+        let change = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == root_path)
+            .unwrap();
+        assert!(
+            change["impacted_callers"]
+                .as_array()
+                .is_some_and(|callers| callers
+                    .iter()
+                    .any(|caller| { caller["path"] == consumer_path.to_str().unwrap() })),
+            "root={root_path}: {context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_custom_target_root_uses_index_manifest() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("tools/consumer");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[[bin]]\nname = \"tool\"\npath = \"tools/tool.rs\"\n",
+    );
+    repo.write(
+        "tools/tool.rs",
+        "mod consumer;\ntype Result<T> = std::result::Result<T, ()>;\nfn main() {}\n",
+    );
+    repo.write(
+        "tools/consumer/mod.rs",
+        "fn caller(value: super::Result<u8>) -> super::Result<u8> { value }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "tools/tool.rs",
+        "mod consumer;\ntype Result<T> = std::result::Result<T, String>;\nfn main() {}\n",
+    );
+    repo.stage_all();
+    // Working tree の manifest は index と異なる。staged 側の対象を読む必要がある。
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[[bin]]\nname = \"other\"\npath = \"tools/other.rs\"\n",
+    );
+
+    let context = repo.run_json("context", &["--git", "--staged"]);
+    assert!(
+        context["changes"][0]["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "tools/consumer/mod.rs")),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_auto_root_keeps_caller_with_unreadable_manifest() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src/bin/consumer");
+    repo.write("Cargo.toml", "[package\ninvalid");
+    repo.write(
+        "src/bin/tool.rs",
+        "mod consumer;\ntype Result<T> = std::result::Result<T, ()>;\nfn main() {}\n",
+    );
+    repo.write(
+        "src/bin/consumer/mod.rs",
+        "fn caller(value: super::Result<u8>) -> super::Result<u8> { value }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/bin/tool.rs",
+        "mod consumer;\ntype Result<T> = std::result::Result<T, String>;\nfn main() {}\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    assert!(
+        context["changes"][0]["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "src/bin/consumer/mod.rs")),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_regular_module_is_not_cargo_target_root() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "mod model;\nmod consumer;\n");
+    repo.write("src/model.rs", "type Payload = u8;\n");
+    repo.write(
+        "src/consumer.rs",
+        "type Payload = u16;\nfn caller(value: Payload) -> Payload { value }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/model.rs", "type Payload = u32;\n");
+
+    let context = repo.run_json("context", &["--git"]);
+    assert!(
+        context["changes"][0]["impacted_callers"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_paths_keep_only_their_module_owner() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src/other");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "pub mod origin;\npub mod other;\npub mod real;\npub mod unrelated;\n",
+    );
+    repo.write("src/origin.rs", "pub struct Payload { pub value: u8 }\n");
+    repo.write("src/unrelated.rs", "#[derive(Debug)] pub struct Helper;\n");
+    repo.write(
+        "src/other.rs",
+        "use std::fmt::Debug;\npub struct Payload { pub other: u8 }\nmod child;\npub fn local(value: Payload) -> Payload { value }\npub fn self_path(value: self::Payload) -> self::Payload { value }\npub fn explicit(value: crate::other::Payload) -> crate::other::Payload { value }\n",
+    );
+    repo.write(
+        "src/other/child.rs",
+        "pub fn parent(value: super::Payload) -> super::Payload { value }\n",
+    );
+    repo.write(
+        "src/real.rs",
+        "use crate::origin::Payload;\npub fn caller(value: Payload) -> Payload { value }\npub fn explicit(value: crate::origin::Payload) -> crate::origin::Payload { value }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/origin.rs", "pub struct Payload { pub value: u64 }\n");
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = &context["changes"][0];
+    assert!(
+        change["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers.iter().any(|caller| caller["path"] == "src/real.rs")),
+        "{context}"
+    );
+    for bucket in [
+        "impacted_callers",
+        "low_confidence_callers",
+        "informational_callers",
+    ] {
+        assert!(
+            change[bucket]
+                .as_array()
+                .is_none_or(|callers| callers.iter().all(|caller| {
+                    caller["path"] != "src/other.rs" && caller["path"] != "src/other/child.rs"
+                })),
+            "{bucket}: {context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_local_type_path_is_not_another_modules_free_function() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "pub mod origin;\npub mod other;\npub mod real;\n",
+    );
+    repo.write("src/origin.rs", "pub fn create() -> u8 { 0 }\n");
+    repo.write(
+        "src/other.rs",
+        "pub struct Factory;\nimpl Factory { pub fn create() -> u8 { 1 } }\npub fn caller() -> u8 { Factory::create() }\n",
+    );
+    repo.write(
+        "src/real.rs",
+        "pub fn caller() -> u8 { crate::origin::create() }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/origin.rs",
+        "pub fn create(value: u8) -> u8 { value }\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = &context["changes"][0];
+    assert!(
+        change["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers.iter().any(|caller| caller["path"] == "src/real.rs")),
+        "{context}"
+    );
+    for bucket in [
+        "impacted_callers",
+        "low_confidence_callers",
+        "informational_callers",
+    ] {
+        assert!(
+            change[bucket].as_array().is_none_or(|callers| callers
+                .iter()
+                .all(|caller| caller["path"] != "src/other.rs")),
+            "{bucket}: {context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_path_owner_keeps_reexports_and_path_attributes() {
+    for (root_source, bridge_source) in [
+        (
+            "pub mod origin;\npub mod bridge;\npub mod consumer;\n",
+            "pub use crate::origin::Payload;\n",
+        ),
+        (
+            "#[path = \"origin.rs\"] pub mod bridge;\npub mod consumer;\n",
+            "pub struct Payload { pub other: u8 }\n",
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write("src/lib.rs", root_source);
+        repo.write("src/origin.rs", "pub struct Payload { pub value: u8 }\n");
+        repo.write("src/bridge.rs", bridge_source);
+        repo.write(
+            "src/consumer.rs",
+            "pub fn caller(value: crate::bridge::Payload) -> crate::bridge::Payload { value }\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("src/origin.rs", "pub struct Payload { pub value: u64 }\n");
+
+        let context = repo.run_json("context", &["--git"]);
+        assert!(
+            context["changes"][0]["impacted_callers"]
+                .as_array()
+                .is_some_and(|callers| callers
+                    .iter()
+                    .any(|caller| caller["path"] == "src/consumer.rs")),
+            "{context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_super_path_keeps_a_shared_source_caller() {
+    for (module_tail, extra_path, extra_source) in [
+        (
+            "#[path = \"../other/child.rs\"] pub mod child;\n",
+            None,
+            None,
+        ),
+        (
+            "pub mod inc;\n",
+            Some("src/alias/inc.RS"),
+            Some("pub use super::Payload;\n#[path = \"../other/child.rs\"] pub mod child;\n"),
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src/other");
+        repo.create_dir_all("src/alias");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write("src/lib.rs", "pub mod other;\npub mod alias;\n");
+        repo.write(
+            "src/other.rs",
+            "pub struct Payload { pub value: u8 }\npub mod child;\n",
+        );
+        repo.write(
+            "src/other/child.rs",
+            "pub fn caller(value: super::Payload) -> super::Payload { value }\n",
+        );
+        if let (Some(path), Some(source)) = (extra_path, extra_source) {
+            repo.write(path, source);
+        }
+        repo.write(
+            "src/alias/mod.rs",
+            format!("pub struct Payload {{ pub value: u8 }}\n{module_tail}"),
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/alias/mod.rs",
+            format!("pub struct Payload {{ pub value: u64 }}\n{module_tail}"),
+        );
+
+        let context = repo.run_json("context", &["--git"]);
+        assert!(
+            context["changes"][0]["impacted_callers"]
+                .as_array()
+                .is_some_and(|callers| callers
+                    .iter()
+                    .any(|caller| caller["path"] == "src/other/child.rs")),
+            "{extra_path:?}: {context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_free_function_paths_keep_only_their_module_owner() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src/other");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "pub mod origin;\npub mod other;\npub mod real;\n",
+    );
+    repo.write("src/origin.rs", "pub fn create() -> u8 { 0 }\n");
+    repo.write(
+        "src/other.rs",
+        "use std::fmt::Debug;\npub fn create() -> u8 { 1 }\npub mod child;\npub fn bare() -> u8 { create() }\npub fn self_path() -> u8 { self::create() }\npub fn absolute() -> u8 { crate::other::create() }\n",
+    );
+    repo.write(
+        "src/other/child.rs",
+        "pub fn parent() -> u8 { super::create() }\n",
+    );
+    repo.write(
+        "src/real.rs",
+        "pub fn caller() -> u8 { crate::origin::create(2) }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/origin.rs",
+        "pub fn create(value: u8) -> u8 { value }\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = &context["changes"][0];
+    assert!(
+        change["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers.iter().any(|caller| caller["path"] == "src/real.rs")),
+        "{context}"
+    );
+    for bucket in [
+        "impacted_callers",
+        "low_confidence_callers",
+        "informational_callers",
+    ] {
+        assert!(
+            change[bucket]
+                .as_array()
+                .is_none_or(|callers| callers.iter().all(|caller| {
+                    caller["path"] != "src/other.rs" && caller["path"] != "src/other/child.rs"
+                })),
+            "{bucket}: {context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_path_owner_staged_uses_index_instead_of_worktree_modules() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "pub mod origin;\npub mod other;\npub mod consumer;\n",
+    );
+    repo.write("src/origin.rs", "pub struct Payload { pub value: u8 }\n");
+    repo.write("src/other.rs", "pub use crate::origin::Payload;\n");
+    repo.write(
+        "src/consumer.rs",
+        "pub fn caller(value: crate::other::Payload) -> crate::other::Payload { value }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/origin.rs", "pub struct Payload { pub value: u64 }\n");
+    repo.git(["add", "src/origin.rs"]);
+    repo.write("src/other.rs", "pub struct Payload { pub value: u8 }\n");
+
+    let context = repo.run_json("context", &["--git", "--staged"]);
+    assert!(
+        context["changes"][0]["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "src/consumer.rs")),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_shared_source_across_cargo_targets_keeps_caller() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("a/src/other");
+    repo.create_dir_all("b");
+    repo.write("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n");
+    repo.write(
+        "a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"../a/src/other.rs\"\n",
+    );
+    repo.write("a/src/lib.rs", "pub mod other;\npub mod sub;\n");
+    repo.write("a/src/sub.rs", "pub struct Payload { pub value: u8 }\n");
+    repo.write(
+        "a/src/other.rs",
+        "pub mod sub;\npub fn caller(value: self::sub::Payload) -> self::sub::Payload { value }\n",
+    );
+    repo.write(
+        "a/src/other/sub.rs",
+        "pub struct Payload { pub value: u8 }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("a/src/sub.rs", "pub struct Payload { pub value: u64 }\n");
+
+    let context = repo.run_json("context", &["--git"]);
+    assert!(
+        context["changes"][0]["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "a/src/other.rs")),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_external_workspace_member_keeps_shared_source_caller() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src/other");
+    let sibling = tempfile::Builder::new()
+        .prefix("shared-member-")
+        .tempdir_in(repo.root().parent().unwrap())
+        .unwrap();
+    let sibling_name = sibling.path().file_name().unwrap().to_str().unwrap();
+    let repo_name = repo.root().file_name().unwrap().to_str().unwrap();
+    repo.write(
+        "Cargo.toml",
+        format!("[workspace]\nmembers = [\".\", \"../{sibling_name}\"]\n[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    );
+    std::fs::write(
+        sibling.path().join("Cargo.toml"),
+        format!("[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\nworkspace = \"../{repo_name}\"\n[lib]\npath = \"../{repo_name}/src/other.rs\"\n"),
+    )
+    .unwrap();
+    repo.write("src/lib.rs", "pub mod other;\npub mod sub;\n");
+    repo.write("src/sub.rs", "pub struct Payload { pub value: u8 }\n");
+    repo.write(
+        "src/other.rs",
+        "pub mod sub;\npub fn caller(value: self::sub::Payload) -> self::sub::Payload { value }\n",
+    );
+    repo.write("src/other/sub.rs", "pub struct Payload { pub value: u8 }\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/sub.rs", "pub struct Payload { pub value: u64 }\n");
+
+    let context = repo.run_json("context", &["--git"]);
+    assert!(
+        context["changes"][0]["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "src/other.rs")),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_module_wiring_change_keeps_old_side_caller() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "pub mod origin;\npub mod consumer;\npub use origin as other;\n",
+    );
+    repo.write("src/origin.rs", "pub struct Payload { pub value: u8 }\n");
+    repo.write("src/other.rs", "pub struct Payload { pub value: u8 }\n");
+    repo.write(
+        "src/consumer.rs",
+        "pub fn caller(value: crate::other::Payload) -> crate::other::Payload { value }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/lib.rs",
+        "pub mod origin;\npub mod consumer;\npub mod other;\n",
+    );
+    repo.write("src/origin.rs", "pub struct Payload { pub value: u64 }\n");
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == "src/origin.rs")
+        .unwrap();
+    assert!(
+        change["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "src/consumer.rs")),
+        "{context}"
+    );
+    let output = cargo_bin()
+        .args([
+            "impact",
+            "--dir",
+            repo.root().to_str().unwrap(),
+            "--git",
+            "--hook",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{context}");
+}
+
+#[test]
+fn impact_rust_private_item_reaches_child_but_not_sibling() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src/foo");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "mod foo;\nmod other;\nmod consumer;\n");
+    repo.write("src/foo.rs", "mod child;\ntype Local = u32;\n");
+    repo.write(
+        "src/foo/child.rs",
+        "pub fn make(value: super::Local) -> super::Local { value }\n",
+    );
+    repo.write(
+        "src/other.rs",
+        "#[derive(Debug)] pub struct Marker;\npub type Local = u16;\n",
+    );
+    repo.write(
+        "src/consumer.rs",
+        "pub fn other(value: crate::other::Local) -> crate::other::Local { value }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/foo.rs", "mod child;\ntype Local = u64;\n");
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == "src/foo.rs")
+        .unwrap();
+    assert!(
+        change["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "src/foo/child.rs")),
+        "{context}"
+    );
+    for bucket in [
+        "impacted_callers",
+        "low_confidence_callers",
+        "informational_callers",
+    ] {
+        assert!(
+            change[bucket].as_array().is_none_or(|callers| callers
+                .iter()
+                .all(|caller| caller["path"] != "src/consumer.rs")),
+            "{bucket}: {context}"
+        );
+    }
+    let output = cargo_bin()
+        .args([
+            "impact",
+            "--dir",
+            repo.root().to_str().unwrap(),
+            "--git",
+            "--hook",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{context}");
+}
+
+#[test]
+fn impact_rust_private_root_function_reaches_child_file() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "mod consumer;\nfn helper(value: u8) -> u8 { value }\n",
+    );
+    repo.write(
+        "src/consumer.rs",
+        "pub fn use_helper() -> u8 { crate::helper(1) }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/lib.rs",
+        "mod consumer;\nfn helper(value: u64) -> u64 { value }\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    assert!(
+        context["changes"][0]["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "src/consumer.rs")),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_private_sibling_is_excluded_with_common_project_syntax() {
+    for variation in [
+        "expression macro",
+        "module attribute",
+        "two roots",
+        "unused source",
+        "test module",
+        "body macro edit",
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write(
+            "src/lib.rs",
+            if variation == "module attribute" {
+                "mod a;\nmod b;\nmod util;\n#[cfg(test)] mod tests;\n"
+            } else {
+                "mod a;\nmod b;\nmod util;\n"
+            },
+        );
+        repo.write(
+            "src/a.rs",
+            if variation == "test module" {
+                "fn helper(value: u8) -> u8 { value }\n#[cfg(test)] mod tests { use super::*; #[test] fn works() { assert_eq!(helper(1), 1); } }\n"
+            } else if variation == "body macro edit" {
+                "fn helper(value: u8) -> u8 { println!(\"old\"); value }\n"
+            } else {
+                "fn helper(value: u8) -> u8 { value }\n"
+            },
+        );
+        repo.write("src/util.rs", "pub fn helper(value: u8) -> u8 { value }\n");
+        repo.write(
+            "src/b.rs",
+            if variation == "expression macro" {
+                "use crate::util::helper;\npub fn call() -> u8 { println!(\"x\"); helper(1) }\n"
+            } else {
+                "use crate::util::helper;\npub fn call() -> u8 { helper(1) }\n"
+            },
+        );
+        if variation == "two roots" {
+            repo.write("src/main.rs", "fn main() {}\n");
+        }
+        if variation == "unused source" {
+            repo.write("src/orphan.rs", "fn check() { assert!(true); }\n");
+        }
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/a.rs",
+            if variation == "test module" {
+                "fn helper(value: u64) -> u64 { value }\n#[cfg(test)] mod tests { use super::*; #[test] fn works() { assert_eq!(helper(1), 1); } }\n"
+            } else if variation == "body macro edit" {
+                "fn helper(value: u64) -> u64 { println!(\"new\"); value }\n"
+            } else {
+                "fn helper(value: u64) -> u64 { value }\n"
+            },
+        );
+
+        let context = repo.run_json("context", &["--git"]);
+        for bucket in [
+            "impacted_callers",
+            "low_confidence_callers",
+            "informational_callers",
+        ] {
+            assert!(
+                context["changes"][0][bucket]
+                    .as_array()
+                    .is_none_or(|callers| callers
+                        .iter()
+                        .all(|caller| caller["path"] != "src/b.rs")),
+                "{variation} {bucket}: {context}"
+            );
+        }
+        let output = cargo_bin()
+            .args([
+                "impact",
+                "--dir",
+                repo.root().to_str().unwrap(),
+                "--git",
+                "--hook",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{variation}: {context}");
+    }
+}
+
+#[test]
+fn impact_rust_private_direct_import_works_inside_workspace() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("crates/sample/src");
+    repo.write("Cargo.toml", "[workspace]\nmembers = [\"crates/sample\"]\n");
+    repo.write(
+        "crates/sample/Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("crates/sample/src/lib.rs", "mod a;\nmod b;\nmod util;\n");
+    repo.write(
+        "crates/sample/src/a.rs",
+        "fn helper(value: u8) -> u8 { value }\n#[cfg(test)] mod tests { use super::*; #[test] fn works() { assert_eq!(helper(1), 1); } }\n",
+    );
+    repo.write(
+        "crates/sample/src/util.rs",
+        "pub fn helper(value: u8) -> u8 { value }\n",
+    );
+    repo.write(
+        "crates/sample/src/b.rs",
+        "use crate::util::helper;\npub fn call() -> u8 { helper(1) }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "crates/sample/src/a.rs",
+        "fn helper(value: u64) -> u64 { value }\n#[cfg(test)] mod tests { use super::*; #[test] fn works() { assert_eq!(helper(1), 1); } }\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = &context["changes"][0];
+    for bucket in [
+        "impacted_callers",
+        "low_confidence_callers",
+        "informational_callers",
+    ] {
+        assert!(
+            change[bucket].as_array().is_none_or(|callers| callers
+                .iter()
+                .all(|caller| caller["path"] != "crates/sample/src/b.rs")),
+            "{bucket}: {context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_private_leaf_ignores_unrelated_sibling_function() {
+    for (variation, extra) in [
+        (
+            "test module",
+            "#[cfg(test)] mod tests { use super::*; #[test] fn works() { assert_eq!(helper(1), 1); } }\n",
+        ),
+        (
+            "derive and formatting",
+            "#[derive(serde::Serialize)] struct Record;\nimpl std::fmt::Display for Record { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, \"record\") } }\n",
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n",
+        );
+        repo.write("src/lib.rs", "mod a;\nmod b;\n");
+        repo.write(
+            "src/a.rs",
+            format!("fn helper(value: u8) -> u8 {{ value }}\n{extra}"),
+        );
+        repo.write(
+            "src/b.rs",
+            "fn helper() -> u8 { println!(\"x\"); 1 }\npub fn call() -> u8 { helper() }\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/a.rs",
+            format!("fn helper(value: u64) -> u64 {{ value }}\n{extra}"),
+        );
+
+        let context = repo.run_json("context", &["--git"]);
+        for bucket in [
+            "impacted_callers",
+            "low_confidence_callers",
+            "informational_callers",
+        ] {
+            assert!(
+                context["changes"][0][bucket]
+                    .as_array()
+                    .is_none_or(|callers| callers
+                        .iter()
+                        .all(|caller| caller["path"] != "src/b.rs")),
+                "{variation} {bucket}: {context}"
+            );
+        }
+    }
+}
+
+#[test]
+fn impact_rust_visibility_widening_keeps_existing_child_without_sibling_noise() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src/model");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "pub mod model; mod other; mod state;\n");
+    repo.write(
+        "src/model.rs",
+        "struct Range { start: usize }\nmod child;\n",
+    );
+    repo.write(
+        "src/model/child.rs",
+        "pub fn make() -> super::Range { super::Range { start: 1 } }\n",
+    );
+    repo.write("src/state.rs", "pub struct Range(pub u8);\n");
+    repo.write(
+        "src/other.rs",
+        "use crate::state::Range;\npub fn take(value: Range) -> Range { println!(\"ok\"); value }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    for visibility in ["pub(crate)", "pub"] {
+        repo.write(
+            "src/model.rs",
+            format!("{visibility} struct Range {{ start: usize }}\nmod child;\n"),
+        );
+        let context = repo.run_json("context", &["--git"]);
+        let change = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == "src/model.rs")
+            .unwrap();
+        assert!(
+            change["informational_callers"]
+                .as_array()
+                .is_some_and(|callers| callers
+                    .iter()
+                    .any(|caller| caller["path"] == "src/model/child.rs")),
+            "{visibility}: {context}"
+        );
+        for bucket in [
+            "impacted_callers",
+            "low_confidence_callers",
+            "informational_callers",
+        ] {
+            assert!(
+                change[bucket].as_array().is_none_or(|callers| callers
+                    .iter()
+                    .all(|caller| caller["path"] != "src/other.rs")),
+                "{visibility} {bucket}: {context}"
+            );
+        }
+        for command in ["impact", "review"] {
+            let output = cargo_bin()
+                .args([
+                    command,
+                    "--dir",
+                    repo.root().to_str().unwrap(),
+                    "--git",
+                    "--hook",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{visibility} {command}: {context} {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+}
+
+#[test]
+fn impact_rust_visibility_widening_function_is_informational() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src/model");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "mod model; mod other; mod state;\n");
+    repo.write(
+        "src/model.rs",
+        "fn helper(value: u8) -> u8 { value }\nmod child;\n",
+    );
+    repo.write(
+        "src/model/child.rs",
+        "pub fn call() -> u8 { super::helper(1) }\n",
+    );
+    repo.write("src/state.rs", "pub fn helper(value: u8) -> u8 { value }\n");
+    repo.write(
+        "src/other.rs",
+        "use crate::state::helper;\npub fn call() -> u8 { helper(1) }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/model.rs",
+        "pub(crate) fn helper(value: u8) -> u8 { value }\nmod child;\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = &context["changes"][0];
+    assert!(
+        change["informational_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "src/model/child.rs")),
+        "{context}"
+    );
+    for bucket in [
+        "impacted_callers",
+        "low_confidence_callers",
+        "informational_callers",
+    ] {
+        assert!(
+            change[bucket].as_array().is_none_or(|callers| callers
+                .iter()
+                .all(|caller| caller["path"] != "src/other.rs")),
+            "{bucket}: {context}"
+        );
+    }
+    let output = cargo_bin()
+        .args([
+            "impact",
+            "--dir",
+            repo.root().to_str().unwrap(),
+            "--git",
+            "--hook",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    let review = cargo_bin()
+        .args([
+            "review",
+            "--dir",
+            repo.root().to_str().unwrap(),
+            "--git",
+            "--hook",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        review.status.code(),
+        Some(0),
+        "{context} {}",
+        String::from_utf8_lossy(&review.stdout)
+    );
+
+    repo.write(
+        "src/model.rs",
+        "pub(crate) fn helper(value: u64) -> u64 { value }\nmod child;\n",
+    );
+    let changed_contract = repo.run_json("context", &["--git"]);
+    assert!(
+        changed_contract["changes"][0]["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "src/model/child.rs")),
+        "{changed_contract}"
+    );
+}
+
+#[test]
+fn impact_rust_visibility_widening_keeps_glob_ambiguity_blocking() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "mod model; mod other;\n");
+    repo.write("src/model.rs", "struct Range<T>(T);\n");
+    repo.write(
+        "src/other.rs",
+        "use crate::model::*;\nuse std::ops::*;\npub fn take(value: Range<usize>) -> Range<usize> { value }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/model.rs", "pub(crate) struct Range<T>(T);\n");
+
+    let context = repo.run_json("context", &["--git"]);
+    assert!(
+        context["changes"][0]["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "src/other.rs")),
+        "{context}"
+    );
+    let output = cargo_bin()
+        .args([
+            "impact",
+            "--dir",
+            repo.root().to_str().unwrap(),
+            "--git",
+            "--hook",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{context}");
+}
+
+#[test]
+fn impact_rust_private_direct_import_does_not_hide_qualified_child_call() {
+    for (label, imports, body) in [
+        ("qualified", "use crate::util::helper;", "super::helper(1)"),
+        (
+            "block import",
+            "use crate::util::helper;",
+            "{ use super::*; helper(1) }",
+        ),
+        (
+            "conditional root import",
+            "#[cfg(not(test))] use crate::util::helper;\n#[cfg(test)] use super::helper;",
+            "helper(1)",
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write(
+            "src/lib.rs",
+            "mod a;\nmod b;\nmod util;\nfn helper(value: u8) -> u8 { value }\n",
+        );
+        repo.write(
+            "src/a.rs",
+            "fn helper(value: u8) -> u8 { value }\n#[path = \"b.rs\"] mod b2;\n",
+        );
+        repo.write(
+            "src/b.rs",
+            format!("{imports}\npub fn call() -> u8 {{ {body} }}\n"),
+        );
+        repo.write("src/util.rs", "pub fn helper(value: u8) -> u8 { value }\n");
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/a.rs",
+            "fn helper(value: u64) -> u64 { value }\n#[path = \"b.rs\"] mod b2;\n",
+        );
+
+        let context = repo.run_json("context", &["--git"]);
+        let call_line = if label == "conditional root import" {
+            2
+        } else {
+            1
+        };
+        assert!(
+            context["changes"][0]["impacted_callers"]
+                .as_array()
+                .is_some_and(|callers| callers
+                    .iter()
+                    .any(|caller| { caller["path"] == "src/b.rs" && caller["line"] == call_line })),
+            "{label}: {context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_private_name_uses_sibling_local_declaration_with_test_module() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "mod model;\nmod consumer;\n");
+    repo.write("src/model.rs", "type Payload = u8;\n");
+    repo.write(
+        "src/consumer.rs",
+        "type Payload = u16;\npub fn use_it(value: Payload) -> Payload { value }\n#[cfg(test)] mod tests { use super::*; #[test] fn works() {} }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/model.rs", "type Payload = u32;\n");
+
+    let context = repo.run_json("context", &["--git"]);
+    for bucket in [
+        "impacted_callers",
+        "low_confidence_callers",
+        "informational_callers",
+    ] {
+        assert!(
+            context["changes"][0][bucket]
+                .as_array()
+                .is_none_or(|callers| callers
+                    .iter()
+                    .all(|caller| caller["path"] != "src/consumer.rs")),
+            "{bucket}: {context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_private_struct_with_impl_keeps_child_and_ignores_sibling() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src/model");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "mod model;\nmod consumer;\n");
+    repo.write(
+        "src/model.rs",
+        "mod child;\nstruct Foo { value: u8 }\nimpl Foo { fn make(value: u8) -> Self { Self { value } } }\n",
+    );
+    repo.write(
+        "src/model/child.rs",
+        "pub fn make() -> super::Foo { super::Foo::make(1) }\n",
+    );
+    repo.write(
+        "src/consumer.rs",
+        "struct Foo { value: u16 }\npub fn make() -> Foo { Foo { value: 1 } }\n#[cfg(test)] mod tests { use super::*; #[test] fn works() {} }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/model.rs",
+        "mod child;\nstruct Foo { value: u64 }\nimpl Foo { fn make(value: u8) -> Self { Self { value: value.into() } } }\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = &context["changes"][0];
+    assert!(
+        change["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "src/model/child.rs")),
+        "{context}"
+    );
+    for bucket in [
+        "impacted_callers",
+        "low_confidence_callers",
+        "informational_callers",
+    ] {
+        assert!(
+            change[bucket].as_array().is_none_or(|callers| callers
+                .iter()
+                .all(|caller| caller["path"] != "src/consumer.rs")),
+            "{bucket}: {context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_visibility_narrowing_keeps_former_caller() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "mod foo;\nmod consumer;\n");
+    repo.write("src/foo.rs", "pub(crate) type Local = u32;\n");
+    repo.write(
+        "src/consumer.rs",
+        "pub fn make(value: crate::foo::Local) -> crate::foo::Local { value }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/foo.rs", "type Local = u32;\n");
+
+    let context = repo.run_json("context", &["--git"]);
+    assert!(
+        context["changes"][0]["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "src/consumer.rs")),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_absolute_grouped_use_shadows_standard_type() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.create_dir_all("shapes/src");
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"shapes\"]\n[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nshapes = { path = \"shapes\" }\n",
+    );
+    repo.write(
+        "shapes/Cargo.toml",
+        "[package]\nname = \"shapes\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("shapes/src/lib.rs", "pub struct Range { pub end: usize }\n");
+    repo.write(
+        "src/lib.rs",
+        "use std::ops::Range;\npub fn standard(r: Range<usize>) -> usize { r.end }\npub fn plain() -> usize { use shapes::Range; let r = Range { end: 1 }; r.end }\npub fn grouped() -> usize { use ::{shapes::Range}; let r = Range { end: 1 }; r.end }\npub fn aliased() -> usize { use ::{shapes::Range as Range}; let r = Range { end: 1 }; r.end }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("shapes/src/lib.rs", "pub struct Range { pub end: u64 }\n");
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == "shapes/src/lib.rs")
+        .unwrap();
+    let callers = change["impacted_callers"].as_array().unwrap();
+    for name in ["plain", "grouped", "aliased"] {
+        assert!(
+            callers.iter().any(|caller| caller["name"] == name),
+            "missing {name}: {context}"
+        );
+    }
+    assert!(
+        callers.iter().all(|caller| caller["name"] != "standard"),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_unreachable_cargo_package_does_not_claim_same_named_type() {
+    let repo = TestRepo::new();
+    for package in ["a", "b", "c"] {
+        repo.create_dir_all(format!("{package}/src"));
+    }
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n",
+    );
+    repo.write(
+        "a/Cargo.toml",
+        "[package]\nname = \"sample-a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "b/Cargo.toml",
+        "[package]\nname = \"sample-b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nanyhow = \"1\"\n",
+    );
+    repo.write(
+        "c/Cargo.toml",
+        "[package]\nname = \"sample-c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nsample-a = { path = \"../a\" }\n",
+    );
+    repo.write(
+        "a/src/lib.rs",
+        "pub type Result<T> = std::result::Result<T, ()>;\n",
+    );
+    repo.write(
+        "b/src/lib.rs",
+        "use anyhow::Result;\npub fn unrelated() -> Result<()> { Ok(()) }\n",
+    );
+    repo.write(
+        "c/src/lib.rs",
+        "use sample_a::Result;\npub fn caller() -> Result<()> { Ok(()) }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "a/src/lib.rs",
+        "pub type Result<T> = std::result::Result<T, u8>;\n",
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == "a/src/lib.rs")
+        .unwrap();
+    let callers = change["impacted_callers"].as_array().unwrap();
+    assert!(
+        callers
+            .iter()
+            .any(|caller| caller["path"] == "c/src/lib.rs"),
+        "{context}"
+    );
+    assert!(
+        callers
+            .iter()
+            .all(|caller| caller["path"] != "b/src/lib.rs"),
+        "{context}"
+    );
+    assert!(
+        change["informational_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .all(|caller| caller["path"] != "b/src/lib.rs")),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_source_included_by_another_package_keeps_real_caller() {
+    for layout in ["direct", "nested", "upper_ext", "unicode_ext"] {
+        let repo = TestRepo::new();
+        for package in ["a", "b", "d"] {
+            repo.create_dir_all(format!("{package}/src"));
+        }
+        repo.write(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"a\", \"b\", \"d\"]\n",
+        );
+        for package in ["a", "b", "d"] {
+            repo.write(
+            format!("{package}/Cargo.toml"),
+            format!(
+                "[package]\nname = \"sample-{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{}",
+                if package == "d" {
+                    "[dependencies]\nsample-a = { path = \"../a\" }\n"
+                } else {
+                    ""
+                }
+            ),
+        );
+        }
+        repo.write(
+            "a/src/lib.rs",
+            "pub type Result<T> = std::result::Result<T, ()>;\n",
+        );
+        repo.write("b/src/lib.rs", "pub fn unrelated() {}\n");
+        repo.write(
+            "b/src/shared.rs",
+            "use sample_a::Result;\npub fn caller() -> Result<()> { Ok(()) }\n",
+        );
+        if layout == "nested" {
+            repo.create_dir_all("d/src/vendor");
+            repo.write("d/src/lib.rs", "mod vendor;\n");
+            repo.write(
+                "d/src/vendor/mod.rs",
+                "#[path = \"../../../b/src/shared.rs\"] mod shared;\n",
+            );
+        } else if matches!(layout, "upper_ext" | "unicode_ext") {
+            repo.write("d/src/lib.rs", "mod inc;\n");
+            repo.write(
+                if layout == "upper_ext" {
+                    "d/src/inc.RS"
+                } else {
+                    "d/src/inc.rſ"
+                },
+                "#[path = \"../../b/src/shared.rs\"] mod shared;\n",
+            );
+        } else {
+            repo.write(
+                "d/src/lib.rs",
+                "#[path = \"../../b/src/shared.rs\"] mod shared;\n",
+            );
+        }
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "a/src/lib.rs",
+            "pub type Result<T> = std::result::Result<T, u8>;\n",
+        );
+
+        let context = repo.run_json("context", &["--git"]);
+        let change = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == "a/src/lib.rs")
+            .unwrap();
+        assert!(
+            change["impacted_callers"]
+                .as_array()
+                .is_some_and(|callers| callers
+                    .iter()
+                    .any(|caller| caller["path"] == "b/src/shared.rs")),
+            "layout={layout}: {context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_cargo_graph_keeps_callers_when_manifest_changes() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("a/src");
+    repo.create_dir_all("b/src");
+    repo.write("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n");
+    repo.write(
+        "a/Cargo.toml",
+        "[package]\nname = \"sample-a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "b/Cargo.toml",
+        "[package]\nname = \"sample-b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nsample-a = { path = \"../a\" }\n",
+    );
+    repo.write(
+        "a/src/lib.rs",
+        "pub type Result<T> = std::result::Result<T, ()>;\n",
+    );
+    repo.write(
+        "b/src/lib.rs",
+        "use sample_a::Result;\npub fn caller() -> Result<()> { Ok(()) }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "a/src/lib.rs",
+        "pub type Result<T> = std::result::Result<T, u8>;\n",
+    );
+    repo.stage_all();
+    repo.write(
+        "b/Cargo.toml",
+        "[package]\nname = \"sample-b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+
+    for arguments in [&["--git", "--staged"][..], &["--git"][..]] {
+        let context = repo.run_json("context", arguments);
+        let change = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == "a/src/lib.rs")
+            .unwrap();
+        assert!(
+            change["impacted_callers"]
+                .as_array()
+                .is_some_and(|callers| callers
+                    .iter()
+                    .any(|caller| caller["path"] == "b/src/lib.rs")),
+            "{arguments:?}: {context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_cargo_config_deletion_keeps_same_named_caller() {
+    let repo = TestRepo::new();
+    for package in ["a", "b"] {
+        repo.create_dir_all(format!("{package}/src"));
+    }
+    repo.create_dir_all(".cargo");
+    repo.write("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n");
+    repo.write(".cargo/config.toml", "[build]\n");
+    for package in ["a", "b"] {
+        repo.write(
+            format!("{package}/Cargo.toml"),
+            format!(
+                "[package]\nname = \"sample-{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+            ),
+        );
+    }
+    repo.write(
+        "a/src/lib.rs",
+        "pub type Result<T> = std::result::Result<T, ()>;\n",
+    );
+    repo.write(
+        "b/src/lib.rs",
+        "use anyhow::Result;\npub fn unrelated() -> Result<()> { Ok(()) }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "a/src/lib.rs",
+        "pub type Result<T> = std::result::Result<T, u8>;\n",
+    );
+    repo.remove_file(".cargo/config.toml");
+    std::fs::remove_dir(repo.root().join(".cargo")).unwrap();
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == "a/src/lib.rs")
+        .unwrap();
+    assert!(
+        change["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "b/src/lib.rs")),
+        "{context}"
+    );
+}
+
+#[test]
+fn impact_rust_one_line_body_change_does_not_block_callers() {
+    for (replacement, should_block) in [
+        ("pub fn helper() -> u8 { 2 }\n", false),
+        ("pub fn helper() -> u16 { 2 }\n", true),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write("src/lib.rs", "pub mod api;\nmod consumer;\n");
+        repo.write("src/api.rs", "pub fn helper() -> u8 { 1 }\n");
+        repo.write(
+            "src/consumer.rs",
+            "use crate::api::helper;\npub fn run() -> u8 { helper() }\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("src/api.rs", replacement);
+
+        let context = repo.run_json("context", &["--git"]);
+        let change = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == "src/api.rs")
+            .unwrap();
+        let blocking = change["impacted_callers"]
+            .as_array()
+            .is_some_and(|callers| {
+                callers
+                    .iter()
+                    .any(|caller| caller["path"] == "src/consumer.rs")
+            });
+        assert_eq!(blocking, should_block, "{replacement}: {context}");
+
+        let output = cargo_bin()
+            .args([
+                "impact",
+                "--dir",
+                repo.root().to_str().unwrap(),
+                "--git",
+                "--hook",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if should_block { 1 } else { 0 }),
+            "{replacement}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn impact_suppresses_only_proven_rust_type_alias_equivalence() {
     let repo = TestRepo::new();
     repo.create_dir_all("src");

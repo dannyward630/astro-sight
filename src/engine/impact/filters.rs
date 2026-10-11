@@ -139,13 +139,7 @@ impl CrossFileFilterContext<'_> {
         }
         // 4. エクスポートされていないシンボルをスキップ
         if !overlapping.is_some_and(|s| {
-            (self.lang_id == LangId::Rust
-                && sym.kind == "type"
-                && (self.file_path == "src/lib.rs"
-                    || self.file_path.ends_with("/src/lib.rs")
-                    || self.file_path == "src/main.rs"
-                    || self.file_path.ends_with("/src/main.rs"))
-                && declaration::is_rust_file_root_symbol(self.root, s))
+            (self.lang_id == LangId::Rust && declaration::is_rust_file_root_symbol(self.root, s))
                 || symbols::is_symbol_exported(
                     self.root,
                     self.source,
@@ -467,10 +461,9 @@ mod tests {
         ));
     }
 
-    // 4. 非 export (pub なし) の関数は除外
     #[test]
-    fn cross_file_filter_skips_non_exported_fn() {
-        let source = "fn foo(a: usize) -> usize { a }\n";
+    fn cross_file_filter_skips_private_function_inside_inline_module() {
+        let source = "mod inner { fn foo(a: usize) -> usize { a } }\n";
         assert!(!include_for_rust(
             source,
             &affected("foo", "function", "modified"),

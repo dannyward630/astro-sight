@@ -7,7 +7,11 @@ mod pass2;
 mod pass3;
 mod python_imports;
 mod reexport_move;
+mod rust_cargo_reachability;
 mod rust_impl_owner;
+mod rust_path_owner;
+mod rust_std_origin;
+mod rust_visibility_scope;
 mod signature;
 pub(crate) mod test_context;
 mod types;
@@ -25,7 +29,7 @@ use crate::models::call::CallEdge;
 use crate::models::impact::{AffectedSymbol, DiffFile, FileImpact, HunkInfo, SignatureChange};
 use crate::models::symbol::{Symbol, SymbolKind};
 
-use pass2::stream_caller_maps_and_defs;
+use pass2::{Pass2Evidence, stream_caller_maps_and_defs};
 use pass3::{apply_stage4b_single, build_file_impact, compute_has_parent_by_ix};
 use reexport_move::ReexportMoveIndex;
 use signature::detect_signature_changes;
@@ -60,8 +64,14 @@ struct FileContext {
     object_member_changes: HashMap<String, object_members::ObjectMemberChange>,
     /// 同名 affected がすべて Rust function/method の場合だけ値束縛を除外する。
     rust_function_names: HashSet<String>,
+    rust_free_function_names: HashSet<String>,
     /// 旧新の種別が異なる名前では束縛と値渡しを降格しない。
     rust_kind_changes: HashSet<String>,
+    /// Direct file-root Rust declarations whose current visibility is private.
+    /// Ambiguous same-name declarations are excluded from this proof.
+    rust_private_root_names: HashSet<String>,
+    /// Names whose entire source edit only widens a direct private Rust item.
+    rust_private_widening_names: HashSet<String>,
 }
 
 fn rust_function_names(lang: LangId, affected: &[AffectedSymbol]) -> HashSet<String> {
@@ -199,14 +209,53 @@ where
     // (`typed_low_caller_maps`) へ振り分けて強い impact 信号を汚染しない。
     let t = std::time::Instant::now();
     log_phase("context.pass2", "start", 0);
+    // Index 側の manifest、依存関係の変更、別 package への移動は
+    // 作業ツリーだけから旧側の到達性を証明できない。
+    let cargo_graph_enabled = options.new_side == crate::models::impact::DiffNewSide::WorkingTree
+        && !diff_files.iter().any(|file| {
+            (file.old_path != file.new_path
+                && [&file.old_path, &file.new_path].iter().any(|path| {
+                    Path::new(path)
+                        .extension()
+                        .is_some_and(|ext| match ext.to_str() {
+                            Some(ext) => !ext.is_ascii() || ext.eq_ignore_ascii_case("rs"),
+                            None => true,
+                        })
+                }))
+                || [&file.old_path, &file.new_path].iter().any(|path| {
+                    let path = Path::new(path);
+                    path.extension()
+                        .is_some_and(|ext| ext.to_str().is_none_or(|ext| !ext.is_ascii()))
+                        || path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.eq_ignore_ascii_case("Cargo.toml")
+                                    || name.eq_ignore_ascii_case("Cargo.lock")
+                            })
+                        || path.components().any(|component| {
+                            component
+                                .as_os_str()
+                                .to_str()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(".cargo"))
+                        })
+                })
+        });
     let pass2_maps = stream_caller_maps_and_defs(
         &file_contexts,
         &all_symbol_names,
         &sym_ix,
         &method_parent_types,
         dir,
-        options,
-        &reexport_moves,
+        Pass2Evidence {
+            options,
+            reexport_moves: &reexport_moves,
+            cargo_graph_enabled,
+            rust_module_wiring_unchanged: cargo_graph_enabled
+                && rust_path_owner::module_wiring_unchanged(dir, &diff_files, diff_input),
+            rust_private_scope_wiring_unchanged: cargo_graph_enabled
+                && rust_path_owner::private_scope_wiring_unchanged(dir, &diff_files, diff_input),
+        },
     );
     log_phase("context.pass2", "end", t.elapsed().as_millis());
     let crate::engine::impact::pass2::StreamCallerMaps {
@@ -630,11 +679,76 @@ fn collect_affected_symbols(
             &syms,
             &affected,
         );
+        let mut rust_private_root_names = HashSet::new();
+        if lang_id == LangId::Rust {
+            let old_private_names = diff::reconstruct_old_source(file_diff, &df.new_path, &source)
+                .and_then(|old| {
+                    let tree = parser::parse_source(&old.source, LangId::Rust).ok()?;
+                    let old_root = tree.root_node();
+                    if old_root.has_error() {
+                        return None;
+                    }
+                    let old_syms =
+                        symbols::extract_symbols(old_root, &old.source, LangId::Rust).ok()?;
+                    let mut counts = HashMap::new();
+                    for symbol in &old_syms {
+                        if rust_impl_owner::is_impl_owner(old_root, symbol) {
+                            continue;
+                        }
+                        *counts.entry(symbol.name.as_str()).or_insert(0usize) += 1;
+                    }
+                    let mut names = HashSet::new();
+                    for symbol in &old_syms {
+                        if !rust_impl_owner::is_impl_owner(old_root, symbol)
+                            && counts.get(symbol.name.as_str()) == Some(&1)
+                            && declaration::is_rust_file_root_symbol(old_root, symbol)
+                            && !symbols::is_symbol_exported(
+                                old_root,
+                                &old.source,
+                                LangId::Rust,
+                                symbol.identity_range(),
+                            )
+                        {
+                            names.insert(symbol.name.clone());
+                        }
+                    }
+                    Some(names)
+                })
+                .unwrap_or_default();
+            for change in &affected {
+                let mut named = syms.iter().filter(|symbol| {
+                    symbol.name == change.name && !rust_impl_owner::is_impl_owner(root, symbol)
+                });
+                if old_private_names.contains(&change.name)
+                    && let Some(symbol) = named.next()
+                    && named.next().is_none()
+                    && declaration::is_rust_file_root_symbol(root, symbol)
+                    && !symbols::is_symbol_exported(root, &source, lang_id, symbol.identity_range())
+                {
+                    rust_private_root_names.insert(change.name.clone());
+                }
+            }
+        }
+        let rust_private_widening_names =
+            if lang_id == LangId::Rust && diff_files.len() == 1 && df.old_path == df.new_path {
+                rust_visibility_scope::private_widening_names(
+                    file_diff,
+                    &df.new_path,
+                    &source,
+                    root,
+                    &affected,
+                )
+            } else {
+                HashSet::new()
+            };
         file_contexts.push(FileContext {
             new_path: df.new_path.clone(),
             lang_id,
             rust_function_names: declaration_proof.rust_function_names,
+            rust_free_function_names: declaration_proof.rust_free_function_names,
             rust_kind_changes: declaration_proof.rust_kind_changes,
+            rust_private_root_names,
+            rust_private_widening_names,
             affected,
             sig_changes,
             compatible_signature_keys,

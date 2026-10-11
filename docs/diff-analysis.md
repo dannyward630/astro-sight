@@ -70,6 +70,10 @@ From the result of `context`, `impact` flags impacts on files outside the diff a
 
 Signature changes are matched on identifier boundaries as in `context`, so a change to a test helper or a derived name does not spread as if the base function had changed. Local symbols declared inside a function are not used as starting points of cross-file impacts. TypeScript/JavaScript, Rust, Python, Go, Java, and Kotlin are supported, and nested Kotlin functions are told apart from top-level functions with the same name.
 
+For Rust, a private declaration directly in a source file can be used by child modules in other files. Impact analysis includes those callers. For a leaf module with no external children, it excludes same-name references in other files when it can rule out source inclusion. For modules with children, it excludes references outside the declaration's subtree only when the old and new visibility, ordinary module paths, and source layout can be verified. Unclear module layouts or source-generating macros keep the candidate. Private methods inside `impl` blocks are outside this file-level rule.
+
+When the only edit in a Rust source file adds `pub(crate)` or `pub` to a direct private item, unchanged references inside its former private subtree are informational. References outside that subtree are excluded because they could not have named the old item. This requires an unchanged ordinary Cargo module layout and no glob imports anywhere in the analyzed project: widening visibility can otherwise introduce an ambiguous name through a glob. Other edits in the same diff, uncertain ownership, and narrower or more complex visibility changes retain the normal blocking classification.
+
 ```bash
 # Get the git diff automatically and detect unresolved impacts (recommended)
 astro-sight impact --dir . --git

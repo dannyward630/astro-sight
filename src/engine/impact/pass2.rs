@@ -93,6 +93,14 @@ struct Pass2Scan {
     pool: rayon::ThreadPool,
 }
 
+pub(super) struct Pass2Evidence<'a> {
+    pub(super) options: &'a crate::models::impact::ContextAnalysisOptions,
+    pub(super) reexport_moves: &'a super::reexport_move::ReexportMoveIndex,
+    pub(super) cargo_graph_enabled: bool,
+    pub(super) rust_module_wiring_unchanged: bool,
+    pub(super) rust_private_scope_wiring_unchanged: bool,
+}
+
 /// Pass 2 の入力 `file_contexts` が全て case-insensitive 言語 (Xojo 等) かを判定する。
 ///
 /// **`diff_files_all_case_insensitive` (mod.rs / commands.rs) とは意図的に入力集合が
@@ -283,9 +291,15 @@ pub(super) fn stream_caller_maps_and_defs(
     sym_ix: &HashMap<String, usize>,
     method_parent_types: &HashMap<String, String>,
     dir: &Path,
-    options: &crate::models::impact::ContextAnalysisOptions,
-    reexport_moves: &super::reexport_move::ReexportMoveIndex,
+    evidence: Pass2Evidence<'_>,
 ) -> StreamCallerMaps {
+    let Pass2Evidence {
+        options,
+        reexport_moves,
+        cargo_graph_enabled,
+        rust_module_wiring_unchanged,
+        rust_private_scope_wiring_unchanged,
+    } = evidence;
     let n_sym = all_symbol_names.len();
     let n_fc = file_contexts.len();
 
@@ -351,6 +365,22 @@ pub(super) fn stream_caller_maps_and_defs(
     // 全 chunk を通して 1 つの StringPool を共有する。workers=1 なら lock 競合は発生しない。
     let string_pool = std::sync::Mutex::new(StringPool::new());
     let python_import_cache = super::python_imports::PythonImportCache::default();
+    let rust_std_project = super::rust_std_origin::RustStdProjectProof::new(dir);
+    let rust_path_owner_project = super::rust_path_owner::RustPathOwnerProjectProof::new(
+        dir,
+        rust_module_wiring_unchanged,
+        rust_private_scope_wiring_unchanged,
+    );
+    let rust_source_paths = file_contexts
+        .iter()
+        .map(|context| {
+            (context.lang_id == crate::language::LangId::Rust)
+                .then(|| dir.join(&context.new_path).canonicalize().ok())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    let rust_cargo_reachability =
+        super::rust_cargo_reachability::RustCargoReachability::new(dir, cargo_graph_enabled);
 
     let init_state = || new_worker_state(n_fc, n_sym);
 
@@ -401,6 +431,15 @@ pub(super) fn stream_caller_maps_and_defs(
                         let dir_str = dir.to_str().unwrap_or("");
                         let mut collector = ImpactCollector {
                             python_imports: std::cell::OnceCell::new(),
+                            rust_std_origin: std::cell::OnceCell::new(),
+                            rust_path_owner: std::cell::OnceCell::new(),
+                            rust_path_owner_project: &rust_path_owner_project,
+                            rust_source_paths: &rust_source_paths,
+                            rust_path_owner_enabled: options.new_side
+                                == crate::models::impact::DiffNewSide::WorkingTree,
+                            rust_std_project_allowed: std::cell::OnceCell::new(),
+                            rust_std_project: &rust_std_project,
+                            rust_cargo_reachability: &rust_cargo_reachability,
                             python_import_cache: &python_import_cache,
                             python_changed_names: sym_ix,
                             sym_to_fc: &sym_to_fc,
@@ -515,7 +554,10 @@ mod tests {
             affected_name_by_cikey: HashMap::new(),
             object_member_changes: HashMap::new(),
             rust_function_names: Default::default(),
+            rust_free_function_names: Default::default(),
             rust_kind_changes: Default::default(),
+            rust_private_root_names: Default::default(),
+            rust_private_widening_names: Default::default(),
         }
     }
 

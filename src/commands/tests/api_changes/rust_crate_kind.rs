@@ -874,3 +874,12 @@ fn cargo_toml_text_declares_lib_false_when_only_bin_array_section() {
     let text = "[package]\nname = \"x\"\n\n[[bin]]\nname = \"x\"\npath = \"src/main.rs\"\n";
     assert!(!cargo_toml_text_declares_lib(text));
 }
+
+#[test]
+fn cargo_toml_text_declares_lib_ignores_unrelated_target_paths() {
+    let binary_only = "[package]\nname = \"x\"\nbuild = \"../shared/build.rs\"\n[[bin]]\nname = \"x\"\npath = \"../tools/main.rs\"\n";
+    assert!(!cargo_toml_text_declares_lib(binary_only));
+    assert!(cargo_toml_text_declares_lib(&format!(
+        "{binary_only}[lib]\npath = \"../shared/lib.rs\"\n"
+    )));
+}

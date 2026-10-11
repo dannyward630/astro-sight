@@ -24,6 +24,7 @@ pub mod refs;
 pub(crate) mod rust_cfg;
 pub(crate) mod rust_scope;
 pub(crate) mod rust_signature;
+pub(crate) mod rust_targets;
 pub mod sequence;
 pub mod snippet;
 pub mod symbols;

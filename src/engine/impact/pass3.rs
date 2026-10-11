@@ -226,7 +226,10 @@ mod tests {
             affected_name_by_cikey: std::collections::HashMap::new(),
             object_member_changes: std::collections::HashMap::new(),
             rust_function_names: Default::default(),
+            rust_free_function_names: Default::default(),
             rust_kind_changes: Default::default(),
+            rust_private_root_names: Default::default(),
+            rust_private_widening_names: Default::default(),
         }
     }
 

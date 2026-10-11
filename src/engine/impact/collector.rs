@@ -8,6 +8,8 @@
 //! - `ImpactCollector`: `refs::RefVisitor` を実装し、per-file visit の callback を
 //!   直接受け取って `finish_file` で Stage 1-6 (Stage 4b 除く) を適用する。
 use lru::LruCache;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::engine::lexical_binding::LexicalBinding;
 use crate::engine::refs;
@@ -71,6 +73,10 @@ pub(super) struct RefEventMini {
     /// Rust: 参照 identifier が `json!()` の callee 名そのものか。通常の関数/値シンボル変更では
     /// macro callee は別名前空間なので low に落とす一方、macro 引数は `ref_in_macro` で high 維持する。
     pub(super) rust_macro_callee: bool,
+    /// `receiver.name` の field 位置。自由関数はこの構文で参照できない。
+    pub(super) rust_receiver_member: bool,
+    /// AST and project evidence identify this Rust reference as a standard crate name.
+    pub(super) rust_std_origin: bool,
     /// Rust: 参照が callee でない関数値渡し (`register((a, my_system, b))` のタプル要素等)。
     /// シグネチャのみ変更 (arity 不変) の場合、トレイト境界に吸収されコンパイルが通る
     /// ことが多いため informational へ格下げする (Issue 2026-07-12 Bevy systemparam FP)。
@@ -83,6 +89,14 @@ pub(super) struct RefEventMini {
     pub(super) rust_value_binding: bool,
     /// Python の相対 import で直接定義へ解決した所有元。未証明は u32::MAX。
     pub(super) python_import_owner_id: u32,
+    /// Rust type path structurally resolved to a local declaration file.
+    pub(super) rust_owner_path_id: u32,
+    pub(super) rust_owner_is_free_function: bool,
+    pub(super) rust_associated_type_path: bool,
+    /// A same-name direct declaration in the reference file owns this use.
+    pub(super) rust_local_owner: bool,
+    pub(super) rust_direct_import_site: bool,
+    pub(super) rust_import_binding_safe: bool,
 }
 
 /// 汎用すぎてシンボル名だけでは owner を特定できない PHP/JS 系メソッド名。
@@ -272,6 +286,15 @@ impl RouteDecisionContext<'_> {
 pub(super) struct ImpactCollector<'a> {
     pub(super) python_imports:
         std::cell::OnceCell<Option<super::python_imports::PythonImportIndex>>,
+    pub(super) rust_std_origin:
+        std::cell::OnceCell<Option<super::rust_std_origin::RustStdOriginIndex>>,
+    pub(super) rust_path_owner: std::cell::OnceCell<super::rust_path_owner::RustPathOwnerIndex>,
+    pub(super) rust_path_owner_project: &'a super::rust_path_owner::RustPathOwnerProjectProof,
+    pub(super) rust_source_paths: &'a [Option<PathBuf>],
+    pub(super) rust_path_owner_enabled: bool,
+    pub(super) rust_std_project_allowed: std::cell::OnceCell<bool>,
+    pub(super) rust_std_project: &'a super::rust_std_origin::RustStdProjectProof,
+    pub(super) rust_cargo_reachability: &'a super::rust_cargo_reachability::RustCargoReachability,
     pub(super) python_import_cache: &'a super::python_imports::PythonImportCache,
     pub(super) python_changed_names: &'a std::collections::HashMap<String, usize>,
     pub(super) sym_to_fc: &'a [Vec<u32>],
@@ -416,6 +439,21 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         let ref_in_macro = self.ref_lang == Some(LangId::Rust)
             && context_line_has_macro_invocation(context)
             && !rust_macro_callee;
+        // 行内の別マクロ (`vec![...].into_iter().collect()`) で macro hint が立っても、
+        // この識別子自身が receiver の field 位置なら自由関数を指すことはない。
+        // token_tree 内はマクロ展開で参照形が変わり得るため証明しない。
+        let rust_receiver_member =
+            self.ref_lang == Some(LangId::Rust) && node.is_some_and(is_rust_receiver_member);
+        let rust_std_origin = self.ref_lang == Some(LangId::Rust)
+            && node.is_some_and(|node| {
+                self.rust_std_origin
+                    .get_or_init(|| super::rust_std_origin::RustStdOriginIndex::build(node, source))
+                    .as_ref()
+                    .is_some_and(|index| index.proves_std_owner(node, source))
+                    && *self
+                        .rust_std_project_allowed
+                        .get_or_init(|| self.rust_std_project.allows(self.source_path_str))
+            });
 
         let python_import_owner_id = if self.ref_lang == Some(LangId::Python) {
             node.and_then(|node| {
@@ -444,6 +482,78 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             u32::MAX
         };
 
+        let rust_owner_index = (self.ref_lang == Some(LangId::Rust)
+            && self.rust_path_owner_enabled)
+            .then(|| {
+                node.map(|node| {
+                    self.rust_path_owner.get_or_init(|| {
+                        super::rust_path_owner::RustPathOwnerIndex::build(node, source)
+                    })
+                })
+            })
+            .flatten();
+        let rust_owner = if let (Some(index), Some(node)) = (rust_owner_index, node) {
+            index
+                .type_owner(
+                    node,
+                    source,
+                    Path::new(self.dir),
+                    self.path_str,
+                    self.rust_path_owner_project,
+                )
+                .map(|owner| (owner, false))
+                .or_else(|| {
+                    index
+                        .free_function_owner(
+                            node,
+                            source,
+                            Path::new(self.dir),
+                            self.path_str,
+                            self.rust_path_owner_project,
+                        )
+                        .map(|owner| (owner, true))
+                })
+        } else {
+            None
+        };
+        let rust_owner_path_id = rust_owner
+            .as_ref()
+            .and_then(|(owner, _)| owner.to_str())
+            .map_or(u32::MAX, |owner| {
+                self.pool
+                    .lock()
+                    .expect("string pool mutex poisoned")
+                    .intern(owner)
+            });
+        let rust_owner_is_free_function = rust_owner.is_some_and(|(_, is_free)| is_free);
+        let rust_associated_type_path = rust_owner_index
+            .zip(node)
+            .is_some_and(|(index, node)| index.is_local_associated_path(node, source));
+        let rust_plain_name = self.ref_lang == Some(LangId::Rust)
+            && !ref_in_macro
+            && !rust_macro_callee
+            && node.is_some_and(|node| {
+                matches!(node.kind(), "identifier" | "type_identifier")
+                    && node.parent().is_none_or(|parent| {
+                        !matches!(
+                            parent.kind(),
+                            "scoped_identifier" | "scoped_type_identifier"
+                        )
+                    })
+            });
+        let rust_local_owner = rust_plain_name
+            && rust_owner_index.zip(node).is_some_and(|(index, node)| {
+                index.plain_local_owner(node, source, &self.all_symbol_names[ix])
+                    || index.plain_local_function_owner(node, source, &self.all_symbol_names[ix])
+            });
+        let rust_direct_import_site = rust_owner_index.zip(node).is_some_and(|(index, node)| {
+            index.is_tracked_direct_import_site(node, source, &self.all_symbol_names[ix])
+        });
+        let rust_import_binding_safe = rust_plain_name
+            && rust_owner_index.zip(node).is_some_and(|(index, node)| {
+                index.plain_import_binding_safe(node, source, &self.all_symbol_names[ix])
+            });
+
         self.ref_events.push(RefEventMini {
             sym_ix,
             line: line as u32,
@@ -454,11 +564,19 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             local_shadow_hint,
             ref_in_macro,
             rust_macro_callee,
+            rust_receiver_member,
+            rust_std_origin,
             fn_value_ref: usage == refs::RefUsageRole::FunctionValue,
             member_path_id,
             unproven_module_ref,
             rust_value_binding: lexical_binding == LexicalBinding::RustValueBinding,
             python_import_owner_id,
+            rust_owner_path_id,
+            rust_owner_is_free_function,
+            rust_associated_type_path,
+            rust_local_owner,
+            rust_direct_import_site,
+            rust_import_binding_safe,
         });
     }
 }
@@ -466,6 +584,27 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
 /// 同名の別 kind をまとめて除外しない。変更後 kind も含めて全件を確認する。
 fn rust_function_only(context: &FileContext, name: &str) -> bool {
     context.lang_id == LangId::Rust && context.rust_function_names.contains(name)
+}
+
+fn is_rust_receiver_member(node: tree_sitter::Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != "field_expression"
+        || !parent
+            .child_by_field_name("field")
+            .is_some_and(|field| field.id() == node.id())
+    {
+        return false;
+    }
+    let mut ancestor = Some(parent);
+    while let Some(current) = ancestor {
+        if current.kind() == "token_tree" {
+            return false;
+        }
+        ancestor = current.parent();
+    }
+    true
 }
 
 impl<'a> ImpactCollector<'a> {
@@ -494,6 +633,20 @@ impl<'a> ImpactCollector<'a> {
         // Phase 4: confidence == BareNameOnly + シンボル名が generic (new/update/...) なら
         // local_low_maps へ振り分け、強い impact 信号を汚染しない。
         let filter_disabled = confidence_filter_disabled();
+        let rust_cargo_unreachable =
+            if self.ref_lang == Some(LangId::Rust) && !self.ref_events.is_empty() {
+                self.file_contexts
+                    .iter()
+                    .map(|context| {
+                        context.lang_id == LangId::Rust
+                            && self
+                                .rust_cargo_reachability
+                                .proves_unreachable(self.path_str, &context.new_path)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
         // symlink 経由の同一ファイルを別の所有元と判定しない。変更元ごとに1回だけ解決する。
         let python_source_paths = if self
             .ref_events
@@ -528,6 +681,10 @@ impl<'a> ImpactCollector<'a> {
         } else {
             &[]
         };
+        let mut rust_owner_paths: HashMap<u32, Option<PathBuf>> = HashMap::new();
+        let mut rust_private_scope: HashMap<usize, Option<bool>> = HashMap::new();
+        let mut rust_private_import_owners: HashMap<(usize, usize), bool> = HashMap::new();
+        let rust_ref_source = std::cell::OnceCell::new();
         let mut route_context = RouteDecisionContext {
             filter_disabled,
             ref_lang: self.ref_lang,
@@ -572,7 +729,134 @@ impl<'a> ImpactCollector<'a> {
                 {
                     continue;
                 }
+                if e.rust_receiver_member
+                    && ctx
+                        .rust_free_function_names
+                        .contains(&self.all_symbol_names[sym_ix_usize])
+                {
+                    continue;
+                }
+                if e.rust_std_origin && ctx.lang_id == LangId::Rust {
+                    continue;
+                }
+                if e.rust_associated_type_path
+                    && ctx.lang_id == LangId::Rust
+                    && !filter_disabled
+                    && ctx
+                        .rust_free_function_names
+                        .contains(&self.all_symbol_names[sym_ix_usize])
+                {
+                    continue;
+                }
+                if e.rust_owner_path_id != u32::MAX
+                    && ctx.lang_id == LangId::Rust
+                    && !filter_disabled
+                    && (!e.rust_owner_is_free_function
+                        || ctx
+                            .rust_free_function_names
+                            .contains(&self.all_symbol_names[sym_ix_usize]))
+                {
+                    let owner = rust_owner_paths
+                        .entry(e.rust_owner_path_id)
+                        .or_insert_with(|| {
+                            let owner = {
+                                let pool = self.pool.lock().expect("string pool mutex poisoned");
+                                pool.get(e.rust_owner_path_id).to_owned()
+                            };
+                            Path::new(self.dir).join(owner).canonicalize().ok()
+                        });
+                    if let (Some(owner), Some(Some(source))) =
+                        (owner.as_ref(), self.rust_source_paths.get(fc_ix))
+                        && owner != source
+                    {
+                        continue;
+                    }
+                }
+                if rust_cargo_unreachable.get(fc_ix) == Some(&true) {
+                    continue;
+                }
                 let source_path = &ctx.new_path;
+                let visibility_only_widening = ctx.lang_id == LangId::Rust
+                    && !filter_disabled
+                    && !filters::is_same_source_file(self.path_str, source_path)
+                    && ctx
+                        .rust_private_widening_names
+                        .contains(&self.all_symbol_names[sym_ix_usize])
+                    && self.rust_path_owner_project.allows_private_widening_paths();
+                let visibility_only_informational = if visibility_only_widening {
+                    let old_scope = *rust_private_scope.entry(fc_ix).or_insert_with(|| {
+                        self.rust_path_owner.get().and_then(|index| {
+                            index.private_subtree_contains(
+                                Path::new(self.dir),
+                                source_path,
+                                self.path_str,
+                                self.rust_path_owner_project,
+                            )
+                        })
+                    });
+                    if old_scope == Some(false) {
+                        continue;
+                    }
+                    old_scope == Some(true)
+                } else {
+                    false
+                };
+                if ctx.lang_id == LangId::Rust
+                    && !filter_disabled
+                    && !filters::is_same_source_file(self.path_str, source_path)
+                    && ctx
+                        .rust_private_root_names
+                        .contains(&self.all_symbol_names[sym_ix_usize])
+                {
+                    if self
+                        .rust_path_owner_project
+                        .private_source_is_leaf(source_path)
+                    {
+                        continue;
+                    }
+                    if e.rust_local_owner {
+                        continue;
+                    }
+                    let outside_subtree = rust_private_scope.entry(fc_ix).or_insert_with(|| {
+                        self.rust_path_owner.get().and_then(|index| {
+                            index.private_subtree_contains(
+                                Path::new(self.dir),
+                                source_path,
+                                self.path_str,
+                                self.rust_path_owner_project,
+                            )
+                        })
+                    }) == &Some(false);
+                    if outside_subtree {
+                        continue;
+                    }
+                    let other_import = (e.rust_import_binding_safe || e.rust_direct_import_site)
+                        && *rust_private_import_owners
+                            .entry((fc_ix, sym_ix_usize))
+                            .or_insert_with(|| {
+                                self.rust_path_owner.get().is_some_and(|index| {
+                                    rust_ref_source
+                                        .get_or_init(|| {
+                                            std::fs::read(Path::new(self.dir).join(self.path_str))
+                                                .ok()
+                                        })
+                                        .as_ref()
+                                        .is_some_and(|source| {
+                                            index.imports_other_private_owner(
+                                                Path::new(self.dir),
+                                                source_path,
+                                                self.path_str,
+                                                source,
+                                                &self.all_symbol_names[sym_ix_usize],
+                                                self.rust_path_owner_project,
+                                            )
+                                        })
+                                })
+                            });
+                    if other_import {
+                        continue;
+                    }
+                }
                 let source_lang_group = lang_compat_group(ctx.lang_id);
 
                 if filters::is_same_source_file(self.path_str, source_path) {
@@ -607,14 +891,18 @@ impl<'a> ImpactCollector<'a> {
                             let pool = self.pool.lock().expect("string pool mutex poisoned");
                             change.read_is_unchanged(pool.get(e.member_path_id))
                         });
-                let route = route_context.decide(
-                    &e,
-                    ctx,
-                    sym_key_canonical,
-                    has_parent_type,
-                    base_route_low,
-                    member_unchanged,
-                );
+                let route = if visibility_only_informational {
+                    CallerRoute::Informational
+                } else {
+                    route_context.decide(
+                        &e,
+                        ctx,
+                        sym_key_canonical,
+                        has_parent_type,
+                        base_route_low,
+                        member_unchanged,
+                    )
+                };
                 // 事前 index (ci_key→元名) で O(1) 参照。per-ref の線形 find + ci_key String 割当を排除。
                 let affected_sym_name = ctx
                     .affected_name_by_cikey
@@ -677,11 +965,19 @@ mod tests {
             local_shadow_hint: false,
             ref_in_macro: false,
             rust_macro_callee: false,
+            rust_receiver_member: false,
+            rust_std_origin: false,
             fn_value_ref: false,
             member_path_id: u32::MAX,
             unproven_module_ref: false,
             rust_value_binding: false,
             python_import_owner_id: u32::MAX,
+            rust_owner_path_id: u32::MAX,
+            rust_owner_is_free_function: false,
+            rust_associated_type_path: false,
+            rust_local_owner: false,
+            rust_direct_import_site: false,
+            rust_import_binding_safe: false,
         }
     }
 
@@ -729,6 +1025,7 @@ mod tests {
             new_path: "src/changed.rs".to_string(),
             lang_id: LangId::Rust,
             rust_function_names: super::super::rust_function_names(LangId::Rust, &affected),
+            rust_free_function_names: Default::default(),
             affected,
             sig_changes,
             compatible_signature_keys: Default::default(),
@@ -738,6 +1035,8 @@ mod tests {
             affected_name_by_cikey: Default::default(),
             object_member_changes: Default::default(),
             rust_kind_changes: Default::default(),
+            rust_private_root_names: Default::default(),
+            rust_private_widening_names: Default::default(),
         }
     }
 
