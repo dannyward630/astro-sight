@@ -857,6 +857,130 @@ fn review_hook_multiline_jsx_checks_only_the_opening_tag() {
 }
 
 #[test]
+fn review_hook_attributes_removed_generated_method_to_surviving_source_class() {
+    let source_class =
+        "export class Formatter { formatItem(value: number): string { return String(value); } }\n";
+    let generated_class =
+        "export class Formatter { formatItem(value) { return String(value); } }\n";
+    let source_call =
+        "import { Formatter } from './util.ts';\nconsole.log(new Formatter().formatItem(1));\n";
+    let generated_call = "import { Formatter as OldFormatter } from '../dist/util.js';\nconsole.log(new OldFormatter().formatItem(1));\n";
+    for (legacy, should_block) in [(None, false), (Some(generated_call), true)] {
+        let mut files = vec![
+            (
+                "package.json",
+                "{\"name\":\"example\",\"private\":true,\"type\":\"module\"}\n",
+            ),
+            ("src/util.ts", source_class),
+            ("src/main.ts", source_call),
+            ("dist/util.js", generated_class),
+            (
+                "dist/util.d.ts",
+                "export declare class Formatter { formatItem(value: number): string; }\n",
+            ),
+            (
+                "dist/main.js",
+                "import { Formatter } from './util.js';\nnew Formatter().formatItem(1);\n",
+            ),
+        ];
+        if let Some(legacy) = legacy {
+            files.push(("src/legacy.ts", legacy));
+        }
+        let output = a3_review_hook(
+            |root| {
+                std::fs::remove_file(root.join("dist/util.js")).unwrap();
+                std::fs::remove_file(root.join("dist/util.d.ts")).unwrap();
+                std::fs::remove_file(root.join("dist/main.js")).unwrap();
+            },
+            &files,
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(!output.status.success(), should_block, "{stderr}");
+        if should_block {
+            assert!(stderr.contains("\"rm\""), "{stderr}");
+        } else {
+            assert!(stderr.contains("\"rm_dead\""), "{stderr}");
+            assert!(!stderr.contains("\"rm\""), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn review_hook_keeps_removed_method_when_survivor_owner_is_unproven() {
+    let generated = "export class Formatter { formatItem(value) { return String(value); } }\n";
+    let source =
+        "export class Formatter { formatItem(value: number): string { return String(value); } }\n";
+    let cases = [
+        (
+            source,
+            "import { Formatter } from './util.ts';\nfunction run(Formatter: any) { new Formatter().formatItem(1); }\nrun(null);\n",
+            None,
+        ),
+        (
+            "export class Formatter {}\n",
+            "import { Formatter } from './util.ts';\nnew Formatter().formatItem(1);\n",
+            Some("export class Other { formatItem() { return 'x'; } }\n"),
+        ),
+        (
+            "import { Formatter as OldFormatter } from '../dist/util.js';\nexport class Formatter { formatItem() { return new OldFormatter().formatItem(1); } }\n",
+            "import { Formatter } from './util.ts';\nnew Formatter().formatItem(1);\n",
+            None,
+        ),
+        (
+            "export class Formatter { constructor() { return replacement; } formatItem() { return 'x'; } }\n",
+            "import { Formatter } from './util.ts';\nnew Formatter().formatItem(1);\n",
+            None,
+        ),
+        (
+            source,
+            "import type { Formatter } from './util.ts';\nnew Formatter().formatItem(1);\n",
+            None,
+        ),
+        (
+            source,
+            "import { type Formatter } from './util.ts';\nnew Formatter().formatItem(1);\n",
+            None,
+        ),
+    ];
+    for (util, main, other) in cases {
+        let mut files = vec![
+            (
+                "package.json",
+                "{\"name\":\"example\",\"private\":true,\"type\":\"module\"}\n",
+            ),
+            ("src/util.ts", util),
+            ("src/main.ts", main),
+            ("dist/util.js", generated),
+        ];
+        if let Some(other) = other {
+            files.push(("src/other.ts", other));
+        }
+        let output = a3_review_hook(
+            |root| std::fs::remove_file(root.join("dist/util.js")).unwrap(),
+            &files,
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{main}\n{stderr}");
+        assert!(stderr.contains("\"rm\""), "{main}\n{stderr}");
+    }
+
+    let output = a3_review_hook(
+        |root| std::fs::remove_file(root.join("src/util.js")).unwrap(),
+        &[
+            ("src/util.ts", source),
+            ("src/util.js", generated),
+            (
+                "src/main.ts",
+                "import { Formatter } from './util';\nnew Formatter().formatItem(1);\n",
+            ),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("\"rm\""), "{stderr}");
+}
+
+#[test]
 fn review_hook_distinguishes_independent_names_from_removed_function_calls() {
     let before =
         "def abort(message):\n    raise SystemExit(message)\ndef version():\n    return '1.0'\n";

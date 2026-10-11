@@ -35,15 +35,22 @@ pub(super) fn apply_stage4b_single(
     def_paths_by_ix: &[Vec<u32>],
     pool: &StringPool,
     has_parent_by_ix: &HashMap<u32, bool>,
-    source_path: &str,
+    ctx: &FileContext,
 ) -> CallerMap {
+    let source_path = &ctx.new_path;
     let mut out: CallerMap = HashMap::with_capacity(typed_map.len());
     for ((path_id, line), (caller_name_id, sym_entries)) in typed_map {
         let path_str = pool.get(path_id).to_string();
         let caller_name = pool.get(caller_name_id).to_string();
         let mut kept: Vec<String> = Vec::with_capacity(sym_entries.len());
         for (sym_ix_val, sym_name_id) in sym_entries {
-            if *has_parent_by_ix.get(&sym_ix_val).unwrap_or(&false)
+            // A private inherent method can be called by descendants even when another
+            // type declares the same name. Keep ambiguous calls instead of discarding
+            // genuine callers through a name-only competing-definition check.
+            if !ctx
+                .rust_private_method_owners
+                .contains_key(pool.get(sym_name_id))
+                && *has_parent_by_ix.get(&sym_ix_val).unwrap_or(&false)
                 && let Some(paths) = def_paths_by_ix.get(sym_ix_val as usize)
             {
                 let has_competing_def = paths.iter().any(|&pid| {
@@ -64,6 +71,48 @@ pub(super) fn apply_stage4b_single(
         }
     }
     out
+}
+
+/// A same-name definition in the reference file makes an untyped receiver ambiguous.
+/// Preserve the candidate but avoid a blocking result until its owner is known.
+pub(super) fn demote_private_method_local_competitors(
+    normal: &mut CallerMap,
+    low: &mut CallerMap,
+    ctx: &FileContext,
+    def_paths_by_ix: &[Vec<u32>],
+    pool: &StringPool,
+    sym_ix: &HashMap<String, usize>,
+) {
+    if ctx.rust_private_method_owners.is_empty() {
+        return;
+    }
+    let mut demoted = Vec::new();
+    normal.retain(|(path, line), (caller, symbols)| {
+        let mut moved = Vec::new();
+        symbols.retain(|name| {
+            let competing_here = ctx.rust_private_method_owners.contains_key(name)
+                && sym_ix
+                    .get(&ci_key(ctx.lang_id, name))
+                    .and_then(|&ix| def_paths_by_ix.get(ix))
+                    .is_some_and(|paths| paths.iter().any(|&pid| pool.get(pid) == path));
+            if competing_here {
+                moved.push(name.clone());
+            }
+            !competing_here
+        });
+        if !moved.is_empty() {
+            demoted.push(((path.clone(), *line), (caller.clone(), moved)));
+        }
+        !symbols.is_empty()
+    });
+    for (key, (caller, moved)) in demoted {
+        let entry = low.entry(key).or_insert_with(|| (caller, Vec::new()));
+        for name in moved {
+            if !entry.1.contains(&name) {
+                entry.1.push(name);
+            }
+        }
+    }
 }
 
 /// Pass 4 (per-fc): 1 ファイル分の `CallerMap` と `FileContext` から `FileImpact` を組み立てる。
@@ -229,6 +278,7 @@ mod tests {
             rust_free_function_names: Default::default(),
             rust_kind_changes: Default::default(),
             rust_private_root_names: Default::default(),
+            rust_private_method_owners: Default::default(),
             rust_private_widening_names: Default::default(),
         }
     }

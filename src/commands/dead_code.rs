@@ -14,7 +14,9 @@ use super::api_changes::{
     bare_name, extract_exported_symbols_from_file_inner_with_lang, extract_symbol_lines,
 };
 use super::dead_code_default_liveness::DefaultExportLiveness;
-use super::dead_code_member_liveness::{JsTsMemberLiveness, MemberStatus, PhpMemberLiveness};
+use super::dead_code_member_liveness::{
+    JsTsMemberLiveness, MemberStatus, PhpMemberLiveness, RustMemberLiveness,
+};
 use super::git_input::{DiffSourceResolution, resolve_diff_source};
 use crate::output::{OutputOptions, serialize_cli_document};
 
@@ -105,9 +107,21 @@ pub(crate) fn detect_dead_symbols(
     let asset_refs = collect_framework_asset_refs(&canonical_dir);
     let default_liveness =
         DefaultExportLiveness::build(&candidates.all_syms, &canonical_dir, &scan.files);
+    let rust_member_liveness = RustMemberLiveness::build(
+        &candidates.all_syms,
+        &canonical_dir,
+        &scan.files,
+        is_test_path,
+    );
 
-    let (mut dead, mut test_only) =
-        classify_dead_symbols(&candidates, &index, &counts, &asset_refs, &default_liveness);
+    let (mut dead, mut test_only) = classify_dead_symbols(
+        &candidates,
+        &index,
+        &counts,
+        &asset_refs,
+        &default_liveness,
+        &rust_member_liveness,
+    );
     attach_declaration_lines(dir, &mut dead, &mut test_only);
     DeadCodeDetection {
         dead,
@@ -423,6 +437,7 @@ fn member_status_for_candidate(
     lang: crate::language::LangId,
     js_ts_liveness: &JsTsMemberLiveness,
     php_liveness: &PhpMemberLiveness,
+    rust_liveness: &RustMemberLiveness,
 ) -> Option<MemberStatus> {
     let (owner, bare) = name.rsplit_once('.')?;
     if owner.contains('.') {
@@ -434,6 +449,7 @@ fn member_status_for_candidate(
         | crate::language::LangId::Javascript
         | crate::language::LangId::Tsx => js_ts_liveness.status_for(owner, bare, file),
         crate::language::LangId::Php => php_liveness.status_for(owner, bare, file),
+        crate::language::LangId::Rust => rust_liveness.status_for(owner, bare, file),
         _ => None,
     }
 }
@@ -445,6 +461,7 @@ fn classify_dead_symbols(
     counts: &std::collections::HashMap<String, (usize, usize)>,
     asset_refs: &FrameworkAssetRefs,
     default_liveness: &DefaultExportLiveness,
+    rust_member_liveness: &RustMemberLiveness,
 ) -> (Vec<DeadSymbol>, Vec<DeadSymbol>) {
     // production 0 / test 0 → dead_symbols
     // production 0 / test > 0 → test_only_symbols (F5)
@@ -456,14 +473,22 @@ fn classify_dead_symbols(
         // 同名シンボルが複数存在する場合は bare name では区別できないためスキップする。
         // ただし TS/JS の class member については `JsTsMemberLiveness` で owner 一意推定
         // が成立した場合のみ、duplicate スキップを緩和して通常判定に乗せる。
-        if index.name_counts.get(&key).copied().unwrap_or(0) > 1 {
-            match member_status_for_candidate(
-                name,
-                file,
-                *lang,
-                &index.member_liveness,
-                &index.php_member_liveness,
-            ) {
+        let member_status = member_status_for_candidate(
+            name,
+            file,
+            *lang,
+            &index.member_liveness,
+            &index.php_member_liveness,
+            rust_member_liveness,
+        );
+        if index.name_counts.get(&key).copied().unwrap_or(0) > 1
+            || (*lang == crate::language::LangId::Rust
+                && matches!(
+                    member_status,
+                    Some(MemberStatus::Live | MemberStatus::TestOnly | MemberStatus::Dead)
+                ))
+        {
+            match member_status {
                 Some(MemberStatus::Live) => continue,
                 Some(MemberStatus::TestOnly) => {
                     // Angular template / Android XML から参照されるシンボルは live。

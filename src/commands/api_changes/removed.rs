@@ -68,6 +68,15 @@ pub(crate) fn partition_removed_dead_candidates(
     // 除外する。これがないと汎用名の削除が外部同名 import を拾って api.rm に誤分類される
     // (codex 設計合意。full TS resolver は入れず、証明できる外部 import binding のみ除外)。
     let external_pkgs = load_external_package_names(dir);
+    let member_names: HashSet<String> = candidates
+        .iter()
+        .filter(|c| {
+            matches!(c.kind.as_str(), "method" | "function")
+                && super::removed_attribution::path_lang(&c.file)
+                    .is_some_and(super::removed_attribution::is_js_ts_family)
+        })
+        .map(|c| bare_name(&c.name).to_string())
+        .collect();
     // (path, symbol) -> ファイル解析結果 (外部 import 事実 + 参照帰属の素材)
     let mut facts_cache: HashMap<(String, String), RefAttributionFacts> = HashMap::new();
 
@@ -92,7 +101,13 @@ pub(crate) fn partition_removed_dead_candidates(
         for x in &r.references {
             let key = (x.path.clone(), r.symbol.clone());
             let facts = facts_cache.entry(key).or_insert_with(|| {
-                analyze_ref_attribution_facts(dir, &x.path, &r.symbol, &external_pkgs)
+                analyze_ref_attribution_facts(
+                    dir,
+                    &x.path,
+                    &r.symbol,
+                    &external_pkgs,
+                    member_names.contains(&r.symbol),
+                )
             });
             let attr = attribution_for_ref(facts, &x.path, &residual_defs, (x.line, x.column));
             if x.kind == Some(RefKind::Definition) {

@@ -7,7 +7,7 @@
 //! (informational) へ降格する。証明できない参照は従来どおり残存参照として数える
 //! (fail-closed、破壊的削除の見逃しを作らない)。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::engine::parser;
@@ -29,19 +29,19 @@ pub(crate) enum RefOrigin {
     IndependentDefinition { path: String },
     /// Rust のローカル値束縛・非 callable なフィールド名位置。
     LocalValue,
-    /// 参照ファイル自身に同名定義が残存している (TS/JS/bash)。TS/JS は削除ファイルからの
-    /// 同名 import が同ファイル定義と共存できない (duplicate declaration) ため、bash は
-    /// 削除ファイルが消えても同ファイル定義が残り未定義呼び出しにならないため、削除
-    /// シンボル由来ではないと言える。bash はリテラル `source` が削除ファイルを指す場合
-    /// のみ証明失敗 (削除実装への明示依存が残っている)。
+    /// 参照ファイル自身に同名定義が残存している (TS/JS/bash)。JS/TS のメソッドは
+    /// 同名定義が別クラスにあり得るため、この証拠では降格しない。静的な依存先に
+    /// 削除ファイルが含まれる場合も証明しない。
     SelfDefined {
-        /// bash のみ Some: リテラル source の解決候補 (repo 相対)。
+        /// 静的な依存先の解決候補 (repo 相対)。
         sourced_candidates: Option<Rc<HashSet<String>>>,
     },
     /// TS/JS: symbol がこのファイルの from 句付き import / re-export 文の識別子として
     /// 出現し、その specifier の解決候補が `candidates`。残存定義ファイルへ解決できれば
     /// 「残存シンボルへの束縛」と証明できる。
     ImportResolved { candidates: Rc<HashSet<String>> },
+    /// Receiver is an instance of a directly imported, surviving class.
+    JsMemberOfResolvedClass(Rc<super::js_member_origin::JsMemberEvidence>),
     /// Python: symbol の出現がすべて属性アクセス (`re.search` / `self.search`) で、
     /// レシーバの実効モジュール名が `receiver_module_names`。モジュールレベルの自由関数 /
     /// クラスは `<module>.<name>` (または再エクスポートした祖先パッケージの
@@ -89,9 +89,27 @@ pub(crate) fn proves_survivor_origin(
                     != super::removed_scope::module_key(candidate.old_path)
         }
         RefOrigin::LocalValue => candidate.kind == "function" && !candidate.name.contains('.'),
-        RefOrigin::SelfDefined { sourced_candidates } => sourced_candidates
-            .as_ref()
-            .is_none_or(|sourced| !sourced.contains(candidate.old_path)),
+        RefOrigin::SelfDefined { sourced_candidates } => {
+            sourced_candidates
+                .as_ref()
+                .is_none_or(|sourced| !sourced.contains(candidate.old_path))
+                && !(matches!(candidate.kind, "method" | "function")
+                    && (candidate.kind == "method" || candidate.name.contains('.'))
+                    && path_lang(candidate.old_path).is_some_and(is_js_ts_family))
+        }
+        RefOrigin::JsMemberOfResolvedClass(evidence) => {
+            matches!(candidate.kind, "method" | "function")
+                && path_lang(candidate.old_path).is_some_and(is_js_ts_family)
+                && super::js_member_origin::is_normalized_repo_path(candidate.old_path)
+                && !evidence
+                    .class_files
+                    .iter()
+                    .any(|path| super::js_member_origin::paths_match(path, candidate.old_path))
+                && !evidence
+                    .dependency_targets
+                    .iter()
+                    .any(|path| super::js_member_origin::paths_match(path, candidate.old_path))
+        }
         RefOrigin::ImportResolved { candidates } => {
             !candidates.contains(candidate.old_path)
                 && candidates.iter().any(|c| residual_def_paths.contains(c))
@@ -170,11 +188,13 @@ pub(crate) struct RefAttributionFacts {
     /// symbol が相対 import / re-export の識別子として出現する文の解決候補 (和集合)。
     /// None = from 句付き文に symbol の出現なし。
     pub local_import_candidates: Option<Rc<HashSet<String>>>,
+    pub js_member_evidence: HashMap<(usize, usize), Rc<super::js_member_origin::JsMemberEvidence>>,
     /// symbol が相対解決できない from 句 (alias / workspace パッケージ / 動的文字列) の
     /// import / re-export 識別子として出現する。fail-closed で全証明を封じる。
     pub has_unresolvable_import_binding: bool,
     /// bash のみ Some: リテラル source の解決候補。
     pub bash_sourced_candidates: Option<Rc<HashSet<String>>>,
+    pub js_dependency_targets: Option<Rc<HashSet<String>>>,
     /// Python のみ Some: symbol の非定義出現がすべて属性アクセスだった場合の、
     /// レシーバの実効モジュール名集合。1 件でも bare identifier 出現があれば None。
     pub python_attribute_receivers: Option<Rc<HashSet<String>>>,
@@ -194,8 +214,10 @@ impl RefAttributionFacts {
             external_local_bound: false,
             external_source_name_lines: HashSet::new(),
             local_import_candidates: None,
+            js_member_evidence: HashMap::new(),
             has_unresolvable_import_binding: false,
             bash_sourced_candidates: None,
+            js_dependency_targets: None,
             python_attribute_receivers: None,
             ref_lang: None,
             is_js_ts: false,
@@ -236,6 +258,9 @@ fn ref_origin_for(
         if facts.has_unresolvable_import_binding {
             return RefOrigin::Unproven;
         }
+        if let Some(evidence) = facts.js_member_evidence.get(&position) {
+            return RefOrigin::JsMemberOfResolvedClass(Rc::clone(evidence));
+        }
         // from 句付き文で束縛 / 再輸出されている場合は同ファイル定義より優先して
         // import 解決で判定する (`export { x } from './deleted'` は同ファイル定義と
         // 共存でき、削除で壊れるため SelfDefined で証明してはならない)。
@@ -246,7 +271,7 @@ fn ref_origin_for(
         }
         if residual_def_paths.contains(ref_path) {
             return RefOrigin::SelfDefined {
-                sourced_candidates: None,
+                sourced_candidates: facts.js_dependency_targets.clone(),
             };
         }
         return RefOrigin::Unproven;
@@ -272,6 +297,7 @@ pub(crate) fn analyze_ref_attribution_facts(
     ref_path: &str,
     symbol: &str,
     external_pkgs: &HashSet<String>,
+    member_proof: bool,
 ) -> RefAttributionFacts {
     let abs = if std::path::Path::new(ref_path).is_absolute() {
         std::path::PathBuf::from(ref_path)
@@ -285,9 +311,15 @@ pub(crate) fn analyze_ref_attribution_facts(
         return RefAttributionFacts::opaque();
     };
     let mut facts = match lang {
-        LangId::Javascript | LangId::Typescript | LangId::Tsx => {
-            analyze_js_ts_facts(utf8, lang, ref_path, symbol, external_pkgs)
-        }
+        LangId::Javascript | LangId::Typescript | LangId::Tsx => analyze_js_ts_facts(
+            utf8,
+            lang,
+            ref_path,
+            symbol,
+            external_pkgs,
+            member_proof,
+            dir,
+        ),
         LangId::Bash => analyze_bash_facts(utf8, ref_path),
         LangId::Python => analyze_python_facts(utf8, symbol),
         LangId::Rust => analyze_rust_facts(utf8, symbol),
@@ -317,8 +349,12 @@ fn file_lang(utf8: &camino::Utf8Path) -> Option<LangId> {
 }
 
 /// 削除元ファイルの言語。削除済みで実体を読めないため拡張子だけで判定する。
-fn path_lang(path: &str) -> Option<LangId> {
+pub(super) fn path_lang(path: &str) -> Option<LangId> {
     LangId::from_path(camino::Utf8Path::new(path)).ok()
+}
+
+pub(super) fn is_js_ts_family(lang: LangId) -> bool {
+    matches!(lang, LangId::Javascript | LangId::Typescript | LangId::Tsx)
 }
 
 /// Python の参照ファイルを解析し、symbol の非定義出現がすべて属性アクセス
@@ -469,6 +505,8 @@ fn analyze_js_ts_facts(
     ref_path: &str,
     symbol: &str,
     external_pkgs: &HashSet<String>,
+    member_proof: bool,
+    dir: &str,
 ) -> RefAttributionFacts {
     let Ok(source) = parser::read_file(utf8) else {
         return RefAttributionFacts::opaque();
@@ -481,6 +519,18 @@ fn analyze_js_ts_facts(
         is_js_ts: true,
         ..RefAttributionFacts::opaque()
     };
+    let dependency_scan = super::js_member_origin::dependency_targets(ref_path, &source, root);
+    if member_proof && !dependency_scan.opaque {
+        facts.js_member_evidence = super::js_member_origin::collect_member_evidence(
+            dir,
+            ref_path,
+            &source,
+            root,
+            symbol,
+            &dependency_scan.targets,
+        );
+    }
+    facts.js_dependency_targets = Some(Rc::new(dependency_scan.targets));
     let mut local_candidates: HashSet<String> = HashSet::new();
     let mut has_local_binding = false;
     let mut cursor = root.walk();
@@ -742,6 +792,44 @@ pub(crate) fn relative_import_candidates(base_file: &str, spec: &str) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn js_member_proof_requires_matching_normalized_deleted_paths() {
+        let evidence = Rc::new(super::super::js_member_origin::JsMemberEvidence {
+            class_files: Rc::new(["src/util.ts".to_string(), "src/util.js".to_string()].into()),
+            dependency_targets: Rc::new(HashSet::new()),
+        });
+        let attributed = RefAttribution {
+            ref_lang: Some(LangId::Typescript),
+            origin: RefOrigin::JsMemberOfResolvedClass(evidence),
+        };
+        let defs = HashSet::new();
+        for old_path in [
+            "src/util.js",
+            "src/Util.js",
+            "./src/util.js",
+            "/src/util.js",
+        ] {
+            assert!(!proves_survivor_origin(
+                &attributed,
+                &RemovedCandidateRef {
+                    old_path,
+                    name: "Formatter.formatItem",
+                    kind: "method",
+                },
+                &defs,
+            ));
+        }
+        assert!(proves_survivor_origin(
+            &attributed,
+            &RemovedCandidateRef {
+                old_path: "dist/util.js",
+                name: "Formatter.formatItem",
+                kind: "method",
+            },
+            &defs,
+        ));
+    }
 
     #[test]
     fn normalize_relative_specifier_resolves_parent_dirs() {

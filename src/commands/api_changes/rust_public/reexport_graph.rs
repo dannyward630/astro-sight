@@ -25,23 +25,6 @@ pub(crate) struct RustExportKey {
     name: String,
 }
 
-/// `pub use` から生成される re-export edge。Named は `source_module::exported_name` が
-/// `target_module::target_item` を指す。alias の場合 `exported_name = alias`、`target_item = 元名`。
-/// Wildcard は `source_module::* = target_module::*` で名前ごとに伝播する。
-#[derive(Clone, Debug)]
-pub(crate) enum RustPubUseEdge {
-    Named {
-        source_module: Vec<String>,
-        exported_name: String,
-        target_module: Vec<String>,
-        target_item: String,
-    },
-    Wildcard {
-        source_module: Vec<String>,
-        target_module: Vec<String>,
-    },
-}
-
 impl RustPubUseIndex {
     /// `info` の private module 配下の `symbol_name` が外部公開 API として到達可能かを返す。
     /// 削除シンボルを seed として live export 集合を固定点伝播し、

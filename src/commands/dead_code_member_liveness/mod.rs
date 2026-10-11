@@ -5,9 +5,11 @@
 
 mod js_ts;
 mod php;
+mod rust;
 
 pub(crate) use js_ts::JsTsMemberLiveness;
 pub(crate) use php::PhpMemberLiveness;
+pub(crate) use rust::RustMemberLiveness;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -421,6 +421,52 @@ pub(super) fn is_rust_file_root_symbol(root: Node<'_>, symbol: &Symbol) -> bool 
     false
 }
 
+/// A private inherent method declared by an impl at the file module root.
+/// The owner is the syntactic type name; aliases and qualified impl targets remain unproven.
+pub(super) fn rust_private_inherent_method(
+    root: Node<'_>,
+    source: &[u8],
+    symbol: &Symbol,
+) -> Option<String> {
+    if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
+        return None;
+    }
+    let mut method = super::descendant_for_range(root, &symbol.range)?;
+    while method.kind() != "function_item" {
+        method = method.parent()?;
+    }
+    if method.child_by_field_name("name")?.utf8_text(source).ok()? != symbol.name {
+        return None;
+    }
+    let mut cursor = method.walk();
+    if method
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == "visibility_modifier")
+    {
+        return None;
+    }
+    let body = method.parent()?;
+    if body.kind() != "declaration_list" {
+        return None;
+    }
+    let impl_item = body.parent()?;
+    if impl_item.kind() != "impl_item"
+        || impl_item.parent()?.id() != root.id()
+        || impl_item.child_by_field_name("trait").is_some()
+    {
+        return None;
+    }
+    let owner = impl_item.child_by_field_name("type")?;
+    let owner = if owner.kind() == "generic_type" {
+        owner.named_child(0)?
+    } else {
+        owner
+    };
+    (owner.kind() == "type_identifier")
+        .then(|| owner.utf8_text(source).ok().map(str::to_owned))
+        .flatten()
+}
+
 fn collect_rust_use_tree_bindings(
     node: Node<'_>,
     source: &[u8],

@@ -85,6 +85,10 @@ impl RustTargets {
     pub(crate) fn has_explicit_roots(&self) -> bool {
         !self.explicit_roots.is_empty()
     }
+
+    pub(crate) fn explicit_roots(&self) -> impl Iterator<Item = &Path> {
+        self.explicit_roots.iter().map(PathBuf::as_path)
+    }
 }
 
 fn record_explicit_path(

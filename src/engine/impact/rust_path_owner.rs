@@ -107,17 +107,28 @@ pub(super) struct RustPathOwnerIndex {
 /// Module-relative paths need a unique compilation context for each source
 /// file. A path attribute or macro elsewhere in the tree can include that
 /// source under a different parent module or crate root.
+pub(super) type RustSourceModule = (PathBuf, PathBuf, Vec<String>);
+pub(super) type RustModuleKey = (PathBuf, Vec<String>);
+
 pub(super) struct RustPathOwnerProjectProof {
-    root: PathBuf,
-    canonical_root: Option<PathBuf>,
+    pub(super) root: PathBuf,
+    pub(super) canonical_root: Option<PathBuf>,
     ordinary_sources: OnceLock<bool>,
     private_scope_sources: OnceLock<bool>,
+    reexport_sources: OnceLock<bool>,
     safe_private_import_environment: OnceLock<bool>,
     no_source_inclusion: OnceLock<bool>,
     no_glob_imports: OnceLock<bool>,
     module_wiring_unchanged: bool,
     private_scope_wiring_unchanged: bool,
+    reexport_cargo_enabled: bool,
+    pub(super) reexport_old_sources: HashMap<PathBuf, Option<Vec<u8>>>,
+    pub(super) reexport_source_modules: Mutex<HashMap<PathBuf, Option<RustSourceModule>>>,
+    pub(super) reexport_module_files: Mutex<HashMap<RustModuleKey, Option<PathBuf>>>,
+    pub(super) reexport_stable_chains: Mutex<HashMap<RustModuleKey, bool>>,
     files: Mutex<HashMap<PathBuf, Option<Arc<FileEvidence>>>>,
+    pub(super) reexport_files:
+        Mutex<HashMap<PathBuf, Option<Arc<super::rust_reexport_owner::ModuleBindings>>>>,
     leaf_sources: Mutex<HashMap<String, bool>>,
 }
 
@@ -126,18 +137,46 @@ impl RustPathOwnerProjectProof {
         root: &Path,
         module_wiring_unchanged: bool,
         private_scope_wiring_unchanged: bool,
+        reexport_cargo_enabled: bool,
+        diff_files: &[DiffFile],
+        diff_input: &str,
     ) -> Self {
+        let mut reexport_old_sources = HashMap::new();
+        for file in diff_files {
+            let path = PathBuf::from(&file.new_path);
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                let old = std::fs::read(root.join(&path)).ok().and_then(|new_source| {
+                    crate::engine::diff::reconstruct_old_source(
+                        diff_input,
+                        &file.new_path,
+                        &new_source,
+                    )
+                    .map(|source| source.source)
+                });
+                reexport_old_sources.insert(path, old);
+            }
+            if file.old_path != file.new_path {
+                reexport_old_sources.insert(PathBuf::from(&file.old_path), None);
+            }
+        }
         Self {
             root: root.to_owned(),
             canonical_root: root.canonicalize().ok(),
             ordinary_sources: OnceLock::new(),
             private_scope_sources: OnceLock::new(),
+            reexport_sources: OnceLock::new(),
             safe_private_import_environment: OnceLock::new(),
             no_source_inclusion: OnceLock::new(),
             no_glob_imports: OnceLock::new(),
             module_wiring_unchanged,
             private_scope_wiring_unchanged,
+            reexport_cargo_enabled,
+            reexport_old_sources,
+            reexport_source_modules: Mutex::new(HashMap::new()),
+            reexport_module_files: Mutex::new(HashMap::new()),
+            reexport_stable_chains: Mutex::new(HashMap::new()),
             files: Mutex::new(HashMap::new()),
+            reexport_files: Mutex::new(HashMap::new()),
             leaf_sources: Mutex::new(HashMap::new()),
         }
     }
@@ -155,6 +194,17 @@ impl RustPathOwnerProjectProof {
             && *self
                 .private_scope_sources
                 .get_or_init(|| scan_private_scope_sources(&self.root))
+    }
+
+    pub(super) fn allows_reexport_paths(&self) -> bool {
+        self.reexport_cargo_enabled
+            && *self
+                .reexport_sources
+                .get_or_init(|| scan_reexport_sources(&self.root))
+    }
+
+    pub(super) fn allows_external_alias_paths(&self) -> bool {
+        self.reexport_cargo_enabled
     }
 
     /// Widening visibility can introduce a name through a glob anywhere in
@@ -861,7 +911,90 @@ fn scan_private_scope_sources(root: &Path) -> bool {
     scan_sources(root, source_can_retarget_private_scope)
 }
 
-fn scan_sources(root: &Path, source_is_uncertain: fn(&[u8]) -> bool) -> bool {
+fn scan_reexport_sources(root: &Path) -> bool {
+    let mut shadowable_names = HashSet::new();
+    let mut defined_macros = HashSet::new();
+    let mut imports = Vec::new();
+    let mut external_glob = false;
+    let ordinary = scan_sources(root, |source| {
+        let Ok(tree) = parser::parse_source(source, LangId::Rust) else {
+            return true;
+        };
+        let root = tree.root_node();
+        if root.has_error() {
+            return true;
+        }
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            match node.kind() {
+                "macro_invocation" => {
+                    if !has_function_ancestor(node) {
+                        return true;
+                    }
+                    let name = node
+                        .child_by_field_name("macro")
+                        .and_then(|name| name.utf8_text(source).ok());
+                    if !name.is_some_and(is_allowed_expression_macro) {
+                        return true;
+                    }
+                    shadowable_names.insert(name.unwrap().to_owned());
+                }
+                "macro_definition" => {
+                    let Some(name) = node
+                        .child_by_field_name("name")
+                        .and_then(|name| name.utf8_text(source).ok())
+                    else {
+                        return true;
+                    };
+                    defined_macros.insert(name.to_owned());
+                }
+                "extern_crate_declaration" => return true,
+                "attribute_item" | "inner_attribute_item" => {
+                    let Some(names) = super::rust_std_origin::safe_attribute(node, source) else {
+                        return true;
+                    };
+                    shadowable_names.extend(names);
+                }
+                "use_declaration" => {
+                    let Ok(text) = node.utf8_text(source) else {
+                        return true;
+                    };
+                    let argument = node.child_by_field_name("argument");
+                    let anchored = argument
+                        .and_then(|value| value.utf8_text(source).ok())
+                        .is_some_and(|text| {
+                            ["crate::", "self::", "super::"]
+                                .iter()
+                                .any(|prefix| text.trim_start().starts_with(prefix))
+                        });
+                    if text.contains('*') && !anchored {
+                        external_glob = true;
+                    }
+                    imports.push(text.to_owned());
+                }
+                _ => {}
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        false
+    });
+    ordinary
+        && shadowable_names.iter().all(|name| {
+            !defined_macros.contains(name)
+                && !external_glob
+                && !imports.iter().any(|import| {
+                    import
+                        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                        .any(|token| token == name)
+                })
+        })
+}
+
+fn scan_sources<F>(root: &Path, mut source_is_uncertain: F) -> bool
+where
+    F: FnMut(&[u8]) -> bool,
+{
     let Ok(root) = root.canonicalize() else {
         return false;
     };
@@ -1008,7 +1141,7 @@ fn source_can_retarget_modules(source: &[u8]) -> bool {
     })
 }
 
-fn is_allowed_expression_macro(name: &str) -> bool {
+pub(super) fn is_allowed_expression_macro(name: &str) -> bool {
     matches!(
         name,
         "println"
@@ -1404,7 +1537,7 @@ fn source_can_retarget_private_scope(source: &[u8]) -> bool {
         })
 }
 
-fn has_uncertain_ancestor(mut node: Node<'_>) -> bool {
+pub(super) fn has_uncertain_ancestor(mut node: Node<'_>) -> bool {
     while let Some(parent) = node.parent() {
         if matches!(
             parent.kind(),
@@ -1418,7 +1551,7 @@ fn has_uncertain_ancestor(mut node: Node<'_>) -> bool {
     false
 }
 
-fn has_attribute_prefix(node: Node<'_>) -> bool {
+pub(super) fn has_attribute_prefix(node: Node<'_>) -> bool {
     let mut previous = node.prev_named_sibling();
     while let Some(sibling) = previous {
         if matches!(sibling.kind(), "line_comment" | "block_comment") {
@@ -1430,7 +1563,7 @@ fn has_attribute_prefix(node: Node<'_>) -> bool {
     false
 }
 
-fn scope_can_rebind_name(scope: Node<'_>, source: &[u8], name: &str) -> bool {
+pub(super) fn scope_can_rebind_name(scope: Node<'_>, source: &[u8], name: &str) -> bool {
     let mut cursor = scope.walk();
     let mut pending = scope.named_children(&mut cursor).collect::<Vec<_>>();
     while let Some(node) = pending.pop() {
@@ -1455,7 +1588,7 @@ fn scope_can_rebind_name(scope: Node<'_>, source: &[u8], name: &str) -> bool {
     false
 }
 
-fn scope_can_rebind_import_name(scope: Node<'_>, source: &[u8], name: &str) -> bool {
+pub(super) fn scope_can_rebind_import_name(scope: Node<'_>, source: &[u8], name: &str) -> bool {
     let mut cursor = scope.walk();
     let mut pending = scope.named_children(&mut cursor).collect::<Vec<_>>();
     while let Some(node) = pending.pop() {
@@ -1499,7 +1632,7 @@ fn scope_can_rebind_import_name(scope: Node<'_>, source: &[u8], name: &str) -> b
     false
 }
 
-fn path_segments(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+pub(super) fn path_segments(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
     match node.kind() {
         "identifier" | "type_identifier" | "crate" | "self" | "super" => {
             Some(vec![node.utf8_text(source).ok()?.to_owned()])
@@ -1535,7 +1668,10 @@ fn plain_crate_import_path(text: &str) -> Option<Vec<String>> {
     Some(parts.into_iter().map(str::to_owned).collect())
 }
 
-fn source_module_path(dir: &Path, ref_file: &Path) -> Option<(PathBuf, PathBuf, Vec<String>)> {
+pub(super) fn source_module_path(
+    dir: &Path,
+    ref_file: &Path,
+) -> Option<(PathBuf, PathBuf, Vec<String>)> {
     let package = ref_file
         .ancestors()
         .find(|ancestor| dir.join(ancestor).join("Cargo.toml").is_file())?;
@@ -1573,7 +1709,7 @@ fn source_module_path(dir: &Path, ref_file: &Path) -> Option<(PathBuf, PathBuf, 
 
 /// Follow ordinary `mod name;` declarations without the owner resolver's
 /// restrictions on unrelated imports, attributes, and expression macros.
-fn private_module_file(
+pub(super) fn private_module_file(
     dir: &Path,
     src: &Path,
     modules: &[String],
@@ -1704,7 +1840,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.path().join("src/child.rs"), "fn call() { dbg!(1); }\n").unwrap();
-        let proof = RustPathOwnerProjectProof::new(root.path(), true, true);
+        let proof = RustPathOwnerProjectProof::new(root.path(), true, true, true, &[], "");
         assert!(!proof.has_safe_private_import_environment());
         assert!(!proof.allows_private_scope_paths());
     }

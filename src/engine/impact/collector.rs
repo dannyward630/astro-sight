@@ -59,6 +59,7 @@ pub(super) struct RefEventMini {
     pub(super) column: u32,
     pub(super) caller_name_id: u32,
     pub(super) is_import: bool,
+    pub(super) rust_alias_import_used: bool,
     /// 0 = ExactOwner, 1 = InferredOwner, 2 = BareNameOnly。
     /// Phase 4 (impact ルーティング) で `BareNameOnly` + generic name のシンボル参照を
     /// `low_confidence_callers` へ振り分けるために使う。
@@ -75,6 +76,10 @@ pub(super) struct RefEventMini {
     pub(super) rust_macro_callee: bool,
     /// `receiver.name` の field 位置。自由関数はこの構文で参照できない。
     pub(super) rust_receiver_member: bool,
+    /// Receiver member, associated path, or macro token that could name a method.
+    pub(super) rust_method_syntax: bool,
+    /// Written receiver type, or enclosing impl type for `self`; u32::MAX if unknown.
+    pub(super) rust_explicit_method_owner_id: u32,
     /// AST and project evidence identify this Rust reference as a standard crate name.
     pub(super) rust_std_origin: bool,
     /// Rust: 参照が callee でない関数値渡し (`register((a, my_system, b))` のタプル要素等)。
@@ -200,6 +205,7 @@ impl RouteDecisionContext<'_> {
             || fn_value_informational
             || reexport_move_informational
             || (event.is_import
+                && !event.rust_alias_import_used
                 && !(event.unproven_module_ref
                     && file_context.object_member_changes.contains_key(symbol_name))
                 && file_context.affected.iter().any(|symbol| {
@@ -444,6 +450,47 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         // token_tree 内はマクロ展開で参照形が変わり得るため証明しない。
         let rust_receiver_member =
             self.ref_lang == Some(LangId::Rust) && node.is_some_and(is_rust_receiver_member);
+        let private_method_target = self.ref_lang == Some(LangId::Rust)
+            && self.sym_to_fc.get(ix).is_some_and(|contexts| {
+                contexts.iter().any(|&fc_ix| {
+                    self.file_contexts[fc_ix as usize]
+                        .rust_private_method_owners
+                        .contains_key(&self.all_symbol_names[ix])
+                })
+            });
+        let rust_method_syntax = private_method_target
+            && node.is_some_and(|node| {
+                is_rust_method_call_member(node)
+                    || node.parent().is_some_and(|parent| {
+                        parent.kind() == "scoped_identifier"
+                            && parent
+                                .child_by_field_name("name")
+                                .is_some_and(|name| name.id() == node.id())
+                    })
+                    || {
+                        let mut ancestor = node.parent();
+                        let mut in_token_tree = false;
+                        while let Some(parent) = ancestor {
+                            if parent.kind() == "token_tree" {
+                                in_token_tree = true;
+                                break;
+                            }
+                            ancestor = parent.parent();
+                        }
+                        in_token_tree
+                    }
+            });
+        let rust_explicit_method_owner_id = if private_method_target {
+            node.and_then(|node| rust_explicit_method_owner(node, source))
+                .map_or(u32::MAX, |owner| {
+                    self.pool
+                        .lock()
+                        .expect("string pool mutex poisoned")
+                        .intern(owner)
+                })
+        } else {
+            u32::MAX
+        };
         let rust_std_origin = self.ref_lang == Some(LangId::Rust)
             && node.is_some_and(|node| {
                 self.rust_std_origin
@@ -493,26 +540,60 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             })
             .flatten();
         let rust_owner = if let (Some(index), Some(node)) = (rust_owner_index, node) {
-            index
-                .type_owner(
-                    node,
-                    source,
-                    Path::new(self.dir),
-                    self.path_str,
-                    self.rust_path_owner_project,
-                )
-                .map(|owner| (owner, false))
-                .or_else(|| {
-                    index
-                        .free_function_owner(
+            let path = Path::new(self.dir);
+            let type_owner = || {
+                index
+                    .type_owner(
+                        node,
+                        source,
+                        path,
+                        self.path_str,
+                        self.rust_path_owner_project,
+                    )
+                    .or_else(|| {
+                        super::rust_reexport_owner::owner(
                             node,
                             source,
-                            Path::new(self.dir),
+                            path,
                             self.path_str,
                             self.rust_path_owner_project,
+                            super::rust_reexport_owner::Namespace::Type,
                         )
-                        .map(|owner| (owner, true))
-                })
+                    })
+                    .map(|owner| (owner, false))
+            };
+            let function_owner = || {
+                index
+                    .free_function_owner(
+                        node,
+                        source,
+                        path,
+                        self.path_str,
+                        self.rust_path_owner_project,
+                    )
+                    .or_else(|| {
+                        super::rust_reexport_owner::owner(
+                            node,
+                            source,
+                            path,
+                            self.path_str,
+                            self.rust_path_owner_project,
+                            super::rust_reexport_owner::Namespace::Function,
+                        )
+                    })
+                    .map(|owner| (owner, true))
+            };
+            if is_import && self.ref_lang == Some(LangId::Rust) {
+                match (type_owner(), function_owner()) {
+                    (Some(owner), None) => Some(owner),
+                    (None, Some(owner)) => Some(owner),
+                    _ => None,
+                }
+            } else if node.kind() == "type_identifier" {
+                type_owner()
+            } else {
+                function_owner()
+            }
         } else {
             None
         };
@@ -526,6 +607,16 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                     .intern(owner)
             });
         let rust_owner_is_free_function = rust_owner.is_some_and(|(_, is_free)| is_free);
+        let rust_alias_import_used = self.ref_lang == Some(LangId::Rust)
+            && node.is_some_and(|node| {
+                super::rust_reexport_owner::alias_import_used(
+                    node,
+                    source,
+                    Path::new(self.dir),
+                    self.path_str,
+                    self.rust_path_owner_project,
+                )
+            });
         let rust_associated_type_path = rust_owner_index
             .zip(node)
             .is_some_and(|(index, node)| index.is_local_associated_path(node, source));
@@ -560,11 +651,14 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             column: column as u32,
             caller_name_id,
             is_import,
+            rust_alias_import_used,
             confidence: confidence_u8,
             local_shadow_hint,
             ref_in_macro,
             rust_macro_callee,
             rust_receiver_member,
+            rust_method_syntax,
+            rust_explicit_method_owner_id,
             rust_std_origin,
             fn_value_ref: usage == refs::RefUsageRole::FunctionValue,
             member_path_id,
@@ -605,6 +699,83 @@ fn is_rust_receiver_member(node: tree_sitter::Node<'_>) -> bool {
         ancestor = current.parent();
     }
     true
+}
+
+fn is_rust_method_call_member(node: tree_sitter::Node<'_>) -> bool {
+    if !is_rust_receiver_member(node) {
+        return false;
+    }
+    let Some(field) = node.parent() else {
+        return false;
+    };
+    let callee = field
+        .parent()
+        .filter(|generic| {
+            generic.kind() == "generic_function"
+                && generic
+                    .child_by_field_name("function")
+                    .is_some_and(|function| function.id() == field.id())
+        })
+        .unwrap_or(field);
+    callee.parent().is_some_and(|call| {
+        call.kind() == "call_expression"
+            && call
+                .child_by_field_name("function")
+                .is_some_and(|function| function.id() == callee.id())
+    })
+}
+
+fn enclosing_rust_impl_owner<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if parent.kind() == "impl_item" {
+            let owner = parent.child_by_field_name("type")?;
+            let owner = if owner.kind() == "generic_type" {
+                owner.named_child(0)?
+            } else {
+                owner
+            };
+            return (owner.kind() == "type_identifier")
+                .then(|| owner.utf8_text(source).ok())
+                .flatten();
+        }
+        ancestor = parent.parent();
+    }
+    None
+}
+
+/// A written receiver type is only a hint: aliases can refer to the changed type.
+/// Use a mismatch to lower confidence, never to erase the reference.
+fn rust_explicit_method_owner<'a>(
+    node: tree_sitter::Node<'_>,
+    source: &'a [u8],
+) -> Option<&'a str> {
+    let parent = node.parent()?;
+    if is_rust_receiver_member(node) {
+        let receiver = parent.child_by_field_name("value")?;
+        return (receiver.utf8_text(source).ok()? == "self")
+            .then(|| enclosing_rust_impl_owner(node, source))
+            .flatten();
+    }
+    if parent.kind() != "scoped_identifier"
+        || !parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id())
+    {
+        return None;
+    }
+    let path = parent.child_by_field_name("path")?;
+    let owner = match path.kind() {
+        "identifier" | "type_identifier" => path,
+        "scoped_identifier" => path.child_by_field_name("name")?,
+        _ => return None,
+    };
+    let owner = owner.utf8_text(source).ok()?;
+    if owner == "Self" {
+        enclosing_rust_impl_owner(node, source)
+    } else {
+        Some(owner)
+    }
 }
 
 impl<'a> ImpactCollector<'a> {
@@ -751,8 +922,8 @@ impl<'a> ImpactCollector<'a> {
                 if e.rust_owner_path_id != u32::MAX
                     && ctx.lang_id == LangId::Rust
                     && !filter_disabled
-                    && (!e.rust_owner_is_free_function
-                        || ctx
+                    && (e.rust_owner_is_free_function
+                        == ctx
                             .rust_free_function_names
                             .contains(&self.all_symbol_names[sym_ix_usize]))
                 {
@@ -857,6 +1028,52 @@ impl<'a> ImpactCollector<'a> {
                         continue;
                     }
                 }
+                let private_method_candidate = ctx.lang_id == LangId::Rust
+                    && !filter_disabled
+                    && ctx
+                        .rust_private_method_owners
+                        .contains_key(&self.all_symbol_names[sym_ix_usize]);
+                if private_method_candidate && (!e.rust_method_syntax || e.is_import) {
+                    continue;
+                }
+                let private_method_owner_mismatch = private_method_candidate
+                    && e.rust_explicit_method_owner_id != u32::MAX
+                    && ctx
+                        .rust_private_method_owners
+                        .get(&self.all_symbol_names[sym_ix_usize])
+                        .is_some_and(|owner| {
+                            let pool = self.pool.lock().expect("string pool mutex poisoned");
+                            pool.get(e.rust_explicit_method_owner_id) != owner
+                        });
+                let private_method_unanchored = private_method_candidate
+                    && has_parent_type
+                    && !parent_in_this_file
+                    && e.rust_explicit_method_owner_id == u32::MAX;
+                let mut private_method_scope_uncertain = false;
+                if private_method_candidate
+                    && !filters::is_same_source_file(self.path_str, source_path)
+                {
+                    if self
+                        .rust_path_owner_project
+                        .private_source_is_leaf(source_path)
+                    {
+                        continue;
+                    }
+                    let subtree = *rust_private_scope.entry(fc_ix).or_insert_with(|| {
+                        self.rust_path_owner.get().and_then(|index| {
+                            index.private_subtree_contains(
+                                Path::new(self.dir),
+                                source_path,
+                                self.path_str,
+                                self.rust_path_owner_project,
+                            )
+                        })
+                    });
+                    if subtree == Some(false) {
+                        continue;
+                    }
+                    private_method_scope_uncertain = subtree.is_none();
+                }
                 let source_lang_group = lang_compat_group(ctx.lang_id);
 
                 if filters::is_same_source_file(self.path_str, source_path) {
@@ -869,7 +1086,7 @@ impl<'a> ImpactCollector<'a> {
                 {
                     continue;
                 }
-                if has_parent_type && !parent_in_this_file {
+                if has_parent_type && !parent_in_this_file && !private_method_candidate {
                     continue;
                 }
                 if is_ref_in_target_test_context(
@@ -893,6 +1110,11 @@ impl<'a> ImpactCollector<'a> {
                         });
                 let route = if visibility_only_informational {
                     CallerRoute::Informational
+                } else if private_method_scope_uncertain
+                    || private_method_owner_mismatch
+                    || private_method_unanchored
+                {
+                    CallerRoute::Low
                 } else {
                     route_context.decide(
                         &e,
@@ -961,11 +1183,14 @@ mod tests {
             column: 0,
             caller_name_id: 0,
             is_import: false,
+            rust_alias_import_used: false,
             confidence,
             local_shadow_hint: false,
             ref_in_macro: false,
             rust_macro_callee: false,
             rust_receiver_member: false,
+            rust_method_syntax: false,
+            rust_explicit_method_owner_id: u32::MAX,
             rust_std_origin: false,
             fn_value_ref: false,
             member_path_id: u32::MAX,
@@ -1036,6 +1261,7 @@ mod tests {
             object_member_changes: Default::default(),
             rust_kind_changes: Default::default(),
             rust_private_root_names: Default::default(),
+            rust_private_method_owners: Default::default(),
             rust_private_widening_names: Default::default(),
         }
     }

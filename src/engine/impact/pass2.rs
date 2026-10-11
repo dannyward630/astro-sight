@@ -99,6 +99,9 @@ pub(super) struct Pass2Evidence<'a> {
     pub(super) cargo_graph_enabled: bool,
     pub(super) rust_module_wiring_unchanged: bool,
     pub(super) rust_private_scope_wiring_unchanged: bool,
+    pub(super) rust_reexport_cargo_enabled: bool,
+    pub(super) rust_diff_files: &'a [crate::models::impact::DiffFile],
+    pub(super) rust_diff_input: &'a str,
 }
 
 /// Pass 2 の入力 `file_contexts` が全て case-insensitive 言語 (Xojo 等) かを判定する。
@@ -299,6 +302,9 @@ pub(super) fn stream_caller_maps_and_defs(
         cargo_graph_enabled,
         rust_module_wiring_unchanged,
         rust_private_scope_wiring_unchanged,
+        rust_reexport_cargo_enabled,
+        rust_diff_files,
+        rust_diff_input,
     } = evidence;
     let n_sym = all_symbol_names.len();
     let n_fc = file_contexts.len();
@@ -370,6 +376,9 @@ pub(super) fn stream_caller_maps_and_defs(
         dir,
         rust_module_wiring_unchanged,
         rust_private_scope_wiring_unchanged,
+        rust_reexport_cargo_enabled,
+        rust_diff_files,
+        rust_diff_input,
     );
     let rust_source_paths = file_contexts
         .iter()
@@ -557,6 +566,7 @@ mod tests {
             rust_free_function_names: Default::default(),
             rust_kind_changes: Default::default(),
             rust_private_root_names: Default::default(),
+            rust_private_method_owners: Default::default(),
             rust_private_widening_names: Default::default(),
         }
     }

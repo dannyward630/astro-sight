@@ -7,7 +7,7 @@
 //!
 //! Pass 1 の cross-file 収録判定 (`CrossFileFilterContext`) も、判定材料が per-file 定数
 //! だけで副作用を持たない同種のフィルタなのでここに置く。
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::engine::symbols;
 use crate::language::LangId;
@@ -31,6 +31,7 @@ pub(super) struct CrossFileFilterContext<'a> {
     pub(super) sig_changes: &'a [SignatureChange],
     pub(super) rust_kind_changes: &'a HashSet<String>,
     pub(super) rust_alias_changes: &'a HashSet<String>,
+    pub(super) rust_private_method_owners: &'a HashMap<String, String>,
     /// 対象ファイルの diff 区間 (`diff::FileSections`。シンボル名が変更行に出現するかの
     /// 照合に使う)。diff 全体を渡しても結果は同じだが、シンボルごとに走査するため遅い。
     pub(super) diff_input: &'a str,
@@ -140,6 +141,10 @@ impl CrossFileFilterContext<'_> {
         // 4. エクスポートされていないシンボルをスキップ
         if !overlapping.is_some_and(|s| {
             (self.lang_id == LangId::Rust && declaration::is_rust_file_root_symbol(self.root, s))
+                || (self.lang_id == LangId::Rust
+                    && self.rust_private_method_owners.contains_key(&s.name)
+                    && declaration::rust_private_inherent_method(self.root, self.source, s)
+                        .is_some())
                 || symbols::is_symbol_exported(
                     self.root,
                     self.source,
@@ -376,6 +381,7 @@ mod tests {
             syms: &syms,
             rust_kind_changes: &HashSet::new(),
             rust_alias_changes: &rust_alias_changes,
+            rust_private_method_owners: &HashMap::new(),
             hunks: &hunks,
             sig_changes,
             diff_input: &diff_input,
@@ -501,6 +507,7 @@ mod tests {
             syms: &syms,
             rust_kind_changes: &HashSet::new(),
             rust_alias_changes: &HashSet::new(),
+            rust_private_method_owners: &HashMap::new(),
             hunks: &hunks,
             sig_changes: &[],
             diff_input,
@@ -596,6 +603,7 @@ mod tests {
                 syms: &syms,
                 rust_kind_changes: &HashSet::new(),
                 rust_alias_changes: &HashSet::new(),
+                rust_private_method_owners: &HashMap::new(),
                 hunks: &hunks,
                 sig_changes,
                 diff_input: diff,

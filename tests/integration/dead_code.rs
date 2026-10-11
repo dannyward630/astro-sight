@@ -441,6 +441,872 @@ fn dead_code_same_method_name_in_multiple_classes_skipped() {
 }
 
 #[test]
+fn dead_code_rust_same_named_methods_keep_only_the_used_owner_live() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "pub mod used; pub mod unused; pub mod call;\n",
+    );
+    repo.write(
+        "src/used.rs",
+        "pub struct ReadCursor; impl ReadCursor { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write(
+        "src/unused.rs",
+        "pub struct WriteCursor; impl WriteCursor { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write(
+        "src/call.rs",
+        "use crate::used::ReadCursor; pub fn call() { let mut value = ReadCursor; value.put_u16(); }\n",
+    );
+
+    let result = repo.run_json("dead-code", &[]);
+    let names: Vec<&str> = result["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"WriteCursor.put_u16"),
+        "unused owner must be reported: {result}"
+    );
+    assert!(
+        !names.contains(&"ReadCursor.put_u16"),
+        "called owner must stay live: {result}"
+    );
+
+    repo.write(
+        "src/call.rs",
+        "use crate::used::ReadCursor; pub fn call() { let mut value = ReadCursor; value.r#put_u16(); }\n",
+    );
+    let raw_name = repo.run_json("dead-code", &[]);
+    assert!(
+        !raw_name["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "ReadCursor.put_u16"),
+        "{raw_name}"
+    );
+    assert!(
+        raw_name["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "WriteCursor.put_u16"),
+        "{raw_name}"
+    );
+
+    repo.create_dir_all(".cache/worktree");
+    repo.write(".cache/worktree/.git", "gitdir: elsewhere\n");
+    repo.write(
+        ".cache/worktree/Cargo.toml",
+        "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    let with_separate_checkout = repo.run_json("dead-code", &[]);
+    assert!(
+        with_separate_checkout["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "WriteCursor.put_u16"),
+        "{with_separate_checkout}"
+    );
+}
+
+#[test]
+fn dead_code_rust_free_function_calls_do_not_keep_same_named_method_live() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "pub mod cursor; pub mod encoding; pub mod consumer;\n",
+    );
+    repo.write(
+        "src/cursor.rs",
+        "pub struct WriteCursor<'a>(&'a mut [u8]); impl<'a> WriteCursor<'a> { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write(
+        "src/encoding.rs",
+        "macro_rules! unrelated { () => { 1 } } pub fn put_u16() {} pub fn encode() { let _ = unrelated!(); put_u16(); }\n",
+    );
+    repo.write(
+        "src/consumer.rs",
+        "use crate::encoding::put_u16; pub fn consume() { put_u16(); }\n",
+    );
+
+    let result = repo.run_json("dead-code", &[]);
+    let names: Vec<&str> = result["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"WriteCursor.put_u16"),
+        "free function calls cannot keep the method live: {result}"
+    );
+    assert!(
+        !names.contains(&"put_u16"),
+        "called free function must stay live: {result}"
+    );
+
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[[bin]]\nname = \"sample-bin\"\npath = \"src/main.rs\"\n",
+    );
+    repo.write("src/main.rs", "fn main() {}\n");
+    let with_binary = repo.run_json("dead-code", &[]);
+    assert!(
+        with_binary["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "WriteCursor.put_u16"),
+        "{with_binary}"
+    );
+}
+
+#[test]
+fn dead_code_rust_unknown_receiver_keeps_duplicate_methods_unclassified() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "pub mod first; pub mod second; pub mod call;\n",
+    );
+    repo.write(
+        "src/first.rs",
+        "pub struct First; impl First { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write(
+        "src/second.rs",
+        "pub struct Second; impl Second { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write(
+        "src/call.rs",
+        "use crate::first::First; pub fn apply(value: &mut First) { value.put_u16(); }\n",
+    );
+
+    let result = repo.run_json("dead-code", &[]);
+    let names: Vec<&str> = result["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert!(
+        !names.iter().any(|name| name.ends_with(".put_u16")),
+        "unknown receiver must keep both candidates unclassified: {result}"
+    );
+}
+
+#[test]
+fn dead_code_rust_generated_calls_without_literal_method_name_are_uncertain() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "pub mod a; pub mod b; pub mod generated;\n");
+    repo.write(
+        "src/a.rs",
+        "pub struct A; impl A { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write(
+        "src/b.rs",
+        "pub struct B; impl B { pub fn put_u16(&mut self) {} }\n",
+    );
+    let baseline = repo.run_json("dead-code", &[]);
+    assert!(
+        baseline["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "A.put_u16"),
+        "{baseline}"
+    );
+
+    repo.write("src/generated.rs", "// only a comment: [<put_ u16>]\n");
+    let comment_only = repo.run_json("dead-code", &[]);
+    assert!(
+        comment_only["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "A.put_u16"),
+        "{comment_only}"
+    );
+
+    for generated in [
+        "include!(concat!(env!(\"OUT_DIR\"), \"/calls.rs\"));\n",
+        "std::include ! (concat!(env!(\"OUT_DIR\"), \"/calls.rs\"));\n",
+        "use std::include as load; load!(concat!(env!(\"OUT_DIR\"), \"/calls.rs\"));\n",
+        "macro_rules! make { ($t:ident) => { paste::paste! { fn call() { let _ = [<put_ $t>]; } } } }\n",
+    ] {
+        repo.write("src/generated.rs", generated);
+        let result = repo.run_json("dead-code", &[]);
+        assert!(
+            !result["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with(".put_u16"))),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn dead_code_rust_attribute_string_method_names_are_uncertain() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "pub mod a; pub mod b; pub mod config;\n");
+    repo.write(
+        "src/a.rs",
+        "pub struct A; impl A { pub fn is_default(&self) -> bool { true } }\n",
+    );
+    repo.write(
+        "src/b.rs",
+        "pub struct B; impl B { pub fn is_default(&self) -> bool { true } }\n",
+    );
+    repo.write(
+        "src/config.rs",
+        "#[serde(skip_serializing_if = \"A::is_default\")] pub struct Config;\n",
+    );
+    let result = repo.run_json("dead-code", &[]);
+    assert!(
+        !result["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with(".is_default"))),
+        "{result}"
+    );
+}
+
+#[test]
+fn dead_code_rust_unique_unknown_receiver_preserves_test_only_result() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.create_dir_all("tests");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "pub mod store;\n");
+    repo.write(
+        "src/store.rs",
+        "pub struct Store; impl Store { pub fn ping(&self) {} }\n",
+    );
+    repo.write(
+        "tests/call.rs",
+        "use sample::store::Store; fn check() { let value = Store; let _ = 1; value.ping(); }\n",
+    );
+    let result = repo.run_json("dead-code", &[]);
+    assert!(
+        result["test_only_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "Store.ping"),
+        "{result}"
+    );
+}
+
+#[test]
+fn dead_code_rust_workspace_proc_macro_keeps_generated_calls_uncertain() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.create_dir_all("macros");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "pub mod a; pub mod b;\n");
+    repo.write(
+        "src/a.rs",
+        "pub struct A; impl A { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write(
+        "src/b.rs",
+        "pub struct B; impl B { pub fn put_u16(&mut self) {} }\n",
+    );
+    let baseline = repo.run_json("dead-code", &[]);
+    assert!(
+        baseline["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "A.put_u16"),
+        "{baseline}"
+    );
+
+    for key in ["proc-macro", "proc_macro"] {
+        repo.write("macros/Cargo.toml", format!("[package]\nname = \"sample-macros\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\n{key} = true\n"));
+        let result = repo.run_json("dead-code", &[]);
+        assert!(
+            !result["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with(".put_u16"))),
+            "{result}"
+        );
+    }
+    repo.write(
+        "macros/Cargo.toml",
+        "[package]\nname = \"sample-macros\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("Cargo.toml", "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nshared = { path = \"../shared\" }\n");
+    let path_dependency = repo.run_json("dead-code", &[]);
+    assert!(
+        !path_dependency["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with(".put_u16"))),
+        "{path_dependency}"
+    );
+}
+
+#[test]
+fn dead_code_rust_exported_impl_attribute_is_not_classified() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "pub mod reader; pub mod writer;\n");
+    repo.write(
+        "src/reader.rs",
+        "pub struct Reader; impl Reader { pub fn read(&self) {} }\n",
+    );
+    repo.write(
+        "src/writer.rs",
+        "pub struct Writer; impl Writer { pub fn read(&self) {} }\n",
+    );
+    let baseline = repo.run_json("dead-code", &[]);
+    assert!(
+        baseline["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "Reader.read"),
+        "{baseline}"
+    );
+
+    for attribute in [
+        "#[pymethods]",
+        "#[cfg_attr(feature = \"python\", pymethods)]",
+    ] {
+        repo.write(
+            "src/reader.rs",
+            format!("pub struct Reader; {attribute} impl Reader {{ pub fn read(&self) {{}} }}\n"),
+        );
+        let result = repo.run_json("dead-code", &[]);
+        assert!(
+            !result["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with(".read"))),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn dead_code_rust_same_name_const_does_not_prove_receiver_owner() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "pub mod used; pub mod writer; pub mod call;\n",
+    );
+    repo.write(
+        "src/writer.rs",
+        "pub struct WriteCursor; impl WriteCursor { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write("src/used.rs", "use crate::writer::WriteCursor; pub struct ReadCursor { x: u8 } impl ReadCursor { pub fn put_u16(&mut self) {} } #[allow(non_upper_case_globals)] pub const ReadCursor: WriteCursor = WriteCursor;\n");
+    repo.write("src/call.rs", "use crate::used::ReadCursor; pub fn call() { let mut value = ReadCursor; value.put_u16(); }\n");
+    let result = repo.run_json("dead-code", &[]);
+    assert!(
+        !result["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with(".put_u16"))),
+        "{result}"
+    );
+}
+
+#[test]
+fn dead_code_rust_nested_package_keeps_sibling_macro_source_uncertain() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("app/src");
+    repo.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("app/src/lib.rs", "pub mod a; pub mod b;\n");
+    repo.write(
+        "app/src/a.rs",
+        "pub struct A; impl A { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write(
+        "app/src/b.rs",
+        "pub struct B; impl B { pub fn put_u16(&mut self) {} }\n",
+    );
+    let app = repo.root().join("app");
+    let run = || {
+        let output = cargo_bin()
+            .args(["dead-code", "--dir", app.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let baseline = run();
+    assert!(
+        baseline["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "A.put_u16"),
+        "{baseline}"
+    );
+
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"app\", \"macros\"]\n",
+    );
+    let result = run();
+    assert!(
+        !result["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with(".put_u16"))),
+        "{result}"
+    );
+}
+
+#[test]
+fn dead_code_rust_nested_import_does_not_bind_outer_receiver() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "pub mod aliases; pub mod call; pub mod used; pub mod writer;\n",
+    );
+    repo.write(
+        "src/used.rs",
+        "pub struct ReadCursor; impl ReadCursor { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write(
+        "src/writer.rs",
+        "pub struct WriteCursor; impl WriteCursor { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write(
+        "src/aliases.rs",
+        "pub use crate::writer::WriteCursor as ReadCursor;\n",
+    );
+    repo.write("src/call.rs", "use crate::aliases::*; pub fn call() { let mut value = ReadCursor; value.put_u16(); } #[cfg(test)] mod tests { use super::*; use crate::used::ReadCursor; #[test] fn check() {} }\n");
+    let result = repo.run_json("dead-code", &[]);
+    assert!(
+        !result["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with(".put_u16"))),
+        "{result}"
+    );
+}
+
+#[test]
+fn dead_code_rust_binary_module_does_not_use_library_owner() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "pub mod used; pub mod writer;\n");
+    repo.write("src/main.rs", "mod writer; mod used { pub use crate::writer::WriteCursor as ReadCursor; } mod call; fn main() { call::call(); }\n");
+    repo.write(
+        "src/used.rs",
+        "pub struct ReadCursor; impl ReadCursor { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write(
+        "src/writer.rs",
+        "pub struct WriteCursor; impl WriteCursor { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write("src/call.rs", "use crate::used::ReadCursor; pub fn call() { let mut value = ReadCursor; value.put_u16(); }\n");
+    let result = repo.run_json("dead-code", &[]);
+    assert!(
+        !result["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with(".put_u16"))),
+        "{result}"
+    );
+}
+
+#[test]
+fn dead_code_rust_explicit_target_roots_keep_other_crate_calls_uncertain() {
+    for target in ["example", "test", "bench", "build"] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        let declaration = if target == "build" {
+            "build = \"src/alt.rs\"".to_owned()
+        } else {
+            format!("\n[[{target}]]\nname = \"alt\"\npath = \"src/alt.rs\"")
+        };
+        repo.write("Cargo.toml", format!("[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{declaration}\n"));
+        repo.write(
+            "src/lib.rs",
+            "pub mod used; pub mod writer; pub mod call;\n",
+        );
+        repo.write("src/alt.rs", "mod writer; mod used { pub use crate::writer::WriteCursor as ReadCursor; } mod call; fn main() { call::call(); }\n");
+        repo.write(
+            "src/used.rs",
+            "pub struct ReadCursor; impl ReadCursor { pub fn put_u16(&mut self) {} }\n",
+        );
+        repo.write(
+            "src/writer.rs",
+            "pub struct WriteCursor; impl WriteCursor { pub fn put_u16(&mut self) {} }\n",
+        );
+        repo.write("src/call.rs", "use crate::used::ReadCursor; pub fn call() { let mut value = ReadCursor; value.put_u16(); }\n");
+        let result = repo.run_json("dead-code", &[]);
+        assert!(
+            !result["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with(".put_u16"))),
+            "{target}: {result}"
+        );
+    }
+}
+
+#[test]
+fn dead_code_rust_path_attribute_keeps_unscanned_calls_uncertain() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "pub mod a; pub mod b; #[path = \"calls.inc\"] mod calls;\n",
+    );
+    repo.write(
+        "src/a.rs",
+        "pub struct A; impl A { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write(
+        "src/b.rs",
+        "pub struct B; impl B { pub fn put_u16(&mut self) {} }\n",
+    );
+    repo.write(
+        "src/calls.inc",
+        "pub fn call() { let mut value = crate::b::B; value.put_u16(); }\n",
+    );
+    let result = repo.run_json("dead-code", &[]);
+    assert!(
+        !result["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with(".put_u16"))),
+        "{result}"
+    );
+}
+
+#[test]
+fn dead_code_rust_cfg_switched_owner_keeps_live_method_uncertain() {
+    for conditional_struct in [true, false] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write("Cargo.toml", "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nfast = []\n");
+        repo.write(
+            "src/lib.rs",
+            "pub mod used; pub mod writer; pub mod call;\n",
+        );
+        repo.write(
+            "src/writer.rs",
+            "pub struct WriteCursor; impl WriteCursor { pub fn put_u16(&self) {} }\n",
+        );
+        if conditional_struct {
+            repo.write("src/used.rs", "#[cfg(feature = \"fast\")] pub struct ReadCursor; #[cfg(feature = \"fast\")] impl ReadCursor { pub fn put_u16(&self) {} } #[cfg(not(feature = \"fast\"))] pub use crate::writer::WriteCursor as ReadCursor;\n");
+        } else {
+            repo.write("src/used.rs", "use crate::writer::WriteCursor; pub struct ReadCursor; #[cfg(feature = \"fast\")] impl ReadCursor { pub fn put_u16(&self) {} } #[cfg(not(feature = \"fast\"))] impl std::ops::Deref for ReadCursor { type Target = WriteCursor; fn deref(&self) -> &WriteCursor { &WriteCursor } }\n");
+        }
+        repo.write("src/call.rs", "use crate::used::ReadCursor; pub fn call() { let value = ReadCursor; value.put_u16(); }\n");
+        let result = repo.run_json("dead-code", &[]);
+        assert!(
+            !result["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with(".put_u16"))),
+            "conditional_struct={conditional_struct}: {result}"
+        );
+    }
+}
+
+#[test]
+fn dead_code_rust_inner_cfg_keeps_live_deref_method_uncertain() {
+    for inner_in_impl in [true, false] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write("Cargo.toml", "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nfast = []\n");
+        repo.write(
+            "src/lib.rs",
+            "pub mod used; pub mod writer; pub mod call;\n",
+        );
+        repo.write(
+            "src/writer.rs",
+            "pub struct WriteCursor; impl WriteCursor { pub fn put_u16(&self) {} }\n",
+        );
+        let method = if inner_in_impl {
+            "impl ReadCursor { #![cfg(feature = \"fast\")] pub fn put_u16(&self) {} }"
+        } else {
+            "impl ReadCursor { pub fn put_u16(&self) { #![cfg(feature = \"fast\")] } }"
+        };
+        repo.write("src/used.rs", format!("use crate::writer::WriteCursor; pub struct ReadCursor; {method} #[cfg(not(feature = \"fast\"))] impl std::ops::Deref for ReadCursor {{ type Target = WriteCursor; fn deref(&self) -> &WriteCursor {{ &WriteCursor }} }}\n"));
+        repo.write("src/call.rs", "use crate::used::ReadCursor; pub fn call() { let value = ReadCursor; value.put_u16(); }\n");
+        let result = repo.run_json("dead-code", &[]);
+        assert!(
+            !result["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with(".put_u16"))),
+            "inner_in_impl={inner_in_impl}: {result}"
+        );
+    }
+}
+
+#[test]
+fn dead_code_rust_ignored_compiled_source_keeps_calls_uncertain() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(".gitignore", "src/generated.rs\n");
+    repo.write("src/lib.rs", "pub mod a; pub mod b; pub mod generated;\n");
+    repo.write(
+        "src/a.rs",
+        "pub struct A; impl A { pub fn put_u16(&self) {} }\n",
+    );
+    repo.write(
+        "src/b.rs",
+        "pub struct B; impl B { pub fn put_u16(&self) {} }\n",
+    );
+    repo.write(
+        "src/generated.rs",
+        "pub fn call() { crate::b::B.put_u16(); }\n",
+    );
+    let result = repo.run_json("dead-code", &[]);
+    assert_eq!(result["scanned_files"], 3, "{result}");
+    assert!(
+        !result["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with(".put_u16"))),
+        "{result}"
+    );
+}
+
+#[test]
+fn dead_code_rust_raw_method_call_stays_live() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "pub mod a; pub mod call;\n");
+    repo.write(
+        "src/a.rs",
+        "pub struct A; impl A { pub fn r#type(&self) -> u8 { 0 } }\n",
+    );
+    repo.write(
+        "src/call.rs",
+        "pub fn call(a: &crate::a::A) -> u8 { a.r#type() }\n",
+    );
+    let result = repo.run_json("dead-code", &[]);
+    assert!(
+        !result["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "A.r#type"),
+        "{result}"
+    );
+}
+
+#[test]
+fn dead_code_rust_ignored_nested_checkout_under_src_keeps_calls_uncertain() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src/gen");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(".gitignore", "src/gen/\n");
+    repo.write("src/lib.rs", "pub mod a; pub mod b; pub mod gen;\n");
+    repo.write(
+        "src/a.rs",
+        "pub struct A; impl A { pub fn put_u16(&self) {} }\n",
+    );
+    repo.write(
+        "src/b.rs",
+        "pub struct B; impl B { pub fn put_u16(&self) {} }\n",
+    );
+    repo.write("src/gen/.git", "gitdir: elsewhere\n");
+    repo.write(
+        "src/gen/mod.rs",
+        "pub fn call() { crate::b::B.put_u16(); }\n",
+    );
+    let result = repo.run_json("dead-code", &[]);
+    assert_eq!(result["scanned_files"], 3, "{result}");
+    assert!(
+        !result["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with(".put_u16"))),
+        "{result}"
+    );
+}
+
+#[test]
+fn dead_code_rust_explicit_root_outside_standard_sources_keeps_calls_uncertain() {
+    for library in [true, false] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let prefix = if library { "" } else { "tools/" };
+        let root_file = if library { "lib.rs" } else { "tools/main.rs" };
+        let target = if library {
+            "[lib]\npath = \"lib.rs\"\n"
+        } else {
+            "[[bin]]\nname = \"sample-bin\"\npath = \"tools/main.rs\"\n"
+        };
+        repo.create_dir_all(format!("{prefix}gen"));
+        repo.write(
+            "Cargo.toml",
+            format!(
+                "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{target}"
+            ),
+        );
+        repo.write(".gitignore", format!("{prefix}gen/\n"));
+        let main = if library {
+            "pub mod a; pub mod b; pub mod gen;\n"
+        } else {
+            "mod a; mod b; mod gen; fn main() {}\n"
+        };
+        repo.write(root_file, main);
+        repo.write(
+            format!("{prefix}a.rs"),
+            "pub struct A; impl A { pub fn put_u16(&self) {} }\n",
+        );
+        repo.write(
+            format!("{prefix}b.rs"),
+            "pub struct B; impl B { pub fn put_u16(&self) {} }\n",
+        );
+        repo.write(format!("{prefix}gen/.git"), "gitdir: elsewhere\n");
+        repo.write(
+            format!("{prefix}gen/mod.rs"),
+            "pub fn call() { crate::b::B.put_u16(); }\n",
+        );
+        let result = repo.run_json("dead-code", &[]);
+        assert_eq!(result["scanned_files"], 3, "{result}");
+        assert!(
+            !result["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with(".put_u16"))),
+            "library={library}: {result}"
+        );
+    }
+}
+
+#[test]
 fn dead_code_layout_onclick_references_handler() {
     // layout XML の `android:onClick="handler"` から Kotlin/Java のメソッドが
     // 呼ばれるため、そのハンドラは dead 扱いすべきでない。

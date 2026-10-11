@@ -1,4 +1,5 @@
 use crate::engine::parser;
+pub(crate) use crate::engine::rust_use_tree::*;
 use crate::engine::symbols::rust_node_has_unrestricted_pub_visibility;
 
 use super::super::git_input::validate_git_revision;

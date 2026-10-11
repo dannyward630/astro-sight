@@ -557,6 +557,7 @@ pub(crate) mod diff_processing;
 pub(crate) mod exported;
 mod forwarded_values;
 mod js_const;
+mod js_member_origin;
 mod js_ts_shadow;
 pub(crate) mod prepare;
 pub(crate) mod removed;
