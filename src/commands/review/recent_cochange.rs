@@ -62,7 +62,7 @@ fn commits(raw: &str) -> Option<Vec<Commit>> {
         return None;
     }
     let mut result = Vec::new();
-    for chunk in fields.chunks_exact(5) {
+    for chunk in fields.as_chunks::<5>().0 {
         let id = chunk[0].trim();
         let parents: Vec<String> = chunk[1].split_whitespace().map(str::to_owned).collect();
         if !oid(id) || parents.iter().any(|p| !oid(p)) {

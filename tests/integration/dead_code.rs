@@ -1059,7 +1059,7 @@ fn dead_code_rust_path_attribute_keeps_unscanned_calls_uncertain() {
         );
         repo.write(
             "src/lib.rs",
-            &format!("pub mod a; pub mod b; {attribute} mod calls;\n"),
+            format!("pub mod a; pub mod b; {attribute} mod calls;\n"),
         );
         repo.write(
             "src/a.rs",

@@ -352,24 +352,23 @@ impl<'a> Scope<'a> {
                 .filter(|(_, tree)| !tree.root_node().has_error());
             let mut assessed_lang = None;
             let mut targets = Vec::new();
-            if let Some((lang, tree)) = parsed {
-                if let Ok(imports) =
+            if let Some((lang, tree)) = parsed
+                && let Ok(imports) =
                     crate::engine::imports::extract_imports(tree.root_node(), &source, lang)
-                {
-                    let mut complete = matches!(
-                        lang,
-                        LangId::Javascript | LangId::Typescript | LangId::Tsx | LangId::Python
-                    ) && !dynamic_loader(tree.root_node(), &source);
-                    for edge in imports {
-                        if let Some(target) = self.resolve_import(path, lang, &edge.source) {
-                            targets.push(target);
-                        } else {
-                            complete = false;
-                        }
+            {
+                let mut complete = matches!(
+                    lang,
+                    LangId::Javascript | LangId::Typescript | LangId::Tsx | LangId::Python
+                ) && !dynamic_loader(tree.root_node(), &source);
+                for edge in imports {
+                    if let Some(target) = self.resolve_import(path, lang, &edge.source) {
+                        targets.push(target);
+                    } else {
+                        complete = false;
                     }
-                    if complete {
-                        assessed_lang = Some(lang);
-                    }
+                }
+                if complete {
+                    assessed_lang = Some(lang);
                 }
             }
             Some(FileFacts {
