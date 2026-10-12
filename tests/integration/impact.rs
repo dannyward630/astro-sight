@@ -773,6 +773,9 @@ fn impact_rust_cargo_target_roots_keep_private_alias_callers() {
             "mod consumer;\ntype Result<T> = std::result::Result<T, ()>;\nfn main() {}\n",
         );
         let consumer_path = root_dir.join("consumer/mod.rs");
+        let expected_consumer_path = consumer_path
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
         repo.write(
             &consumer_path,
             "fn caller(value: super::Result<u8>) -> super::Result<u8> { value }\n",
@@ -796,7 +799,7 @@ fn impact_rust_cargo_target_roots_keep_private_alias_callers() {
                 .as_array()
                 .is_some_and(|callers| callers
                     .iter()
-                    .any(|caller| { caller["path"] == consumer_path.to_str().unwrap() })),
+                    .any(|caller| { caller["path"] == expected_consumer_path })),
             "root={root_path}: {context}"
         );
     }

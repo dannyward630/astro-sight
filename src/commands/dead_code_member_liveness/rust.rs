@@ -864,7 +864,8 @@ fn resolve_receiver<'a>(
     if module.contains('/') || path == root.join(&candidate.file) {
         return None;
     }
-    let reference = path.strip_prefix(root).ok()?.to_str()?;
+    let reference =
+        crate::git_support::normalize_workspace_separators(path.strip_prefix(root).ok()?.to_str()?);
     let reference_module = reference.strip_prefix("src/")?.strip_suffix(".rs")?;
     if reference_module.contains('/')
         || !lib_modules?.contains(module)
