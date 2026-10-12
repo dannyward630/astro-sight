@@ -3112,3 +3112,108 @@ fn removed_free_function_rust_scope_proof_stays_inside_value_bindings() {
         );
     }
 }
+
+#[test]
+fn removed_free_function_rust_expression_macros_do_not_hide_independent_values() {
+    for source in [
+        "pub fn run() -> u32 { let total = make!(); total }\n",
+        "pub fn run() -> u32 { let total = 3; let other = make!(); total + other }\n",
+        "pub fn log() { log!(); }\npub fn run(total: u32) -> u32 { total }\n",
+    ] {
+        let api = removal_scope_fixture(
+            "src/a.rs",
+            &[
+                ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+                ("src/b.rs", source),
+            ],
+        );
+        assert!(api.removed.is_empty(), "{source}\n{:?}", api.removed);
+        assert!(api.removed_dead.iter().any(|s| s.name == "total"));
+    }
+    for source in [
+        "pub fn run() -> u32 { let total = 3; bind!(total); total }\n",
+        "#[rewrite] pub fn run(total: u32) -> u32 { total }\n",
+        "#[rewrite] impl Store { pub fn run(total: u32) -> u32 { total } }\n",
+        "#[rewrite] mod nested { pub fn run(total: u32) -> u32 { total } }\n",
+        "#[rewrite] fn outer() { fn inner(total: u32) -> u32 { total } }\n",
+        "pub fn run() -> u32 { let total = 3; total = total(3); total }\n",
+        "pub fn run() -> u32 { let total = 3; let total = total; total(3) }\n",
+    ] {
+        let api = removal_scope_fixture(
+            "src/a.rs",
+            &[
+                ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+                ("src/b.rs", source),
+            ],
+        );
+        assert!(
+            api.removed.iter().any(|s| s.name == "total"),
+            "{source}\n{:?}",
+            api.removed_dead
+        );
+    }
+}
+
+#[test]
+fn removed_free_function_ignores_initialized_submodule_references_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[("tools/old.py", "def main():\n    return 0\n")],
+        "base",
+    );
+    let oid = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    let entry = format!(
+        "160000,{},vendor/plugin",
+        String::from_utf8(oid.stdout).unwrap().trim()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args(["update-index", "--add", "--cacheinfo", &entry])
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args(["commit", "-m", "submodule"])
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::create_dir_all(repo.join("vendor/plugin")).unwrap();
+    fs::write(
+        repo.join("vendor/plugin/client.py"),
+        "from tools.old import main\nmain()\n",
+    )
+    .unwrap();
+    fs::remove_file(repo.join("tools/old.py")).unwrap();
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(api.removed.iter().any(|symbol| symbol.name == "main"));
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.join("vendor/plugin"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(api.removed.is_empty(), "{:?}", api.removed);
+    assert!(api.removed_dead.iter().any(|symbol| symbol.name == "main"));
+    fs::write(
+        repo.join("vendor/plugin-copy.py"),
+        "from tools.old import main\nmain()\n",
+    )
+    .unwrap();
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(api.removed.iter().any(|symbol| symbol.name == "main"));
+}

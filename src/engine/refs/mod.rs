@@ -26,8 +26,7 @@ use crate::models::skip::SkippedFiles;
 use crate::models::truncation::TruncationInfo;
 
 pub(crate) use definition::rust::{
-    RustPatternBindingCache, is_rust_shadowable_value_identifier,
-    is_rust_struct_field_non_callable, rust_pattern_binds_name,
+    is_rust_shadowable_value_identifier, is_rust_struct_field_non_callable,
 };
 pub(crate) use files::detect_source_lang;
 pub use files::{

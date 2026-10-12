@@ -1,12 +1,9 @@
 //! 削除した自由関数と無関係な、座標ごとの定義・値束縛を証明する。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use tree_sitter::Node;
 
-use crate::engine::refs::{
-    RustPatternBindingCache, is_rust_shadowable_value_identifier,
-    is_rust_struct_field_non_callable, rust_pattern_binds_name,
-};
+use crate::engine::refs::is_rust_struct_field_non_callable;
 
 pub(super) type Positions = HashSet<(usize, usize)>;
 
@@ -154,10 +151,6 @@ fn has_attributes(node: Node<'_>) -> bool {
         .any(|n| n.kind() == "attribute_item")
 }
 
-fn contains(container: Node<'_>, node: Node<'_>) -> bool {
-    container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
-}
-
 /// Rust の top-level fn 定義と、通常の let / 引数の有効範囲を別々に返す。
 /// refs の出現自体は変更せず、削除候補の帰属判定だけで用いる。
 pub(super) fn rust_scope_positions(
@@ -172,12 +165,6 @@ pub(super) fn rust_scope_positions(
     if all.iter().any(|n| n.is_missing()) {
         return (Positions::new(), Positions::new());
     }
-    let cache = RustPatternBindingCache::default();
-    // 展開後の use / const / 値束縛はこの解析木には無い。マクロのあるファイルでは
-    // パターンの名前解決を証明せず、従来の保守的な参照判定へ戻す。
-    let has_macros = all
-        .iter()
-        .any(|n| matches!(n.kind(), "macro_invocation" | "macro_definition"));
     let named = |n: Node<'_>| {
         n.child_by_field_name("name")
             .and_then(|n| n.utf8_text(source).ok())
@@ -196,39 +183,21 @@ pub(super) fn rust_scope_positions(
     {
         independent.insert(position(n));
     }
-    // 入れ子の同名 item は外側 let より優先され得る。解決できなければ値束縛を証明しない。
-    let nested_item = all.iter().any(|n| {
-        matches!(
-            n.kind(),
-            "function_item" | "struct_item" | "enum_item" | "mod_item"
-        ) && named(*n)
-            && n.parent().is_none_or(|p| p.id() != root.id())
+    // Item macros may introduce declarations not present in this tree. Expression
+    // macros cannot introduce bindings into the surrounding function's block.
+    let opaque_item_macro = all.iter().any(|node| {
+        node.kind() == "macro_invocation"
+            && node.parent().is_some_and(|parent| {
+                matches!(parent.kind(), "source_file" | "declaration_list")
+                    || (parent.kind() == "expression_statement"
+                        && parent.parent().is_some_and(|p| {
+                            matches!(p.kind(), "source_file" | "declaration_list")
+                        }))
+            })
     });
-    let mut lets: HashMap<usize, Vec<(Node<'_>, Node<'_>)>> = HashMap::new();
-    let mut parameters: HashMap<usize, Vec<Node<'_>>> = HashMap::new();
-    if !nested_item && !has_macros {
-        for &n in &all {
-            if n.kind() == "let_declaration"
-                && !has_attributes(n)
-                && let Some(block) = n.parent().filter(|p| p.kind() == "block")
-                && let Some(pattern) = n.child_by_field_name("pattern")
-                && rust_pattern_binds_name(pattern, name, source, &cache)
-            {
-                lets.entry(block.id()).or_default().push((n, pattern));
-            }
-            if n.kind() == "parameter"
-                && !has_attributes(n)
-                && let Some(params) = n.parent().filter(|p| p.kind() == "parameters")
-                && let Some(function) = params.parent().filter(|p| p.kind() == "function_item")
-                && let Some(pattern) = n.child_by_field_name("pattern")
-                && rust_pattern_binds_name(pattern, name, source, &cache)
-            {
-                parameters.entry(function.id()).or_default().push(pattern);
-            }
-        }
-    }
+    let scope = crate::engine::rust_scope::RustScopeIndex::build(root, source);
     let mut local = Positions::new();
-    for &node in &all {
+    for node in all {
         if node.utf8_text(source).ok() != Some(name) {
             continue;
         }
@@ -236,49 +205,23 @@ pub(super) fn rust_scope_positions(
             local.insert(position(node));
             continue;
         }
-        if nested_item || has_macros || !is_rust_shadowable_value_identifier(node) {
-            continue;
+        // Attribute macros can rewrite the entire function, including bindings.
+        let mut parent = node.parent();
+        let mut attributed_function = false;
+        while let Some(ancestor) = parent {
+            if ancestor.kind().ends_with("_item") && has_attributes(ancestor) {
+                attributed_function = true;
+                break;
+            }
+            parent = ancestor.parent();
         }
-        let mut current = node;
-        let mut proven = false;
-        while let Some(parent) = current.parent() {
-            if matches!(
-                parent.kind(),
-                "token_tree" | "macro_invocation" | "macro_definition" | "attribute_item"
-            ) {
-                proven = false;
-                break;
-            }
-            if parent.kind() == "block"
-                && lets.get(&parent.id()).is_some_and(|bindings| {
-                    bindings.iter().any(|(decl, pattern)| {
-                        contains(*pattern, node) || node.start_byte() >= decl.end_byte()
-                    })
-                })
-            {
-                proven = true;
-            }
-            if parent.kind() == "function_item" {
-                if let Some(body) = parent.child_by_field_name("body")
-                    && parameters.get(&parent.id()).is_some_and(|bindings| {
-                        bindings
-                            .iter()
-                            .any(|pattern| contains(*pattern, node) || contains(body, node))
-                    })
-                {
-                    proven = true;
-                }
-                break;
-            }
-            if matches!(
-                parent.kind(),
-                "mod_item" | "impl_item" | "const_item" | "static_item"
-            ) {
-                break;
-            }
-            current = parent;
-        }
-        if proven {
+        if !opaque_item_macro
+            && !attributed_function
+            && scope.as_ref().is_some_and(|index| {
+                index.resolve(node, source)
+                    == crate::engine::lexical_binding::LexicalBinding::RustValueBinding
+            })
+        {
             local.insert(position(node));
         }
     }

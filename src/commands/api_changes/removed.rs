@@ -56,13 +56,25 @@ pub(crate) fn partition_removed_dead_candidates(
     }
 
     let service = AppService::new();
-    let batch_result = match service.find_symbol_references_batch(&unique_bare, dir, None) {
+    let mut batch_result = match service.find_symbol_references_batch(&unique_bare, dir, None) {
         Ok(r) => r,
         Err(_) => {
             // 検索失敗時は保守的にすべて removed に残す
             return (candidates, Vec::new());
         }
     };
+
+    // Initialized submodules belong to another repository. Keep refs occurrence
+    // output unchanged; omit those files only from this repository's API proof.
+    if let Some(gitlinks) = current_gitlinks(dir) {
+        for result in &mut batch_result {
+            result.references.retain(|reference| {
+                !gitlinks
+                    .iter()
+                    .any(|path| std::path::Path::new(&reference.path).starts_with(path))
+            });
+        }
+    }
 
     // 外部パッケージ (package.json deps) から import された同名 binding は、削除した
     // ローカルシンボルとは別物 (例: tailwindcss の `Config` 型) なので参照カウントから
@@ -272,10 +284,48 @@ pub(crate) fn partition_removed_dead_candidates(
     (removed_kept, removed_dead)
 }
 
+/// 現在の index が所有する gitlink。取得失敗・未マージ・上限超過なら除外しない。
+fn current_gitlinks(dir: &str) -> Option<Vec<std::path::PathBuf>> {
+    use std::process::Stdio;
+    let mut child = crate::git_support::git_command_for_dir(dir)
+        .args(["ls-files", "--stage", "-z"])
+        .current_dir(dir)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let output = crate::commands::common::read_bytes_limited_and_drain(
+        child.stdout.take()?,
+        2 * 1024 * 1024,
+        "API submodule metadata",
+    );
+    if !child.wait().ok()?.success() {
+        return None;
+    }
+    let data = output.ok()?;
+    let mut paths = Vec::new();
+    for entry in data
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (header, path) = std::str::from_utf8(entry).ok()?.split_once('\t')?;
+        let fields: Vec<_> = header.split_whitespace().collect();
+        if fields.len() != 3 || fields[2] != "0" {
+            return None;
+        }
+        if fields[0] == "160000" && std::path::Path::new(dir).join(path).join(".git").exists() {
+            paths.push(std::path::PathBuf::from(path));
+        }
+    }
+    Some(paths)
+}
+
 /// `<dir>/package.json` の dependencies / devDependencies / peerDependencies /
 /// optionalDependencies のキー (外部パッケージ名) を集める。package.json 不在 / パース
 /// 失敗時は空集合 (= 何も除外しない、保守的)。
-pub(crate) fn load_external_package_names(dir: &str) -> std::collections::HashSet<String> {
+fn load_external_package_names(dir: &str) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
     let path = std::path::Path::new(dir).join("package.json");
     let Ok(content) = std::fs::read_to_string(&path) else {
