@@ -405,10 +405,7 @@ fn build_review_hook_json_cochange_only_is_informational() {
     assert_eq!(entry["c"], 90, "confidence は百分率");
     assert_eq!(entry["n"], 9, "共変更コミット数 (分子) を併記する");
     assert_eq!(entry["d"], 10, "集計対象コミット数 (分母) を併記する");
-    assert!(
-        entry.get("e").is_none(),
-        "変更行 blame (既定) では証拠種別を省略して出力を短く保つ"
-    );
+    assert_eq!(entry["e"], "blame", "変更行の履歴も証拠種別を明示する");
 }
 
 /// ファイル履歴 fallback で作った証拠は `e: "history"` として区別できるようにする。
@@ -2037,9 +2034,8 @@ fn build_review_hook_json_cochange_omits_non_finite_ranking_without_losing_candi
         assert!(!build.is_blocking);
         let value = build.value.unwrap();
         let compact = &value["cochange"][0];
-        assert!(
-            compact.get("s").is_none() && compact.get("d").is_none() && compact.get("e").is_none()
-        );
+        assert!(compact.get("s").is_none() && compact.get("d").is_none());
+        assert_eq!(compact["e"], "blame");
         assert_eq!(compact["c"], 90);
         assert_eq!(compact["i"], full["interpretation"]);
     }

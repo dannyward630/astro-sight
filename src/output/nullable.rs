@@ -92,6 +92,16 @@ pub(super) const OMITTED_DEFAULTS: &[(&str, &str, OmittedDefault)] = &[
     ),
     ("SkippedFiles", "truncated", OmittedDefault::BoolFalse),
     (
+        "RecentCochangeEvidence",
+        "recent_scan_truncated",
+        OmittedDefault::BoolFalse,
+    ),
+    (
+        "CoChangeInterpretation",
+        "small_sample",
+        OmittedDefault::BoolFalse,
+    ),
+    (
         "CoChangeDiagnostics",
         "filtered_deleted_candidates",
         OmittedDefault::UsizeZero,
@@ -375,6 +385,42 @@ mod tests {
                 ]),
             ])
         );
+    }
+
+    #[test]
+    fn cochange_rows_preserve_omitted_false_values() {
+        use crate::models::cochange::{CoChangeInterpretation, RecentCochangeEvidence};
+        use crate::output::{JsonStyle, OutputFormat, OutputOptions, serialize_document};
+        let options = OutputOptions::new(OutputFormat::Toon, JsonStyle::Compact);
+        let recent = |truncated| RecentCochangeEvidence {
+            base: "base".into(),
+            fork_point: None,
+            commit: None,
+            checked_commits: 32,
+            window_seconds: 1800,
+            reason: None,
+            truncated,
+        };
+        let rows = vec![recent(true), recent(false)];
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[0]["recent_scan_truncated"], true);
+        assert!(json[0].get("truncated").is_none());
+        assert!(json[1].get("recent_scan_truncated").is_none());
+        let toon = serialize_document(&rows, options).unwrap();
+        assert!(toon.contains("recent_scan_truncated"), "{toon}");
+        assert!(toon.contains("false"), "{toon}");
+        assert!(!toon.contains("null"), "{toon}");
+        let rows = vec![
+            CoChangeInterpretation {
+                small_sample: true,
+                ..CoChangeInterpretation::HISTORY_ONLY
+            },
+            CoChangeInterpretation::HISTORY_ONLY,
+        ];
+        let toon = serialize_document(&rows, options).unwrap();
+        assert!(toon.contains("small_sample"), "{toon}");
+        assert!(toon.contains("false"), "{toon}");
+        assert!(!toon.contains("null"), "{toon}");
     }
 
     /// 登録キーでも列の値の型が既定値と合わなければ、登録したフィールドの列だと確認

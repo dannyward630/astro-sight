@@ -68,7 +68,7 @@ fn inert_package(parent: &Path) -> Option<()> {
     }
 }
 
-pub(super) fn resolve(dir: &str, module: &str) -> Option<String> {
+pub(crate) fn resolve(dir: &str, module: &str) -> Option<String> {
     let parts: Vec<_> = module.split('.').collect();
     if parts.is_empty()
         || parts.iter().any(|part| {

@@ -609,7 +609,7 @@ mod type_annotation;
 
 mod python_call_arity;
 mod python_contract;
-mod python_module_path;
+pub(crate) mod python_module_path;
 
 mod python_literal;
 

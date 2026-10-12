@@ -3410,7 +3410,24 @@ fn review_cochange_history_candidates_explain_unassessed_actionability_and_ranki
     assert_eq!(entry["co_changes"], 5);
     assert_eq!(entry["denominator"], 5);
     assert_eq!(entry["evidence"], "history");
-    let interpretation = serde_json::json!({"relation":"historical_cochange","actionability":"history_only","resolution":"not_assessed"});
+    let base = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo.root())
+        .output()
+        .unwrap();
+    assert!(base.status.success());
+    let base = String::from_utf8(base.stdout).unwrap();
+    let interpretation = serde_json::json!({
+        "relation": "historical_cochange",
+        "actionability": "history_only",
+        "resolution": "not_assessed",
+        "recent": {
+            "base": base.trim(),
+            "checked_commits": 0,
+            "window_seconds": 1800,
+            "reason": "no_upstream"
+        }
+    });
     assert_eq!(entry["interpretation"], interpretation);
     // 単純な頻度式から作り直さず、既存エンジンの重み付き順位をそのまま保持する。
     let standalone = repo.run_json("cochange", &["--paths", "spec.md"]);

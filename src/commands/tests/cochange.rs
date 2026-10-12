@@ -26,6 +26,138 @@ use std::io::Cursor;
 #[allow(unused_imports)]
 use std::process::Command;
 
+#[test]
+fn review_cochange_prefers_current_import_evidence_and_marks_small_samples() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    for n in 1..=3 {
+        git_commit_files(
+            repo,
+            &[
+                ("source.ts", &format!("export const value = {n};\n")),
+                (
+                    "related.ts",
+                    &format!(
+                        "import {{ value }} from './source';\nexport const output = value + {n};\n"
+                    ),
+                ),
+                ("history.txt", &format!("unrelated revision {n}\n")),
+            ],
+            "paired change",
+        );
+    }
+    fs::write(repo.join("source.ts"), "export const value = 4;\n").unwrap();
+    let files = HashSet::from(["source.ts".to_owned()]);
+    let service = AppService::new();
+    let report = detect_missing_cochanges_scoped(
+        &service,
+        ReviewCochangeInput {
+            dir: repo.to_str().unwrap(),
+            analysis_dir: repo.to_str().unwrap(),
+            changed_files: &files,
+            diff_files: &[],
+            min_confidence: 0.3,
+            min_samples: 3,
+            base: Some("HEAD"),
+            include_generated: false,
+            exclude_dirs: &[],
+            exclude_globs: &[],
+        },
+    )
+    .unwrap();
+    assert_eq!(report.missing[0].file, "related.ts", "{:?}", report.missing);
+    assert_eq!(
+        report.missing[0].interpretation.actionability,
+        crate::models::cochange::CoChangeActionability::VerificationTarget
+    );
+    assert_eq!(
+        report.missing[0]
+            .interpretation
+            .current_dependency
+            .unwrap()
+            .direction,
+        crate::models::cochange::CochangeDependencyDirection::RelatedToChanged
+    );
+    assert!(report.missing[0].interpretation.small_sample);
+    assert_eq!(report.missing[0].confidence, 1.0);
+    let history = report
+        .missing
+        .iter()
+        .find(|item| item.file == "history.txt")
+        .unwrap();
+    assert_eq!(
+        history.interpretation.actionability,
+        crate::models::cochange::CoChangeActionability::HistoryOnly
+    );
+}
+
+#[test]
+fn review_cochange_deletion_keeps_only_observed_references_and_honors_exclusions() {
+    for referenced in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        for n in 1..=3 {
+            git_commit_files(
+                repo,
+                &[
+                    ("source.ts", &format!("export const value = {n};\n")),
+                    (
+                        "related.ts",
+                        &format!(
+                            "{}export const output = {n};\n",
+                            if referenced {
+                                "import './source';\n"
+                            } else {
+                                ""
+                            }
+                        ),
+                    ),
+                ],
+                "paired change",
+            );
+        }
+        fs::remove_file(repo.join("source.ts")).unwrap();
+        let files = HashSet::from(["source.ts".to_owned()]);
+        let diff = [crate::models::impact::DiffFile {
+            old_path: "source.ts".into(),
+            new_path: "/dev/null".into(),
+            hunks: vec![],
+            deleted_old_source: None,
+        }];
+        let excluded = vec!["related.ts".to_owned()];
+        let service = AppService::new();
+        for exclude in [false, true] {
+            let report = detect_missing_cochanges_scoped(
+                &service,
+                ReviewCochangeInput {
+                    dir: repo.to_str().unwrap(),
+                    analysis_dir: repo.to_str().unwrap(),
+                    changed_files: &files,
+                    diff_files: &diff,
+                    min_confidence: 0.3,
+                    min_samples: 3,
+                    base: Some("HEAD"),
+                    include_generated: false,
+                    exclude_dirs: &[],
+                    exclude_globs: if exclude { &excluded } else { &[] },
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                report.missing.iter().any(|i| i.file == "related.ts"),
+                referenced && !exclude,
+                "{referenced}/{exclude}: {:?}",
+                report.missing
+            );
+            if !referenced || exclude {
+                assert!(report.diagnostics.review_filters.is_some());
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------------
 // is_dependency_manifest_pair
 // ------------------------------------------------------------------

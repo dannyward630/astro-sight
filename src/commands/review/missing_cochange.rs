@@ -350,7 +350,11 @@ impl RankedMissingCochange {
                 confidence: entry.confidence,
                 co_changes: entry.co_changes,
                 denominator: entry.denominator,
-                evidence: entry.evidence,
+                evidence: Some(
+                    entry
+                        .evidence
+                        .unwrap_or(crate::models::cochange::CoChangeEvidence::Blame),
+                ),
                 interpretation: crate::models::cochange::CoChangeInterpretation::HISTORY_ONLY,
                 ranking_score: ranking.is_finite().then_some(ranking),
             },
@@ -365,9 +369,19 @@ impl RankedMissingCochange {
 /// raw confidence だけで比較すると、3/3 の小標本が 30/40 の十分な標本より上位になり、
 /// エンジン側で計算した Bayesian smoothing の順位を review が壊してしまう。
 fn compare_ranked_missing(a: &RankedMissingCochange, b: &RankedMissingCochange) -> Ordering {
-    b.ranking
-        .partial_cmp(&a.ranking)
-        .unwrap_or(Ordering::Equal)
+    let tier = |item: &RankedMissingCochange| match item
+        .item
+        .interpretation
+        .current_dependency
+        .map(|e| e.kind)
+    {
+        Some(crate::models::cochange::CochangeDependencyKind::StaticImportCandidate) => 2,
+        Some(crate::models::cochange::CochangeDependencyKind::PathMention) => 1,
+        None => 0,
+    };
+    tier(b)
+        .cmp(&tier(a))
+        .then_with(|| b.ranking.partial_cmp(&a.ranking).unwrap_or(Ordering::Equal))
         .then_with(|| b.item.co_changes.cmp(&a.item.co_changes))
         .then_with(|| {
             b.item
@@ -393,6 +407,20 @@ fn insert_best_missing(
         .or_insert(candidate);
 }
 
+pub(crate) struct ReviewCochangeInput<'a> {
+    pub dir: &'a str,
+    pub analysis_dir: &'a str,
+    pub changed_files: &'a HashSet<String>,
+    pub diff_files: &'a [crate::models::impact::DiffFile],
+    pub min_confidence: f64,
+    pub min_samples: usize,
+    pub base: Option<&'a str>,
+    pub include_generated: bool,
+    pub exclude_dirs: &'a [String],
+    pub exclude_globs: &'a [String],
+}
+
+#[cfg(test)]
 pub(crate) fn detect_missing_cochanges(
     service: &AppService,
     dir: &str,
@@ -405,6 +433,55 @@ pub(crate) fn detect_missing_cochanges(
     // そのまま流す＝standalone の cochange と review で同じ指定が効く。
     include_generated: bool,
 ) -> Result<MissingCochangeReport> {
+    detect_missing_cochanges_scoped(
+        service,
+        ReviewCochangeInput {
+            dir,
+            analysis_dir: dir,
+            changed_files,
+            diff_files: &[],
+            min_confidence,
+            min_samples,
+            base,
+            include_generated,
+            exclude_dirs: &[],
+            exclude_globs: &[],
+        },
+    )
+}
+
+fn attach_filters(
+    diagnostics: &mut crate::models::cochange::CoChangeDiagnostics,
+    scope: &super::cochange_scope::Scope<'_>,
+) {
+    if scope.filters != Default::default() {
+        diagnostics.review_filters = Some(scope.filters.clone());
+    }
+}
+
+pub(crate) fn detect_missing_cochanges_scoped(
+    service: &AppService,
+    input: ReviewCochangeInput<'_>,
+) -> Result<MissingCochangeReport> {
+    let ReviewCochangeInput {
+        dir,
+        analysis_dir,
+        changed_files,
+        diff_files,
+        min_confidence,
+        min_samples,
+        base,
+        include_generated,
+        exclude_dirs,
+        exclude_globs,
+    } = input;
+    let mut scope = super::cochange_scope::Scope::new(
+        analysis_dir,
+        base,
+        diff_files,
+        exclude_dirs,
+        exclude_globs,
+    )?;
     // review では blame モードで cochange を解析する。
     // 起点ファイル = 差分に登場したファイル。
     // ただし起点が無い (差分が空) ときは何もせず空を返す。
@@ -416,12 +493,15 @@ pub(crate) fn detect_missing_cochanges(
     let source_files: Vec<String> = changed_files
         .iter()
         .filter(|f| !is_dependency_lock_path(f))
+        .filter(|f| scope.source(f))
         .cloned()
         .collect();
     if source_files.is_empty() {
+        let mut diagnostics = Default::default();
+        attach_filters(&mut diagnostics, &scope);
         return Ok(MissingCochangeReport {
             missing: Vec::new(),
-            diagnostics: Default::default(),
+            diagnostics,
         });
     }
     // 起点過多 (退化した作業ツリー等で diff が全追跡ファイルに化けたケース) では
@@ -513,7 +593,25 @@ pub(crate) fn detect_missing_cochanges(
             None
         };
 
-        if let Some(candidate) = candidate {
+        if let Some(mut candidate) = candidate {
+            if !scope.candidate(&candidate.item.file) {
+                continue;
+            }
+            let evidence = scope.evidence(&candidate.item.expected_with, &candidate.item.file);
+            if scope.deleted_without_reference(
+                &candidate.item.expected_with,
+                &candidate.item.file,
+                evidence,
+            ) {
+                continue;
+            }
+            candidate.item.interpretation.current_dependency = evidence;
+            candidate.item.interpretation.small_sample =
+                candidate.item.denominator.is_some_and(|d| d < 5);
+            if evidence.is_some() {
+                candidate.item.interpretation.actionability =
+                    crate::models::cochange::CoChangeActionability::VerificationTarget;
+            }
             // snapshot → 生成元テストの方向だけ推薦から外す。
             //
             // **重複排除より前に判定する**のが要点。`insert_best_missing` は欠落ファイルごとに
@@ -543,10 +641,13 @@ pub(crate) fn detect_missing_cochanges(
     let mut ranked: Vec<RankedMissingCochange> = best.into_values().collect();
     ranked.sort_by(compare_ranked_missing);
     ranked.truncate(10);
-    let missing = ranked.into_iter().map(|candidate| candidate.item).collect();
+    let mut missing: Vec<_> = ranked.into_iter().map(|candidate| candidate.item).collect();
+    super::recent_cochange::annotate(dir, base, &mut missing);
+    let mut diagnostics = cochange_result.diagnostics;
+    attach_filters(&mut diagnostics, &scope);
     Ok(MissingCochangeReport {
         missing,
-        diagnostics: cochange_result.diagnostics,
+        diagnostics,
     })
 }
 

@@ -2,7 +2,7 @@
 //!
 //! 共有ヘルパーは `common`、以降はテーマ別のサブモジュールに分けている。
 
-mod common;
+pub(crate) mod common;
 
 mod api_changes;
 mod cochange;

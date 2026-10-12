@@ -18,11 +18,13 @@ use super::dead_code::{
 };
 use super::git_input::{DiffSourceResolution, resolve_diff_source, run_git_diff};
 use hook::review_hook_output;
-use missing_cochange::detect_missing_cochanges;
+use missing_cochange::{ReviewCochangeInput, detect_missing_cochanges_scoped};
 
+mod cochange_scope;
 pub mod hook;
 mod index_snapshot;
 pub(crate) mod missing_cochange;
+mod recent_cochange;
 
 // ---------------------------------------------------------------------------
 // Review コマンド: impact / cochange / API surface diff / dead symbol 統合
@@ -242,14 +244,20 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
 
     // 4. cochange 分析 → missing_cochanges 検出
     let cochange_report = timed_ok("cochange", || {
-        detect_missing_cochanges(
+        detect_missing_cochanges_scoped(
             service,
-            dir,
-            &changed_file_set,
-            min_confidence,
-            cochange_min_samples,
-            Some(analysis_base),
-            include_generated,
+            ReviewCochangeInput {
+                dir,
+                analysis_dir,
+                changed_files: &changed_file_set,
+                diff_files: &diff_files,
+                min_confidence,
+                min_samples: cochange_min_samples,
+                base: Some(analysis_base),
+                include_generated,
+                exclude_dirs: extra_exclude_dirs,
+                exclude_globs: extra_exclude_globs,
+            },
         )
     })?;
 

@@ -2,6 +2,18 @@ use serde::{Deserialize, Serialize};
 
 use super::skip::SkipInfo;
 
+/// review の除外と、現在の依存証拠を調べられなかった範囲。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CochangeReviewFilters {
+    pub gitlink_sources: usize,
+    pub gitlink_candidates: usize,
+    pub excluded_sources: usize,
+    pub excluded_candidates: usize,
+    pub deleted_pairs_without_observed_reference: usize,
+    pub dependency_probes_truncated: bool,
+    pub metadata_unavailable: bool,
+}
+
 /// 履歴上の関連。未知の値から変更義務や対応完了を推測しない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,6 +28,28 @@ pub enum CoChangeRelation {
 #[non_exhaustive]
 pub enum CoChangeActionability {
     HistoryOnly,
+    VerificationTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CochangeDependencyKind {
+    StaticImportCandidate,
+    PathMention,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CochangeDependencyDirection {
+    ChangedToRelated,
+    RelatedToChanged,
+    Bidirectional,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CochangeDependencyEvidence {
+    pub kind: CochangeDependencyKind,
+    pub direction: CochangeDependencyDirection,
 }
 
 /// 履歴頻度だけでは対応済み・未対応のどちらとも認定できない。
@@ -24,14 +58,63 @@ pub enum CoChangeActionability {
 #[non_exhaustive]
 pub enum CoChangeResolution {
     NotAssessed,
+    ChangedInRecentCommits,
+    NotChangedInRecentSuffix,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecentCochangeReason {
+    NoUpstream,
+    NoForkPoint,
+    ShallowHistory,
+    OtherAuthor,
+    MergeBoundary,
+    OutsideWindow,
+    InvalidMetadata,
+    GitFailure,
+    Truncated,
+    ReferenceChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecentCochangeEvidence {
+    pub base: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_point: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    pub checked_commits: usize,
+    pub window_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<RecentCochangeReason>,
+    #[serde(
+        rename = "recent_scan_truncated",
+        skip_serializing_if = "crate::models::review::is_false"
+    )]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CochangeVerificationDirection {
+    CheckCurrentChangeAgainstPriorChange,
 }
 
 /// blame/history とも履歴の証拠であり、因果・必要性・完了状態とは区別する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CoChangeInterpretation {
     pub relation: CoChangeRelation,
     pub actionability: CoChangeActionability,
     pub resolution: CoChangeResolution,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent: Option<RecentCochangeEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_direction: Option<CochangeVerificationDirection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_dependency: Option<CochangeDependencyEvidence>,
+    #[serde(skip_serializing_if = "crate::models::review::is_false")]
+    pub small_sample: bool,
 }
 
 impl CoChangeInterpretation {
@@ -39,6 +122,10 @@ impl CoChangeInterpretation {
         relation: CoChangeRelation::HistoricalCochange,
         actionability: CoChangeActionability::HistoryOnly,
         resolution: CoChangeResolution::NotAssessed,
+        recent: None,
+        verification_direction: None,
+        current_dependency: None,
+        small_sample: false,
     };
 }
 
@@ -157,6 +244,8 @@ pub enum CoChangeDiagnosticReason {
 /// 全カウンタが 0 のときは出力から省略される (追加専用フィールド)。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CoChangeDiagnostics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_filters: Option<CochangeReviewFilters>,
     /// 起点として渡されたファイル数。
     pub sources_requested: usize,
     /// 変更行 blame でコミット集合を構築できた起点数。
