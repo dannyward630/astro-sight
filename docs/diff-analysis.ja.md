@@ -125,7 +125,9 @@ condition = { command_exists = "astro-sight" }
 { "...": "...", "skipped": { "reason": "not_git_repository", "source": "git", "message": "--git was requested but --dir is not inside a git worktree" } }
 ```
 
-判定には `git rev-parse --is-inside-work-tree`（`LC_ALL=C`）を使うので、worktree / submodule / bare repo でも正しく判定できる。**真のエラー**（`--base` 不正・git 実行不能・壊れた repo・権限不足）は `exit 1` を返す。`--diff` / `--diff-file` / stdin で diff を渡す経路は、この判定を通らない。
+判定には `git rev-parse --is-inside-work-tree`（`LC_ALL=C`）を使うので、worktree / submodule / bare repo でも正しく判定できる。**真のエラー**（`--base` 不正・base がコミットに解決できない・git 実行不能・壊れた repo・権限不足）は `exit 1` を返す。`--diff` / `--diff-file` / stdin で diff を渡す経路は、この判定を通らない。
+
+`review --git` は開始時に base をコミット ID に固定し、差分・cochange・API 解析で共有する。解析中に index や作業ツリーが変わった場合は `exit 1` で再実行を促す。`--staged` でも API と dead-code は作業ツリーのファイルを読むため、staged 差分と作業ツリーの両方を確認する。
 
 ### 未追跡ファイルの取り込み上限
 

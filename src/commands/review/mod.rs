@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use tracing::info;
 
+use crate::error::{AstroError, ErrorCode};
 use crate::models::review::{ApiSymbol, DeadSymbol, ReviewResult};
 use crate::models::skip::SkipInfo;
 use crate::service::AppService;
@@ -15,7 +16,7 @@ use super::dead_code::{
     filter_diff_files_for_dead_code, resolve_dead_code_excludes,
     resolve_framework_globs_with_auto_detect,
 };
-use super::git_input::{DiffSourceResolution, resolve_diff_source};
+use super::git_input::{DiffSourceResolution, resolve_diff_source, run_git_diff};
 use hook::review_hook_output;
 use missing_cochange::detect_missing_cochanges;
 
@@ -84,9 +85,13 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
     // 未指定時は package.json から next 依存を検出して nextjs プリセットを自動適用する。
     let framework_globs = resolve_framework_globs_with_auto_detect(framework, dir)?;
     // 1. diff 取得（context コマンドと同じ入力方式）
-    let (diff_input, truncations) =
+    let (diff_input, truncations, pinned_base) =
         match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
-            DiffSourceResolution::Diff { diff, truncations } => (diff, truncations),
+            DiffSourceResolution::Diff {
+                diff,
+                truncations,
+                base_commit,
+            } => (diff, truncations, base_commit),
             // git 管理外: hook は完全 silent、通常は空結果 + skipped で exit 0。
             DiffSourceResolution::Skipped(skip) => {
                 return emit_review_short_circuit(
@@ -104,11 +109,39 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
                 (
                     read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?,
                     Vec::new(),
+                    None,
                 )
             }
         };
+    let analysis_base = pinned_base.as_deref().unwrap_or(base);
+    // staged の API / dead-code は作業ツリーも読む。index だけの再比較では、
+    // 解析中に未ステージの内容が変わっても検出できないため両方を記録する。
+    let working_tree_diff = if staged {
+        pinned_base
+            .as_deref()
+            .map(|commit| run_git_diff(dir, commit, false))
+            .transpose()?
+    } else {
+        None
+    };
+    if working_tree_diff.is_some() {
+        ensure_review_diff_unchanged(
+            dir,
+            pinned_base.as_deref(),
+            staged,
+            &diff_input,
+            working_tree_diff.as_deref(),
+        )?;
+    }
 
     if diff_input.trim().is_empty() {
+        ensure_review_diff_unchanged(
+            dir,
+            pinned_base.as_deref(),
+            staged,
+            &diff_input,
+            working_tree_diff.as_deref(),
+        )?;
         return emit_review_short_circuit(
             hook,
             output,
@@ -134,6 +167,13 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
     // で繰り返し参照するため、ここで一度だけ parse して再利用する。
     let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
     if crate::engine::impact::should_skip_ci_only_diff(&diff_files) {
+        ensure_review_diff_unchanged(
+            dir,
+            pinned_base.as_deref(),
+            staged,
+            &diff_input,
+            working_tree_diff.as_deref(),
+        )?;
         log_phase("review.skip_ci_only", "applied", 0);
         return emit_review_short_circuit(
             hook,
@@ -182,14 +222,18 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
             &changed_file_set,
             min_confidence,
             cochange_min_samples,
-            Some(base),
+            Some(analysis_base),
             include_generated,
         )
     })?;
 
     // 5. API 公開面の差分 (内容同一の rename も含めて見る。`api_diff_files` 参照)
     let mut api_changes = timed("api_changes", || {
-        detect_api_changes(dir, base, &api_diff_files(&diff_files, &diff_input))
+        detect_api_changes(
+            dir,
+            analysis_base,
+            &api_diff_files(&diff_files, &diff_input),
+        )
     });
 
     // 6. dead symbol 検出
@@ -226,6 +270,14 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         truncations,
     };
 
+    ensure_review_diff_unchanged(
+        dir,
+        pinned_base.as_deref(),
+        staged,
+        &diff_input,
+        working_tree_diff.as_deref(),
+    )?;
+
     if hook {
         return review_hook_output(
             &result,
@@ -246,6 +298,96 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
     );
     print!("{text}");
     Ok(())
+}
+
+/// 解析の間に index / 作業ツリー側が変わった場合、異なる時点の情報を混ぜた結果を返さない。
+/// 基点には固定済みコミットを使い、HEAD の移動だけでは誤って失敗しない。
+fn ensure_review_diff_unchanged(
+    dir: &str,
+    pinned_base: Option<&str>,
+    staged: bool,
+    original_diff: &str,
+    original_working_tree_diff: Option<&str>,
+) -> Result<()> {
+    if let Some(base) = pinned_base {
+        let current_diff = run_git_diff(dir, base, staged)?;
+        if current_diff != original_diff {
+            return Err(AstroError::new(
+                ErrorCode::InvalidRequest,
+                "review input changed during analysis; run review again",
+            )
+            .into());
+        }
+        if let Some(original) = original_working_tree_diff {
+            let current = run_git_diff(dir, base, false)?;
+            if current != original {
+                return Err(AstroError::new(
+                    ErrorCode::InvalidRequest,
+                    "review working tree changed during analysis; run review again",
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+
+    #[test]
+    fn changed_worktree_or_index_invalidates_review_result() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(repo)
+                    .status()
+                    .expect("git")
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        fs::write(repo.join("sample.rs"), "pub fn sample() -> i32 { 1 }\n").expect("write");
+        git(&["add", "sample.rs"]);
+        git(&["commit", "-qm", "initial"]);
+        let dir = repo.to_str().expect("utf-8");
+
+        let worktree_diff = run_git_diff(dir, "HEAD", false).expect("initial diff");
+        fs::write(repo.join("sample.rs"), "pub fn sample() -> i32 { 2 }\n").expect("write");
+        assert!(
+            ensure_review_diff_unchanged(dir, Some("HEAD"), false, &worktree_diff, None).is_err()
+        );
+
+        git(&["add", "sample.rs"]);
+        let staged_diff = run_git_diff(dir, "HEAD", true).expect("staged diff");
+        fs::write(repo.join("sample.rs"), "pub fn sample() -> i32 { 3 }\n").expect("write");
+        git(&["add", "sample.rs"]);
+        assert!(ensure_review_diff_unchanged(dir, Some("HEAD"), true, &staged_diff, None).is_err());
+
+        let staged_diff = run_git_diff(dir, "HEAD", true).expect("updated staged diff");
+        let worktree_diff = run_git_diff(dir, "HEAD", false).expect("worktree snapshot");
+        fs::write(repo.join("sample.rs"), "pub fn sample() -> i32 { 4 }\n").expect("write");
+        assert!(
+            ensure_review_diff_unchanged(
+                dir,
+                Some("HEAD"),
+                true,
+                &staged_diff,
+                Some(&worktree_diff)
+            )
+            .is_err(),
+            "staged が同じでも作業ツリー側の変化は破棄する"
+        );
+    }
 }
 
 /// 解析へ進まず空結果で打ち切る共通処理 (git 管理外 / 空 diff / CI 言語のみ の 3 経路)。

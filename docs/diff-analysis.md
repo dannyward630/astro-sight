@@ -125,7 +125,9 @@ When a command that accepts `--git` (`context` / `impact` / `review` / `dead-cod
 { "...": "...", "skipped": { "reason": "not_git_repository", "source": "git", "message": "--git was requested but --dir is not inside a git worktree" } }
 ```
 
-The check uses `git rev-parse --is-inside-work-tree` (with `LC_ALL=C`), so worktrees, submodules, and bare repositories are detected correctly. **Real errors** (an invalid `--base`, git not runnable, a broken repository, missing permissions) return `exit 1`. Passing a diff through `--diff` / `--diff-file` / stdin does not go through this check.
+The check uses `git rev-parse --is-inside-work-tree` (with `LC_ALL=C`), so worktrees, submodules, and bare repositories are detected correctly. **Real errors** (an invalid `--base`, a base that cannot resolve to a commit, git not runnable, a broken repository, missing permissions) return `exit 1`. Passing a diff through `--diff` / `--diff-file` / stdin does not go through this check.
+
+For `review --git`, the base is resolved to a commit once and used for the diff, cochange, and API analysis. If the index or working tree changes during review, the command returns `exit 1` and asks you to run it again. With `--staged`, both the staged diff and working tree are checked because API and dead-code analysis also read working-tree files.
 
 ### Limit on Untracked Files
 

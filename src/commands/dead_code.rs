@@ -1484,7 +1484,9 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
     // --staged 実行中の git add で 2 つの diff が乖離する競合状態があった)。
     // NotRequested (diff/diff_file/git いずれも未指定) は全体走査に振り分ける。
     let resolved_diff = match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
-        DiffSourceResolution::Diff { diff, truncations } => {
+        DiffSourceResolution::Diff {
+            diff, truncations, ..
+        } => {
             if diff.trim().is_empty() {
                 // 未追跡の巨大ファイルを除外した結果 diff が空になった場合も、
                 // 何を対象外にしたかを報告する (空結果と打ち切りを混同させない)。

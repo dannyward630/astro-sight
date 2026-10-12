@@ -415,6 +415,8 @@ pub(crate) enum GitDiffInput {
     Diff {
         diff: String,
         truncations: Vec<TruncationInfo>,
+        /// 差分取得時に確定した旧側のコミット。後続解析で ref を再解決しない。
+        base_commit: String,
     },
     Skipped(SkipInfo),
 }
@@ -468,9 +470,41 @@ pub(crate) fn resolve_git_diff(dir: &str, base: &str, staged: bool) -> Result<Gi
         return Ok(GitDiffInput::Skipped(SkipInfo::not_git_repository()));
     }
 
+    let base_commit = resolve_commit_revision(dir, base)?;
     let mut truncations = Vec::new();
-    let diff = run_git_diff_collecting_truncations(dir, base, staged, &mut truncations)?;
-    Ok(GitDiffInput::Diff { diff, truncations })
+    let diff = run_git_diff_collecting_truncations(dir, &base_commit, staged, &mut truncations)?;
+    Ok(GitDiffInput::Diff {
+        diff,
+        truncations,
+        base_commit,
+    })
+}
+
+/// 変動する ref を一度だけ解決する。rev-list / show / diff が別々の HEAD を
+/// 見ないよう、呼び出し側は返されたコミット ID を全段階へ渡す。
+fn resolve_commit_revision(dir: &str, revision: &str) -> Result<String> {
+    let commit_expr = format!("{revision}^{{commit}}");
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &commit_expr])
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .map_err(|e| {
+            AstroError::new(ErrorCode::InvalidRequest, format!("Failed to run git: {e}"))
+        })?;
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success()
+        || !matches!(commit.len(), 40 | 64)
+        || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!("--base does not resolve to a commit: {revision}"),
+        )
+        .into());
+    }
+    Ok(commit)
 }
 
 /// 経路A (context / impact / review / dead-code) の diff 入力ソースを **解決のみ** 行う。
@@ -484,6 +518,8 @@ pub(crate) enum DiffSourceResolution {
         /// `--git` 経路で合成対象外にした未追跡ファイルの打ち切り情報。
         /// inline (`--diff`) / `--diff-file` は明示範囲を尊重するため常に空。
         truncations: Vec<TruncationInfo>,
+        /// `--git` 入力だけ Some。明示 diff の既存 base 解決規則は維持する。
+        base_commit: Option<String>,
     },
     Skipped(SkipInfo),
     NotRequested,
@@ -501,17 +537,25 @@ pub(crate) fn resolve_diff_source(
         Ok(DiffSourceResolution::Diff {
             diff: d.to_string(),
             truncations: Vec::new(),
+            base_commit: None,
         })
     } else if let Some(df) = file {
         Ok(DiffSourceResolution::Diff {
             diff: read_file_to_string_limited(df, MAX_INPUT_SIZE)?,
             truncations: Vec::new(),
+            base_commit: None,
         })
     } else if git {
         match resolve_git_diff(dir, base, staged)? {
-            GitDiffInput::Diff { diff, truncations } => {
-                Ok(DiffSourceResolution::Diff { diff, truncations })
-            }
+            GitDiffInput::Diff {
+                diff,
+                truncations,
+                base_commit,
+            } => Ok(DiffSourceResolution::Diff {
+                diff,
+                truncations,
+                base_commit: Some(base_commit),
+            }),
             GitDiffInput::Skipped(skip) => Ok(DiffSourceResolution::Skipped(skip)),
         }
     } else {

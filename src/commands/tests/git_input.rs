@@ -62,6 +62,72 @@ fn resolve_git_diff_rejects_invalid_base_even_when_non_git() {
     );
 }
 
+#[test]
+fn resolve_git_diff_pins_commit_for_worktree_and_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("src/lib.rs", "pub fn before() {}\n")], "initial");
+    let head = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf-8");
+    git_in(repo, &["tag", "-a", "v1", "-m", "release"]);
+    fs::write(repo.join("src/lib.rs"), "pub fn after() {}\n").expect("write");
+
+    for (revision, staged) in [("HEAD", false), ("v1", false), ("HEAD", true)] {
+        if staged {
+            git_in(repo, &["add", "src/lib.rs"]);
+        }
+        match resolve_git_diff(repo.to_str().expect("utf-8"), revision, staged).expect("diff") {
+            GitDiffInput::Diff {
+                diff, base_commit, ..
+            } => {
+                assert_eq!(base_commit, head.trim());
+                assert!(diff.contains("+pub fn after()"), "{diff}");
+            }
+            GitDiffInput::Skipped(_) => panic!("git repository should produce a diff"),
+        }
+    }
+}
+
+#[test]
+fn resolve_git_diff_rejects_unresolvable_commit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("src/lib.rs", "pub fn before() {}\n")], "initial");
+    for revision in ["missing-ref", "HEAD..HEAD"] {
+        assert!(
+            resolve_git_diff(repo.to_str().expect("utf-8"), revision, false).is_err(),
+            "{revision} should be rejected before analysis"
+        );
+    }
+}
+
+#[test]
+fn explicit_diff_keeps_base_unpinned() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    match resolve_diff_source(
+        dir.path().to_str().expect("utf-8"),
+        Some("sample diff"),
+        None,
+        true,
+        "missing-ref",
+        false,
+    )
+    .expect("explicit diff")
+    {
+        DiffSourceResolution::Diff { base_commit, .. } => assert!(base_commit.is_none()),
+        _ => panic!("explicit diff should take precedence"),
+    }
+}
+
 /// 行数上限を超える未追跡ファイルは合成 diff に含めず `truncations` に記録する。
 ///
 /// 生成物 (数万行 / 数万 `pub fn`) を合成すると全 exported symbol が api.add 候補になり、

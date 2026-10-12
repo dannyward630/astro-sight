@@ -494,7 +494,9 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
     } = opts;
     let (diff_input, truncations) =
         match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
-            DiffSourceResolution::Diff { diff, truncations } => (diff, truncations),
+            DiffSourceResolution::Diff {
+                diff, truncations, ..
+            } => (diff, truncations),
             DiffSourceResolution::Skipped(skip) => {
                 // git 管理外: 空の changes + skipped を返して exit 0。
                 let result = crate::models::impact::ContextResult {
@@ -608,7 +610,9 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
     output.ensure_json_protocol("impact")?;
     // impact に inline `--diff` / `--diff-file` は無いため resolver へは None を渡す。
     let (diff_input, truncations) = match resolve_diff_source(dir, None, None, git, base, staged)? {
-        DiffSourceResolution::Diff { diff, truncations } => (diff, truncations),
+        DiffSourceResolution::Diff {
+            diff, truncations, ..
+        } => (diff, truncations),
         // git 管理外: 既存の「差分なし」と同じく無出力で exit 0。
         // impact は構造化 JSON 出力を持たず未解決 caller 検出時のみ stderr に
         // 出力する設計のため、skipped JSON は出さない (hook の有無を問わず silent)。

@@ -3663,3 +3663,97 @@ fn review_hook_python_protocol_argument_rejects_contract_mutation_and_builtin_sh
         );
     }
 }
+
+/// 最初の diff を取得した直後に別プロセスがコミットする。後続の API / cochange が
+/// 新しい HEAD を再解決すると、削除された公開関数や履歴の相関を見失う。
+#[cfg(unix)]
+#[test]
+fn review_git_uses_one_base_when_head_advances_after_diff() {
+    for staged in [false, true] {
+        review_git_head_advance_case(staged);
+    }
+}
+
+#[cfg(unix)]
+fn review_git_head_advance_case(staged: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    for i in 0..4 {
+        repo.write("src/a.rs", format!("pub fn old() -> i32 {{ {i} }}\n"));
+        repo.write("src/b.rs", format!("pub fn paired() -> i32 {{ {i} }}\n"));
+        repo.commit_all(&format!("pair {i}"));
+    }
+    repo.write("src/a.rs", "pub fn replacement() -> i32 { 4 }\n");
+    if staged {
+        repo.stage_all();
+    }
+
+    let wrapper_dir = tempfile::tempdir().expect("wrapper tempdir");
+    let trigger = wrapper_dir.path().join("commit-on-first-diff");
+    std::fs::write(&trigger, "ready").expect("trigger");
+    let wrapper = wrapper_dir.path().join("git");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\n\"$ASTRO_TEST_REAL_GIT\" \"$@\"\nresult=$?\nif [ \"$result\" -eq 0 ] && [ -f \"$ASTRO_TEST_TRIGGER\" ]; then\n  for arg in \"$@\"; do\n    if [ \"$arg\" = diff ]; then\n      rm \"$ASTRO_TEST_TRIGGER\"\n      GIT_INDEX_FILE=\"$ASTRO_TEST_INDEX\" \"$ASTRO_TEST_REAL_GIT\" read-tree HEAD || exit 1\n      GIT_INDEX_FILE=\"$ASTRO_TEST_INDEX\" \"$ASTRO_TEST_REAL_GIT\" add src/a.rs || exit 1\n      GIT_INDEX_FILE=\"$ASTRO_TEST_INDEX\" \"$ASTRO_TEST_REAL_GIT\" rm --cached -q src/b.rs || exit 1\n      tree=$(GIT_INDEX_FILE=\"$ASTRO_TEST_INDEX\" \"$ASTRO_TEST_REAL_GIT\" write-tree) || exit 1\n      next=$(printf 'advanced\\n' | \"$ASTRO_TEST_REAL_GIT\" commit-tree \"$tree\" -p HEAD) || exit 1\n      \"$ASTRO_TEST_REAL_GIT\" update-ref HEAD \"$next\" || exit 1\n      break\n    fi\n  done\nfi\nexit \"$result\"\n",
+    )
+    .expect("wrapper");
+    let mut permissions = std::fs::metadata(&wrapper).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions).expect("chmod");
+
+    let host_path = std::env::var_os("PATH").expect("PATH");
+    let real_git = std::env::split_paths(&host_path)
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .expect("git executable");
+    let mut paths = vec![wrapper_dir.path().to_path_buf()];
+    paths.extend(std::env::split_paths(&host_path));
+    let wrapped_path = std::env::join_paths(paths).expect("wrapped PATH");
+
+    let mut command = cargo_bin();
+    command
+        .args(["review", "--dir"])
+        .arg(repo.root())
+        .arg("--git");
+    if staged {
+        command.arg("--staged");
+    }
+    let output = command
+        .env("PATH", wrapped_path)
+        .env("ASTRO_TEST_REAL_GIT", real_git)
+        .env("ASTRO_TEST_TRIGGER", &trigger)
+        .env(
+            "ASTRO_TEST_INDEX",
+            wrapper_dir.path().join("alternate-index"),
+        )
+        .output()
+        .expect("review");
+    assert!(
+        output.status.success(),
+        "staged={staged}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!trigger.exists(), "the test must move HEAD during review");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("review JSON");
+    assert!(
+        ["removed", "removed_dead"].iter().any(|bucket| {
+            result["api_changes"][bucket]
+                .as_array()
+                .expect("removed bucket")
+                .iter()
+                .any(|item| item["name"] == "old")
+        }),
+        "API phase must read the pinned old blob: {result}"
+    );
+    assert!(
+        result["missing_cochanges"]
+            .as_array()
+            .expect("missing cochanges")
+            .iter()
+            .any(|item| item["file"] == "src/b.rs"),
+        "cochange phase must read history from the pinned base: {result}"
+    );
+}

@@ -66,7 +66,9 @@ pub(crate) fn resolve_git_diff_parts(
     repo: &std::path::Path,
 ) -> (String, Vec<crate::models::truncation::TruncationInfo>) {
     match resolve_git_diff(repo.to_str().expect("utf-8"), "HEAD", false).expect("resolve") {
-        GitDiffInput::Diff { diff, truncations } => (diff, truncations),
+        GitDiffInput::Diff {
+            diff, truncations, ..
+        } => (diff, truncations),
         GitDiffInput::Skipped(_) => panic!("git リポでは Diff を返すべき"),
     }
 }
