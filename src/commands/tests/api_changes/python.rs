@@ -818,6 +818,202 @@ fn python_same_name_methods_check_their_own_argument_contracts() {
 }
 
 #[test]
+fn python_unchanged_other_owner_is_excluded_only_with_exact_module_and_receiver() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+    for (label, other_class, other_call, duplicate_root, expected) in [
+        (
+            "direct",
+            "class Ledger:\n    def price(self, amount):\n        return amount\n",
+            "Ledger().price(1)",
+            false,
+            true,
+        ),
+        (
+            "one hop",
+            "class Ledger:\n    def price(self, amount):\n        return amount\n",
+            "item.price(1)",
+            false,
+            true,
+        ),
+        (
+            "unknown receiver",
+            "class Ledger:\n    def price(self, amount):\n        return amount\n",
+            "unknown().price(1)",
+            false,
+            false,
+        ),
+        (
+            "inherited",
+            "class Base:\n    def price(self, amount):\n        return amount\n\nclass Ledger(Base):\n    pass\n",
+            "Ledger().price(1)",
+            false,
+            false,
+        ),
+        (
+            "duplicate root",
+            "class Ledger:\n    def price(self, amount):\n        return amount\n",
+            "Ledger().price(1)",
+            true,
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let foreign = format!(
+            "from pkg.other import Ledger\n\ndef other():\n    item = Ledger()\n    return {other_call}\n"
+        );
+        git_commit_files(
+            repo,
+            &[
+                ("pkg/__init__.py", ""),
+                (
+                    "pkg/catalog.py",
+                    "class Catalog:\n    def price(self, amount):\n        return amount\n",
+                ),
+                ("pkg/other.py", other_class),
+                (
+                    "pkg/caller.py",
+                    "from pkg.catalog import Catalog\n\ndef use():\n    item = Catalog()\n    return item.price(1)\n",
+                ),
+                ("pkg/foreign.py", &foreign),
+            ],
+            "base",
+        );
+        if duplicate_root {
+            std::fs::create_dir_all(repo.join("src/pkg")).unwrap();
+            std::fs::write(repo.join("src/pkg/__init__.py"), "").unwrap();
+            std::fs::write(repo.join("src/pkg/other.py"), other_class).unwrap();
+        }
+        std::fs::write(
+            repo.join("pkg/catalog.py"),
+            "class Catalog:\n    def price(self, amount, tax):\n        return amount + tax\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("pkg/caller.py"), "from pkg.catalog import Catalog\n\ndef use():\n    item = Catalog()\n    return item.price(1, 2)\n").unwrap();
+        let changes = detect_api_changes_from_worktree(repo);
+        assert_eq!(
+            changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|c| c.name == "Catalog.price"),
+            expected,
+            "{label}: {changes:?}"
+        );
+        assert_eq!(
+            changes.modified.iter().any(|c| c.name == "Catalog.price"),
+            !expected,
+            "{label}: {changes:?}"
+        );
+    }
+}
+
+#[test]
+fn python_same_class_name_in_another_file_is_not_the_target_owner() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+    for target_used in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("pkg/__init__.py", ""),
+                (
+                    "pkg/catalog.py",
+                    "class Catalog:\n    def price(self, amount):\n        return amount\n",
+                ),
+                (
+                    "pkg/other.py",
+                    "class Catalog:\n    def price(self, amount):\n        return amount\n",
+                ),
+                (
+                    "pkg/foreign.py",
+                    "from pkg.other import Catalog\n\ndef use_other():\n    return Catalog().price(1)\n",
+                ),
+                (
+                    "pkg/caller.py",
+                    if target_used {
+                        "from pkg.catalog import Catalog\n\ndef use():\n    return Catalog().price(1)\n"
+                    } else {
+                        "def use():\n    return 0\n"
+                    },
+                ),
+            ],
+            "base",
+        );
+        std::fs::write(
+            repo.join("pkg/catalog.py"),
+            "class Catalog:\n    def price(self, amount, tax):\n        return amount + tax\n",
+        )
+        .unwrap();
+        if target_used {
+            std::fs::write(
+                repo.join("pkg/caller.py"),
+                "from pkg.catalog import Catalog\n\ndef use():\n    return Catalog().price(1, 2)\n",
+            )
+            .unwrap();
+        }
+        let changes = detect_api_changes_from_worktree(repo);
+        assert_eq!(
+            changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|c| c.name == "Catalog.price"),
+            target_used,
+            "{changes:?}"
+        );
+        assert_eq!(
+            changes.modified.iter().any(|c| c.name == "Catalog.price"),
+            !target_used,
+            "{changes:?}"
+        );
+    }
+}
+
+#[test]
+fn python_same_file_other_method_definition_has_a_distinct_class_owner() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let other = "\nclass Ledger:\n    def price(self, amount):\n        return amount\n";
+    git_commit_files(
+        repo,
+        &[
+            ("pkg/__init__.py", ""),
+            (
+                "pkg/catalog.py",
+                &format!(
+                    "class Catalog:\n    def price(self, amount):\n        return amount\n{other}"
+                ),
+            ),
+            (
+                "pkg/caller.py",
+                "from pkg.catalog import Catalog, Ledger\n\ndef use():\n    return Catalog().price(1) + Ledger().price(1)\n",
+            ),
+        ],
+        "base",
+    );
+    std::fs::write(repo.join("pkg/catalog.py"), format!("class Catalog:\n    def price(self, amount, tax):\n        return amount + tax\n{other}")).unwrap();
+    std::fs::write(repo.join("pkg/caller.py"), "from pkg.catalog import Catalog, Ledger\n\ndef use():\n    return Catalog().price(1, 2) + Ledger().price(1)\n").unwrap();
+    let changes = detect_api_changes_from_worktree(repo);
+    assert!(
+        changes
+            .modified_closed_in_diff
+            .iter()
+            .any(|c| c.name == "Catalog.price"),
+        "{changes:?}"
+    );
+}
+
+#[test]
 fn python_bound_receiver_keyword_is_checked_before_kwargs() {
     use crate::commands::tests::common::{
         detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,

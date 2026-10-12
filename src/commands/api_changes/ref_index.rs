@@ -276,6 +276,11 @@ pub(crate) fn is_modified_closed_in_diff(
         arg_evidence,
     } = input;
     let bare = bare_name(name);
+    let target_lang =
+        crate::language::LangId::from_path(camino::Utf8Path::new(target_new_path)).ok();
+    let python_method = target_lang == Some(crate::language::LangId::Python)
+        && kind == "function"
+        && name.contains('.');
     let Some(refs) = index.refs_for(bare) else {
         return false;
     };
@@ -289,10 +294,16 @@ pub(crate) fn is_modified_closed_in_diff(
         .iter()
         .filter(|r| r.kind == Some(RefKind::Definition))
         .collect();
-    let target_def_count = defs
+    let target_defs: Vec<_> = defs
         .iter()
         .filter(|r| diff_path_matches_ref(target_new_path, &r.path, dir))
-        .count();
+        .filter(|r| {
+            !python_method
+                || super::python_call_arity::definition_belongs_to_method(dir, name, r, caches)
+        })
+        .copied()
+        .collect();
+    let target_def_count = target_defs.len();
     if target_def_count != 1 {
         return false;
     }
@@ -301,14 +312,16 @@ pub(crate) fn is_modified_closed_in_diff(
     // 定義の帰属は曖昧でも、全候補が更新済みならどの定義へ束縛されてもよい。
     // JS/TS/TSX のトップレベル関数は従来の shadow resolver を使う。
     let has_foreign_defs = defs.len() > target_def_count;
-    let target_lang =
-        crate::language::LangId::from_path(camino::Utf8Path::new(target_new_path)).ok();
     let python_foreign_defs_updated = has_foreign_defs
         && name.contains('.')
         && target_lang == Some(crate::language::LangId::Python)
         && defs
             .iter()
-            .filter(|r| !diff_path_matches_ref(target_new_path, &r.path, dir))
+            .filter(|r| {
+                !target_defs.iter().any(|target| {
+                    target.path == r.path && target.line == r.line && target.column == r.column
+                })
+            })
             .all(|r| {
                 let Some(parsed) = parsed_ref_file(dir, &r.path, caches) else {
                     return false;
@@ -331,6 +344,7 @@ pub(crate) fn is_modified_closed_in_diff(
             });
     if has_foreign_defs
         && !python_foreign_defs_updated
+        && !python_method
         && (name.contains('.')
             || kind != "function"
             || !matches!(
@@ -372,6 +386,7 @@ pub(crate) fn is_modified_closed_in_diff(
         // binding は OtherOrAmbiguous = 除外せず下の diff 実変更行チェックに掛かる。
         if has_foreign_defs
             && !python_foreign_defs_updated
+            && !python_method
             && !diff_path_matches_ref(target_new_path, &r.path, dir)
             && resolve_ref_shadow_binding(dir, r, bare, caches)
                 == crate::commands::api_changes::js_ts_shadow::LocalResolution::SameFileFunction
@@ -383,6 +398,19 @@ pub(crate) fn is_modified_closed_in_diff(
             && name.contains('.')
         {
             use super::python_call_arity::MethodCallMatch;
+            if has_foreign_defs && !python_foreign_defs_updated {
+                match super::python_call_arity::method_reference_owner(
+                    dir,
+                    target_new_path,
+                    name,
+                    r,
+                    caches,
+                ) {
+                    MethodCallMatch::Target => {}
+                    MethodCallMatch::Other => continue,
+                    MethodCallMatch::Unknown => return false,
+                }
+            }
             match super::python_call_arity::changed_method_call_matches_signature(
                 dir,
                 target_new_path,
@@ -850,6 +878,7 @@ pub(crate) struct ApiClosureCaches {
         (String, String),
         Option<super::python_call_arity::MethodContract>,
     >,
+    pub(super) python_module_paths: std::collections::HashMap<String, Option<String>>,
     /// JS / TS / TSX の変更後関数契約。参照ごとの定義ファイル再走査を避ける。
     pub(super) js_call_contracts:
         std::collections::HashMap<(String, String), Option<super::js_ts_call_arity::CallContract>>,

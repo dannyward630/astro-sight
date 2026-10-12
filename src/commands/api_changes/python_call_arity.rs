@@ -789,6 +789,203 @@ pub(super) enum MethodCallMatch {
     Unknown,
 }
 
+pub(super) fn definition_belongs_to_method(
+    dir: &str,
+    name: &str,
+    reference: &SymbolReference,
+    caches: &mut ApiClosureCaches,
+) -> bool {
+    let Some(file) = parsed_ref_file(dir, &reference.path, caches) else {
+        return false;
+    };
+    if file.lang_id != crate::language::LangId::Python || file.tree.root_node().has_error() {
+        return false;
+    }
+    let Some(function) = super::python_signature::find_python_function_by_name(
+        file.tree.root_node(),
+        &file.source,
+        name,
+    ) else {
+        return false;
+    };
+    function.child_by_field_name("name").is_some_and(|node| {
+        node.start_position()
+            == tree_sitter::Point {
+                row: reference.line,
+                column: reference.column,
+            }
+    })
+}
+
+fn module_lookup_is_dynamic(root: Node<'_>, source: &[u8]) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if (node.kind() == "function_definition"
+            && node
+                .child_by_field_name("name")
+                .and_then(|n| node_text(n, source))
+                == Some("__getattr__"))
+            || (node.kind() == "attribute"
+                && node
+                    .child_by_field_name("attribute")
+                    .and_then(|n| node_text(n, source))
+                    .is_some_and(|n| matches!(n, "path" | "modules"))
+                && node
+                    .child_by_field_name("object")
+                    .and_then(|n| node_text(n, source))
+                    == Some("sys"))
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn class_import_module(root: Node<'_>, source: &[u8], name: &str) -> Option<String> {
+    let mut found = None;
+    let mut cursor = root.walk();
+    for node in root.named_children(&mut cursor) {
+        if node.kind() != "import_from_statement" {
+            continue;
+        }
+        let module = node.child_by_field_name("module_name")?;
+        if module.kind() != "dotted_name" {
+            continue;
+        }
+        let mut children = node.walk();
+        if node.named_children(&mut children).any(|n| {
+            n.id() != module.id() && n.kind() == "dotted_name" && node_text(n, source) == Some(name)
+        }) {
+            if found.is_some() || has_other_binding(root, node, source, name) {
+                return None;
+            }
+            found = Some(node_text(module, source)?.to_owned());
+        }
+    }
+    found
+}
+
+/// 他 owner の無変更定義を除外する追加証拠。曖昧な receiver は除外しない。
+pub(super) fn method_reference_owner(
+    dir: &str,
+    target_path: &str,
+    name: &str,
+    reference: &SymbolReference,
+    caches: &mut ApiClosureCaches,
+) -> MethodCallMatch {
+    let Some((target_class, method_name)) = name.split_once('.') else {
+        return MethodCallMatch::Unknown;
+    };
+    let Some(caller) = parsed_ref_file(dir, &reference.path, caches) else {
+        return MethodCallMatch::Unknown;
+    };
+    let root = caller.tree.root_node();
+    if caller.lang_id != crate::language::LangId::Python
+        || root.has_error()
+        || module_lookup_is_dynamic(root, &caller.source)
+    {
+        return MethodCallMatch::Unknown;
+    }
+    let point = tree_sitter::Point {
+        row: reference.line,
+        column: reference.column,
+    };
+    let Some(member) = root.descendant_for_point_range(point, point) else {
+        return MethodCallMatch::Unknown;
+    };
+    if member.kind() != "identifier" || node_text(member, &caller.source) != Some(method_name) {
+        return MethodCallMatch::Unknown;
+    }
+    let Some(attribute) = member.parent().filter(|n| {
+        n.kind() == "attribute"
+            && n.child_by_field_name("attribute")
+                .is_some_and(|a| a.id() == member.id())
+    }) else {
+        return MethodCallMatch::Unknown;
+    };
+    if attribute.parent().is_none_or(|n| {
+        n.kind() != "call"
+            || n.child_by_field_name("function")
+                .is_none_or(|f| f.id() != attribute.id())
+    }) {
+        return MethodCallMatch::Unknown;
+    }
+    let Some(receiver) = attribute
+        .child_by_field_name("object")
+        .and_then(|r| receiver_kind(r, root, &caller.source, dir))
+    else {
+        return MethodCallMatch::Unknown;
+    };
+    if !receiver.exact_class {
+        return MethodCallMatch::Unknown;
+    }
+    let owner = receiver.owner;
+    let local = local_class(root, &caller.source, &owner);
+    let module = if local {
+        None
+    } else {
+        class_import_module(root, &caller.source, &owner)
+    };
+    let origin = if local {
+        Some(reference.path.clone())
+    } else {
+        let Some(module) = module else {
+            return MethodCallMatch::Unknown;
+        };
+        caches
+            .python_module_paths
+            .entry(module.clone())
+            .or_insert_with(|| super::python_module_path::resolve(dir, &module))
+            .clone()
+    };
+    let Some(origin) = origin else {
+        return MethodCallMatch::Unknown;
+    };
+    let canonical = |path: &str| {
+        let path = std::path::Path::new(path);
+        std::fs::canonicalize(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::path::Path::new(dir).join(path)
+        })
+        .ok()
+    };
+    let (Some(origin_path), Some(target)) = (canonical(&origin), canonical(target_path)) else {
+        return MethodCallMatch::Unknown;
+    };
+    let Some(file) = parsed_ref_file(dir, &origin, caches) else {
+        return MethodCallMatch::Unknown;
+    };
+    let root = file.tree.root_node();
+    if root.has_error()
+        || module_lookup_is_dynamic(root, &file.source)
+        || !local_class(root, &file.source, &owner)
+    {
+        return MethodCallMatch::Unknown;
+    }
+    if origin_path == target && owner == target_class {
+        return MethodCallMatch::Target;
+    }
+    let qualified = format!("{owner}.{method_name}");
+    let ordinary =
+        super::python_signature::find_python_function_by_name(root, &file.source, &qualified)
+            .and_then(|m| m.parent())
+            .filter(|n| n.kind() == "block")
+            .and_then(|n| n.parent())
+            .is_some_and(|class| {
+                class
+                    .child_by_field_name("superclasses")
+                    .is_none_or(|n| node_text(n, &file.source) == Some("(object)"))
+            });
+    if ordinary && class_has_direct_method(root, &file.source, &owner, method_name) {
+        MethodCallMatch::Other
+    } else {
+        MethodCallMatch::Unknown
+    }
+}
+
 pub(super) fn changed_method_call_matches_signature(
     dir: &str,
     target_path: &str,
