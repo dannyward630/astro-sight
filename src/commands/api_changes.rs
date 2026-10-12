@@ -558,6 +558,7 @@ pub(crate) mod exported;
 mod forwarded_values;
 mod js_const;
 mod js_member_origin;
+mod js_ts_call_arity;
 mod js_ts_shadow;
 pub(crate) mod prepare;
 pub(crate) mod removed;
@@ -566,6 +567,7 @@ mod signature_tokens;
 mod static_const;
 mod type_annotation;
 
+mod python_call_arity;
 mod python_contract;
 
 mod python_literal;

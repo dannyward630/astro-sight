@@ -379,6 +379,38 @@ pub(crate) fn is_modified_closed_in_diff(
             continue;
         }
         effective_call_refs += 1;
+        if matches!(
+            target_lang,
+            Some(
+                crate::language::LangId::Javascript
+                    | crate::language::LangId::Typescript
+                    | crate::language::LangId::Tsx
+            )
+        ) && kind == "function"
+            && !name.contains('.')
+            && !super::js_ts_call_arity::changed_call_matches_signature(
+                dir,
+                target_new_path,
+                bare,
+                r,
+                caches,
+            )
+        {
+            return false;
+        }
+        if target_lang == Some(crate::language::LangId::Python)
+            && kind == "function"
+            && !name.contains('.')
+            && !super::python_call_arity::changed_top_level_call_matches_signature(
+                dir,
+                target_new_path,
+                bare,
+                r,
+                caches,
+            )
+        {
+            return false;
+        }
         if let ClosureArgEvidence::PythonProtocolParams(proof) = &arg_evidence
             && proof.closes_reference(dir, r, caches)
         {
@@ -560,7 +592,7 @@ fn callee_call_line_range(
 }
 
 /// JSX の名前位置だけを解決し、終了タグも対応する開始タグへ戻す。
-fn jsx_name_opening_tag<'a>(
+pub(super) fn jsx_name_opening_tag<'a>(
     mut node: tree_sitter::Node<'a>,
     source: &[u8],
 ) -> Option<tree_sitter::Node<'a>> {
@@ -794,6 +826,12 @@ pub(crate) struct ApiClosureCaches {
     /// 失敗 (毎回再試行しない)。同名定義が複数ある modified シンボルが多数あっても、
     /// 参照ファイル単位で 1 回だけ parse する。
     parsed_refs: std::collections::HashMap<String, Option<ParsedRefFile>>,
+    /// Python の変更後関数契約。参照ごとの定義ファイル再走査を避ける。
+    pub(super) python_call_contracts:
+        std::collections::HashMap<(String, String), Option<super::python_call_arity::CallContract>>,
+    /// JS / TS / TSX の変更後関数契約。参照ごとの定義ファイル再走査を避ける。
+    pub(super) js_call_contracts:
+        std::collections::HashMap<(String, String), Option<super::js_ts_call_arity::CallContract>>,
 }
 
 /// 参照行が named export clause (`export { X }` / `export type { X }`) かを判定する。

@@ -4,6 +4,10 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **Python の変更済み呼び出しと API 降格** — `commands/api_changes/python_call_arity.rs` はトップレベル関数の `api.mod` を同一差分内で解決済みとする前に、変更後の定義と直接呼び出しの位置引数・キーワード引数を AST で照合する。対象は `f(...)` と識別子からなる属性連鎖 `x.y.f(...)`。属性の受け手がモジュールかどうかの解決は行わない。必須引数の欠落、位置専用・キーワード専用の違反、余分な引数、呼び出し側の `*` / `**` 展開、定義元ファイル内の静的な再束縛、デコレータ、解析エラーや関数値としての参照は証明せず blocking を維持する。`globals()` や `setattr` による動的な書き換えは検出しない。メソッドの束縛は別の判定課題として扱う。`refs` の出現一覧は変えない。
+
+- **JS / TS / TSX の変更済み呼び出しと API 降格** — `commands/api_changes/js_ts_call_arity.rs` はトップレベルの直接関数宣言について、変更後の必須引数数と最大引数数を直接呼び出しの AST と照合する。変更行にあることや共有 const の証拠に加える必要条件であり、引数個数だけで `mod_closed` へ降格しない。spread、overload、同名束縛、明示した型引数、解析エラー、証明できない callee は blocking に残す。JSX の参照は従来の props 判定を維持し、関数値の参照は証明しない。型付き rest は配列型だけを扱い、tuple や不明な型は証明しない。`refs` の出現一覧は変えない。
+
 - **Rust の dead-code メソッド帰属** — `commands/dead_code_member_liveness/rust.rs` は直接の inherent impl に属する候補だけを対象にする。自由関数の同名呼び出しはメソッド参照に数えず、通常の Cargo モジュールと直接 import、同名の値宣言がない単位構造体、および直前の単純な束縛で所有型を確認できる呼び出しだけをその型へ割り当てる。未知の receiver、対象名を含む属性・マクロ、名前を合成するマクロ、解析エラー、型の別名や再束縛があり得る場合は判定を保留する。ワークスペース内に proc-macro crate がある場合、外部の path 依存がある場合、解析 root の外に Cargo package がある場合や外部ランタイムへ公開する属性付き impl は、所有型別の断定から外す。同名メソッドが複数の型にある場合と、自由関数が同名の場合をともに扱い、production と test の参照を分けて数える。`refs` の出現一覧は変更しない。
 
 - **Rust の再公開と glob の impact 所有元** — `engine/rust_use_tree.rs` の use-tree 展開を API 公開面と `engine/impact/rust_reexport_owner.rs` で共有する。通常の Cargo モジュール配置を確認し、型と自由関数の名前空間を分けて、名前付き import・`pub use` 連鎖・glob を最終宣言ファイルへたどる。参照元と通過モジュールの旧新束縛が一致するときだけ別所有元の同名参照を除外する。別名 import が利用・公開されるか、子モジュールからの利用があり得る場合は元名の import 行を blocking に残す。標準 crate または registry 依存と証明できる別名 import は情報提供に保つ。その他の外部名、条件付き宣言、曖昧な glob、循環、動的なソース構成は証明せず、従来の候補を保つ。作業ツリー以外、Cargo 設定変更、解析不能な配置でも使わない。`refs` と dead-code の出現契約は変えない。

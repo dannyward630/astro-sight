@@ -1420,6 +1420,273 @@ fn detect_api_changes_ts_new_export_type_counts_internal_annotation_refs() {
     );
 }
 
+#[test]
+fn changed_js_ts_multiline_call_must_supply_new_required_parameter() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+
+    for (extension, before, after) in [
+        (
+            "ts",
+            "export function render(name: string): string { return name; }\n",
+            "export function render(name: string, color: string): string { return name + color; }\n",
+        ),
+        (
+            "tsx",
+            "export function render(name: string): string { return name; }\n",
+            "export function render(name: string, color: string): string { return name + color; }\n",
+        ),
+        (
+            "js",
+            "export function render(name) { return name; }\n",
+            "export function render(name, color) { return name + color; }\n",
+        ),
+    ] {
+        for (label, call, should_close) in [
+            ("missing", "render(\n  'new',\n)", false),
+            ("supplied", "render(\n  'new',\n  'blue',\n)", true),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let repo = dir.path();
+            init_git_repo_for_test(repo);
+            let definition = format!("lib.{extension}");
+            let caller = format!("app.{extension}");
+            let original_caller =
+                "import { render } from './lib';\n\nconst value = render(\n  'old',\n);\n";
+            git_commit_files(
+                repo,
+                &[
+                    (definition.as_str(), before),
+                    (caller.as_str(), original_caller),
+                ],
+                "initial",
+            );
+            std::fs::write(repo.join(&definition), after).expect("write definition");
+            std::fs::write(
+                repo.join(&caller),
+                format!("import {{ render }} from './lib';\n\nconst value = {call};\n"),
+            )
+            .expect("write caller");
+
+            let changes = detect_api_changes_from_worktree(repo);
+            assert_eq!(
+                changes
+                    .modified_closed_in_diff
+                    .iter()
+                    .any(|change| change.name == "render"),
+                should_close,
+                "{extension} {label}: {changes:?}"
+            );
+            assert_eq!(
+                changes
+                    .modified
+                    .iter()
+                    .any(|change| change.name == "render"),
+                !should_close,
+                "{extension} {label}: {changes:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn changed_ts_call_arity_handles_single_line_namespace_rest_and_spread() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+
+    for (label, before_caller, new_definition, after_caller, should_close) in [
+        (
+            "single line missing",
+            "import { render } from './lib';\nconst value = render('old');\n",
+            "export function render(name: string, color: string): string { return name + color; }\n",
+            "import { render } from './lib';\nconst value = render('new');\n",
+            false,
+        ),
+        (
+            "single line supplied",
+            "import { render } from './lib';\nconst value = render('old');\n",
+            "export function render(name: string, color: string): string { return name + color; }\n",
+            "import { render } from './lib';\nconst value = render('new', 'blue');\n",
+            true,
+        ),
+        (
+            "namespace missing",
+            "import * as lib from './lib';\nconst value = lib.render('old');\n",
+            "export function render(name: string, color: string): string { return name + color; }\n",
+            "import * as lib from './lib';\nconst value = lib.render('new');\n",
+            false,
+        ),
+        (
+            "namespace supplied",
+            "import * as lib from './lib';\nconst value = lib.render('old');\n",
+            "export function render(name: string, color: string): string { return name + color; }\n",
+            "import * as lib from './lib';\nconst value = lib.render('new', 'blue');\n",
+            true,
+        ),
+        (
+            "generic call remains uncertain",
+            "import { render } from './lib';\nconst value = render('old');\n",
+            "export function render(name: string, color: string): string { return name + color; }\n",
+            "import { render } from './lib';\nconst value = render<string>('new', 'blue');\n",
+            false,
+        ),
+        (
+            "parenthesized supplied",
+            "import { render } from './lib';\nconst value = render('old');\n",
+            "export function render(name: string, color: string): string { return name + color; }\n",
+            "import { render } from './lib';\nconst value = (render)('new', 'blue');\n",
+            true,
+        ),
+        (
+            "optional call remains uncertain",
+            "import { render } from './lib';\nconst value = render('old');\n",
+            "export function render(name: string, color: string): string { return name + color; }\n",
+            "import { render } from './lib';\nconst value = render?.('new', 'blue');\n",
+            false,
+        ),
+        (
+            "optional member remains uncertain",
+            "import * as lib from './lib';\nconst value = lib.render('old');\n",
+            "export function render(name: string, color: string): string { return name + color; }\n",
+            "import * as lib from './lib';\nconst value = lib?.render('new', 'blue');\n",
+            false,
+        ),
+        (
+            "rest accepts extra",
+            "import { render } from './lib';\nconst value = render('old');\n",
+            "export function render(name: string, color: string, ...rest: string[]): string { return name + color + rest.join(''); }\n",
+            "import { render } from './lib';\nconst value = render('new', 'blue', 'extra');\n",
+            true,
+        ),
+        (
+            "rest still requires color",
+            "import { render } from './lib';\nconst value = render('old');\n",
+            "export function render(name: string, color: string, ...rest: string[]): string { return name + color + rest.join(''); }\n",
+            "import { render } from './lib';\nconst value = render('new');\n",
+            false,
+        ),
+        (
+            "spread remains uncertain",
+            "import { render } from './lib';\nconst value = render('old');\n",
+            "export function render(name: string, color: string): string { return name + color; }\n",
+            "import { render } from './lib';\nconst value = render(...args);\n",
+            false,
+        ),
+        (
+            "tagged template remains uncertain",
+            "import { render } from './lib';\nconst value = render('old');\n",
+            "export function render(name: string, color: string): string { return name + color; }\n",
+            "import { render } from './lib';\nconst value = render`new${color}`;\n",
+            false,
+        ),
+        (
+            "function value remains uncertain",
+            "import { render } from './lib';\nconst value = render('old');\n",
+            "export function render(name: string, color: string): string { return name + color; }\n",
+            "import { render } from './lib';\nconst value = render('new', 'blue');\nconst handler = render;\n",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "lib.ts",
+                    "export function render(name: string): string { return name; }\n",
+                ),
+                ("app.ts", before_caller),
+            ],
+            "initial",
+        );
+        std::fs::write(repo.join("lib.ts"), new_definition).expect("write definition");
+        std::fs::write(repo.join("app.ts"), after_caller).expect("write caller");
+        let changes = detect_api_changes_from_worktree(repo);
+        assert_eq!(
+            changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|change| change.name == "render"),
+            should_close,
+            "{label}: {changes:?}"
+        );
+        assert_eq!(
+            changes
+                .modified
+                .iter()
+                .any(|change| change.name == "render"),
+            !should_close,
+            "{label}: {changes:?}"
+        );
+    }
+}
+
+#[test]
+fn changed_tsx_jsx_tag_preserves_existing_props_closure() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+
+    for (label, import, before, after) in [
+        (
+            "direct self-closing tag",
+            "import { Card } from './Card';",
+            "<Card name=\"old\" />",
+            "<Card name=\"new\" color=\"blue\" />",
+        ),
+        (
+            "member self-closing tag",
+            "import * as UI from './Card';",
+            "<UI.Card name=\"old\" />",
+            "<UI.Card name=\"new\" color=\"blue\" />",
+        ),
+        (
+            "opening and closing tags",
+            "import { Card } from './Card';",
+            "<Card name=\"old\">hello</Card>",
+            "<Card name=\"new\" color=\"blue\">hello</Card>",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Card.tsx",
+                    "export function Card(props: { name: string }) { return <div>{props.name}</div>; }\n",
+                ),
+                ("App.tsx", &format!("{import}\nconst view = {before};\n")),
+            ],
+            "initial",
+        );
+        std::fs::write(
+            repo.join("Card.tsx"),
+            "export function Card(props: { name: string; color: string }) { return <div>{props.name}</div>; }\n",
+        )
+        .expect("write definition");
+        std::fs::write(
+            repo.join("App.tsx"),
+            format!("{import}\nconst view = {after};\n"),
+        )
+        .expect("write caller");
+
+        let changes = detect_api_changes_from_worktree(repo);
+        assert!(
+            changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|change| change.name == "Card"),
+            "{label}: {changes:?}"
+        );
+    }
+}
+
 /// TS で export 関数と同名のローカル関数が別ファイルにあっても、shadow 解決で
 /// ローカル呼び出しを除外し、対象 caller (複数行呼び出しの引数内のみ変更) が追随済みなら
 /// closed-in-diff に降格する (Issue 2026-07-12-api-mod-same-diff-informational の完全再現)。

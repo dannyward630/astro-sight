@@ -1,6 +1,335 @@
 //! Python の API 差分検出テスト。
 
 #[test]
+fn python_changed_caller_must_supply_new_required_argument_to_close_api_mod() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+
+    for (label, call, should_close) in [
+        ("unrelated edit", "render('new')", false),
+        ("positional argument", "render('new', 'blue')", true),
+        ("keyword argument", "render('new', color='blue')", true),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("lib.py", "def render(name: str) -> str:\n    return name\n"),
+                (
+                    "app.py",
+                    "from lib import render\n\nvalue = render('old')\n",
+                ),
+            ],
+            "initial",
+        );
+        std::fs::write(
+            repo.join("lib.py"),
+            "def render(name: str, color: str) -> str:\n    return name + color\n",
+        )
+        .expect("write definition");
+        std::fs::write(
+            repo.join("app.py"),
+            format!("from lib import render\n\nvalue = {call}\n"),
+        )
+        .expect("write caller");
+
+        let changes = detect_api_changes_from_worktree(repo);
+        assert_eq!(
+            changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|change| change.name == "render"),
+            should_close,
+            "{label}: {changes:?}"
+        );
+        assert_eq!(
+            changes
+                .modified
+                .iter()
+                .any(|change| change.name == "render"),
+            !should_close,
+            "{label}: {changes:?}"
+        );
+    }
+}
+
+#[test]
+fn python_changed_call_respects_keyword_only_positional_only_and_splats() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+
+    for (label, definition, call, should_close) in [
+        (
+            "keyword-only supplied",
+            "def render(name: str, *, color: str) -> str:\n    return name + color\n",
+            "render('new', color='blue')",
+            true,
+        ),
+        (
+            "keyword-only missing",
+            "def render(name: str, *, color: str) -> str:\n    return name + color\n",
+            "render('new')",
+            false,
+        ),
+        (
+            "keyword-only passed positionally",
+            "def render(name: str, *, color: str) -> str:\n    return name + color\n",
+            "render('new', 'blue')",
+            false,
+        ),
+        (
+            "positional-only passed by keyword",
+            "def render(name: str, color: str, /) -> str:\n    return name + color\n",
+            "render('new', color='blue')",
+            false,
+        ),
+        (
+            "positional-only supplied",
+            "def render(name: str, color: str, /) -> str:\n    return name + color\n",
+            "render('new', 'blue')",
+            true,
+        ),
+        (
+            "positional-only name can enter kwargs",
+            "def render(name: str, /, **options: str) -> str:\n    return name\n",
+            "render('new', name='alias')",
+            true,
+        ),
+        (
+            "positional-only still requires positional value",
+            "def render(name: str, /, **options: str) -> str:\n    return name\n",
+            "render(name='alias')",
+            false,
+        ),
+        (
+            "splat is uncertain",
+            "def render(name: str, color: str) -> str:\n    return name + color\n",
+            "render('new', *args)",
+            false,
+        ),
+        (
+            "positional after keyword",
+            "def render(name: str, color: str) -> str:\n    return name + color\n",
+            "render(color='blue', 'new')",
+            false,
+        ),
+        (
+            "variadic positional accepts surplus",
+            "def render(name: str, color: str, *rest) -> str:\n    return name + color\n",
+            "render('new', 'blue', 'extra')",
+            true,
+        ),
+        (
+            "variadic keyword accepts surplus",
+            "def render(name: str, color: str, **options) -> str:\n    return name + color\n",
+            "render('new', 'blue', mood='bright')",
+            true,
+        ),
+        (
+            "typed variadics accept surplus",
+            "def render(name: str, color: str, *rest: str, **options: str) -> str:\n    return name + color\n",
+            "render('new', 'blue', 'extra', mood='bright')",
+            true,
+        ),
+        (
+            "typed variadics still require color",
+            "def render(name: str, color: str, *rest: str, **options: str) -> str:\n    return name + color\n",
+            "render('new', mood='bright')",
+            false,
+        ),
+        (
+            "decorated function is uncertain",
+            "@register\ndef render(name: str, color: str) -> str:\n    return name + color\n",
+            "render('new', 'blue')",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("lib.py", "def render(name: str) -> str:\n    return name\n"),
+                (
+                    "app.py",
+                    "from lib import render\n\nvalue = render('old')\n",
+                ),
+            ],
+            "initial",
+        );
+        std::fs::write(repo.join("lib.py"), definition).expect("write definition");
+        std::fs::write(
+            repo.join("app.py"),
+            format!("from lib import render\n\nvalue = {call}\n"),
+        )
+        .expect("write caller");
+
+        let changes = detect_api_changes_from_worktree(repo);
+        assert_eq!(
+            changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|change| change.name == "render"),
+            should_close,
+            "{label}: {changes:?}"
+        );
+        assert_eq!(
+            changes
+                .modified
+                .iter()
+                .any(|change| change.name == "render"),
+            !should_close,
+            "{label}: {changes:?}"
+        );
+    }
+}
+
+#[test]
+fn python_module_qualified_changed_call_keeps_valid_and_invalid_arity_distinct() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+
+    for (call, should_close) in [
+        ("lib.render('new', 'blue')", true),
+        ("lib.render('new')", false),
+        ("pkg.lib.render('new', 'blue')", true),
+        ("pkg.lib.render('new')", false),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let deep = call.starts_with("pkg.");
+        let target = if deep { "pkg/lib.py" } else { "lib.py" };
+        let imported = if deep { "import pkg.lib" } else { "import lib" };
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (target, "def render(name: str) -> str:\n    return name\n"),
+                (
+                    "app.py",
+                    if deep {
+                        "import pkg.lib\n\nvalue = pkg.lib.render('old')\n"
+                    } else {
+                        "import lib\n\nvalue = lib.render('old')\n"
+                    },
+                ),
+            ],
+            "initial",
+        );
+        std::fs::write(
+            repo.join(target),
+            "def render(name: str, color: str) -> str:\n    return name + color\n",
+        )
+        .expect("write definition");
+        std::fs::write(
+            repo.join("app.py"),
+            format!("{imported}\n\nvalue = {call}\n"),
+        )
+        .expect("write caller");
+
+        let changes = detect_api_changes_from_worktree(repo);
+        assert_eq!(
+            changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|change| change.name == "render"),
+            should_close,
+            "{call}: {changes:?}"
+        );
+        assert_eq!(
+            changes
+                .modified
+                .iter()
+                .any(|change| change.name == "render"),
+            !should_close,
+            "{call}: {changes:?}"
+        );
+    }
+}
+
+#[test]
+fn python_rebinding_and_function_values_do_not_close_changed_calls() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+
+    for (label, suffix, caller) in [
+        (
+            "rebound with partial",
+            "\nfrom functools import partial\nrender = partial(render, color='blue')\n",
+            "value = render('new', 'blue')\n",
+        ),
+        (
+            "rebound through conditional import",
+            "\ntry:\n    from speedups import render\nexcept ImportError:\n    pass\n",
+            "value = render('new', 'blue')\n",
+        ),
+        (
+            "rebound through import alias",
+            "\nfrom speedups import fast as render\n",
+            "value = render('new', 'blue')\n",
+        ),
+        (
+            "rebound through wildcard import",
+            "\nfrom speedups import *\n",
+            "value = render('new', 'blue')\n",
+        ),
+        (
+            "function value",
+            "",
+            "value = render('new', 'blue')\nhandlers = [render]\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("lib.py", "def render(name: str) -> str:\n    return name\n"),
+                (
+                    "app.py",
+                    "from lib import render\n\nvalue = render('old')\n",
+                ),
+            ],
+            "initial",
+        );
+        std::fs::write(
+            repo.join("lib.py"),
+            format!("def render(name: str, color: str) -> str:\n    return name + color\n{suffix}"),
+        )
+        .expect("write definition");
+        std::fs::write(
+            repo.join("app.py"),
+            format!("from lib import render\n\n{caller}"),
+        )
+        .expect("write caller");
+
+        let changes = detect_api_changes_from_worktree(repo);
+        assert!(
+            changes
+                .modified
+                .iter()
+                .any(|change| change.name == "render"),
+            "{label}: {changes:?}"
+        );
+        assert!(
+            !changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|change| change.name == "render"),
+            "{label}: {changes:?}"
+        );
+    }
+}
+
+#[test]
 fn python_same_name_methods_close_only_when_all_definitions_and_callers_change() {
     use crate::commands::tests::common::{
         detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
