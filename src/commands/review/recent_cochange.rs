@@ -522,7 +522,14 @@ mod tests {
 
     #[test]
     fn supporting_commit_uses_literal_route_and_colon_paths() {
-        for (literal, other) in [("app/[id]/page.tsx", "app/i/page.tsx"), (":state", "state")] {
+        let cases = [
+            ("app/[id]/page.tsx", "app/i/page.tsx"),
+            // Windows forbids colons in filesystem names; keep the literal-route
+            // case on every platform and the colon case where it can be created.
+            #[cfg(not(windows))]
+            (":state", "state"),
+        ];
+        for (literal, other) in cases {
             let dir = repo(true);
             let p = dir.path();
             for path in [literal, other] {
