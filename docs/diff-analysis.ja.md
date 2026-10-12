@@ -380,3 +380,5 @@ fixtures/hand-maintained.yaml -linguist-generated
 Bash / zsh の関数が抽出結果から消えても、`ERROR` 内に同名の宣言ヘッダが残る場合、`review` は削除と断定せず `api_changes.uncertain_removals` に分類する。名前・ファイル・0 始まりの行番号・旧シグネチャ・`reason: "parse_error_region"` を返す。hook では `api.rm_unverified` の `{n,f,l,r}` となる。この項目自体は情報提供であり、同じファイルの確定した削除は引き続き blocking になる。同名の複数定義や、文字列・heredoc か判別できない内容では、従来の保守的な削除判定を維持する。
 
 解析エラーを含む変更後の Bash / zsh ファイルは、`truncations`（hook: `trunc`）にも `parse_error_region` として申告する。その範囲の宣言・参照・シグネチャ変更は未検証であり、exit 0 は互換性の保証ではない。推測したシンボルは追加せず、正常に解析できた領域の検証は続ける。
+
+明示 diff で対応言語のソースファイルを削除し、その旧内容が指定 base に無い、食い違う、または完全に照合できない場合、`review` は `truncations`（hook: `trunc`）へ `diff_base_mismatch` を出す。hook は `api.diff_base_mismatch` で停止する。抽出できた削除シンボルは blocking の `api.rm` に残し、旧ソース自体が無ければ打ち切りの申告だけを返す。文書や Git サブモジュールの削除は対象外。`--git` は `diff.submodule` の設定にかかわらず gitlink の短い差分を使う。可能なら削除前のリビジョンを `--base` に指定する。

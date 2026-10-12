@@ -137,6 +137,8 @@ pub(crate) enum PreparedDiffFile {
     /// 入れるため、旧版の exported シンボルを Phase 0 で抽出しておく。
     Deleted {
         old_syms: Option<Vec<(String, String, String)>>,
+        /// 指定 base に旧ソースが無い、または diff と照合できない。
+        old_source_unverified: bool,
     },
     /// 通常の modified ファイル。
     Modified {
@@ -210,20 +212,73 @@ pub(crate) fn collect_modified_file_index_names(
     }
 }
 
-/// 削除ファイルの旧版から exported シンボルを抽出する。
-///
-/// base が source branch HEAD と同一の場合、`git show base:old_path` は削除済みで
-/// 失敗し None になる。その場合は --diff-file が保持している旧ソース
-/// (deleted_old_source) から AST を組み立てて exported シンボルを抽出する。
+/// 削除前の公開宣言と、指定 base で旧ソースを検証できたかを一緒に返す。
+pub(crate) struct DeletedSourceFacts {
+    pub(crate) symbols: Option<ExportedSymbols>,
+    pub(crate) old_source_unverified: bool,
+    pub(crate) analyzable_source: bool,
+}
+
+fn is_gitlink_patch_source(source: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(source) else {
+        return false;
+    };
+    let Some(hash) = text
+        .trim_end_matches(['\r', '\n'])
+        .strip_prefix("Subproject commit ")
+    else {
+        return false;
+    };
+    matches!(hash.len(), 40 | 64) && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// base と明示 diff の旧ソースを照合し、採用した旧ソースから公開宣言を抽出する。
 pub(crate) fn extract_deleted_file_exported_symbols(
     base_blobs: &crate::commands::git_input::GitBlobBatch,
     df: &crate::models::impact::DiffFile,
-) -> Option<ExportedSymbols> {
-    extract_exported_symbols_from_git(base_blobs, &df.old_path).or_else(|| {
-        df.deleted_old_source
-            .as_deref()
-            .and_then(|src| extract_exported_symbols_from_source(&df.old_path, src))
-    })
+) -> DeletedSourceFacts {
+    let base_source = base_blobs.read(&df.old_path);
+    let diff_source = df.deleted_old_source.as_deref();
+    // unified diff の復元は CRLF と末尾改行の有無を保持しない。行内容で比較する。
+    // hunk が途中で切れた場合は部分ソースを完全な base blob より優先しない。
+    let diff_complete = df.hunks.is_empty()
+        || (df.hunks.len() == 1
+            && df.hunks[0].old_start == 1
+            && df.hunks[0].new_start == 0
+            && df.hunks[0].new_count == 0
+            && diff_source.is_some_and(|src| {
+                std::str::from_utf8(src)
+                    .is_ok_and(|text| text.lines().count() == df.hunks[0].old_count)
+            }));
+    let old_source_unverified = match (base_source.as_deref(), diff_source) {
+        (Some(base), Some(diff)) if diff_complete => {
+            match (std::str::from_utf8(base), std::str::from_utf8(diff)) {
+                (Ok(base), Ok(diff)) => !base.lines().eq(diff.lines()),
+                _ => base != diff,
+            }
+        }
+        (Some(_), None) => false,
+        (Some(_), Some(_)) => true,
+        (None, _) => true,
+    };
+    // base が別時点の blob を指すなら、明示 diff に含まれる旧ソースを優先する。
+    let source = if !diff_complete {
+        base_source.as_deref().or(diff_source)
+    } else if old_source_unverified {
+        diff_source.or(base_source.as_deref())
+    } else {
+        base_source.as_deref()
+    };
+    let path = camino::Utf8Path::new(&df.old_path);
+    let gitlink = base_source.is_none() && diff_source.is_some_and(is_gitlink_patch_source);
+    let analyzable_source = !gitlink
+        && (crate::language::LangId::from_path(path).is_ok()
+            || source.is_some_and(|src| crate::engine::parser::detect_lang(path, src).is_ok()));
+    DeletedSourceFacts {
+        symbols: source.and_then(|src| extract_exported_symbols_from_source(&df.old_path, src)),
+        old_source_unverified,
+        analyzable_source,
+    }
 }
 
 /// src 相対パスを Rust モジュールセグメント列に変換する。

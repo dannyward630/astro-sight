@@ -1142,6 +1142,7 @@ pub(crate) fn process_deleted_file(
     state: &mut DetectionState<'_>,
     df: &crate::models::impact::DiffFile,
     old_syms: &[(String, String, String)],
+    old_source_unverified: bool,
 ) {
     let &DetectionInputs {
         dir,
@@ -1153,23 +1154,26 @@ pub(crate) fn process_deleted_file(
     // Python の root-level スクリプト (package 外の単体スクリプト) の top-level helper は公開
     // API 面外なので api.rm にしない (A3、Issue 2026-06-14-python-script-move-api-rm)。file 単位の
     // 判定なので全シンボルをまとめて除外する。
-    if is_python_root_script_local_file(dir, base, &df.old_path) {
+    if !old_source_unverified && is_python_root_script_local_file(dir, base, &df.old_path) {
         return;
     }
     let is_bash_old_file = is_bash_script_path(&df.old_path);
     // base 側 blob の `export -f` 宣言はファイル単位で 1 回だけ読む (関数ごとの git show を避ける)。
     let mut bash_exported: Option<std::collections::HashSet<String>> = None;
     for (name, kind, sig) in old_syms {
-        if is_rust_old_symbol_outside_public_api_surface(
-            dir,
-            base_blobs,
-            &df.old_path,
-            name,
-            state.rust_public,
-        ) {
+        if !old_source_unverified
+            && is_rust_old_symbol_outside_public_api_surface(
+                dir,
+                base_blobs,
+                &df.old_path,
+                name,
+                state.rust_public,
+            )
+        {
             continue;
         }
-        if is_bash_old_file
+        if !old_source_unverified
+            && is_bash_old_file
             && !bash_exported
                 .get_or_insert_with(|| bash_exported_functions_in_git(dir, base, &df.old_path))
                 .contains(name)

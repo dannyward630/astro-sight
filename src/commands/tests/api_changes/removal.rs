@@ -18,6 +18,773 @@ use std::io::Cursor;
 #[allow(unused_imports)]
 use std::process::Command;
 
+/// 明示 diff の旧ソースだけがあるときは、旧公開面を推測して削除候補を捨てない。
+#[test]
+fn detect_api_changes_deleted_source_without_old_base_stays_blocking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let old = "pub struct Record { pub value: i32 }\n";
+    git_commit_files(
+        repo,
+        &[
+            (
+                "core/Cargo.toml",
+                "[package]\nname = \"core\"\nversion = \"0.1.0\"\n",
+            ),
+            ("core/src/lib.rs", old),
+        ],
+        "old",
+    );
+    fs::remove_file(repo.join("core/src/lib.rs")).expect("remove old source");
+    git_commit_files(
+        repo,
+        &[("App/Caller.swift", "func call() { let _ = Record.self }\n")],
+        "new",
+    );
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "core/src/lib.rs".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![],
+        deleted_old_source: Some(old.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed.iter().any(|symbol| symbol.name == "Record"),
+        "missing old base must keep the deletion blocking: {api:?}"
+    );
+    assert!(api.parse_truncations.iter().any(|item| {
+        item.reason == crate::models::truncation::TruncationReason::DiffBaseMismatch
+    }));
+    fs::remove_file(repo.join("App/Caller.swift")).expect("remove caller");
+    let no_refs = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        no_refs.removed.iter().any(|symbol| symbol.name == "Record"),
+        "unverified source must not become removed_dead: {no_refs:?}"
+    );
+}
+
+#[test]
+fn detect_api_changes_deleted_source_with_matching_old_base_keeps_normal_classification() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "core/Cargo.toml",
+                "[package]\nname = \"core\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "core/src/lib.rs",
+                "pub struct Record { pub value: i32 }\r\n",
+            ),
+        ],
+        "old",
+    );
+    fs::remove_file(repo.join("core/src/lib.rs")).expect("remove old source");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "core/src/lib.rs".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![],
+        deleted_old_source: Some(b"pub struct Record { pub value: i32 }\n".to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(api.parse_truncations.is_empty(), "matching base: {api:?}");
+    assert!(
+        api.removed_dead
+            .iter()
+            .any(|symbol| symbol.name == "Record"),
+        "verified unreferenced deletion remains informational: {api:?}"
+    );
+}
+
+#[test]
+fn detect_api_changes_deleted_source_conflicting_with_base_uses_diff_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "core/Cargo.toml",
+                "[package]\nname = \"core\"\nversion = \"0.1.0\"\n",
+            ),
+            ("core/src/lib.rs", "pub struct Other;\n"),
+        ],
+        "base",
+    );
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "core/src/lib.rs".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![],
+        deleted_old_source: Some(b"pub struct Record;\n".to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed.iter().any(|symbol| symbol.name == "Record"),
+        "{api:?}"
+    );
+    assert!(!api.removed.iter().any(|symbol| symbol.name == "Other"));
+    assert!(api.parse_truncations.iter().any(|item| {
+        item.reason == crate::models::truncation::TruncationReason::DiffBaseMismatch
+    }));
+}
+
+#[test]
+fn detect_api_changes_incomplete_deleted_source_prefers_complete_base() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "core/Cargo.toml",
+                "[package]\nname = \"core\"\nversion = \"0.1.0\"\n",
+            ),
+            ("core/src/lib.rs", "pub struct Complete;\n"),
+        ],
+        "base",
+    );
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "core/src/lib.rs".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 2,
+            new_start: 0,
+            new_count: 0,
+        }],
+        deleted_old_source: Some(b"pub struct Partial;\n".to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed.iter().any(|symbol| symbol.name == "Complete"),
+        "{api:?}"
+    );
+    assert!(!api.removed.iter().any(|symbol| symbol.name == "Partial"));
+    assert!(api.parse_truncations.iter().any(|item| {
+        item.reason == crate::models::truncation::TruncationReason::DiffBaseMismatch
+    }));
+}
+
+#[test]
+fn detect_api_changes_deleted_source_missing_everywhere_reports_mismatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("README.md", "temporary\n")], "base");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "core/src/lib.rs".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![],
+        deleted_old_source: None,
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(api.removed.is_empty());
+    assert!(api.parse_truncations.iter().any(|item| {
+        item.path.as_deref() == Some("core/src/lib.rs")
+            && item.reason == crate::models::truncation::TruncationReason::DiffBaseMismatch
+    }));
+}
+
+#[test]
+fn detect_api_changes_deleted_non_source_and_gitlink_do_not_report_mismatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("placeholder.txt", "temporary\n")], "base");
+    let diff_files = [
+        ("README.md", b"# Documentation\n".as_slice()),
+        (
+            "dependency",
+            b"Subproject commit 0123456789abcdef0123456789abcdef01234567\n".as_slice(),
+        ),
+        (
+            "dependency.rs",
+            b"Subproject commit 0123456789abcdef0123456789abcdef01234567\n".as_slice(),
+        ),
+    ]
+    .into_iter()
+    .map(|(path, old)| crate::models::impact::DiffFile {
+        old_path: path.to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![],
+        deleted_old_source: Some(old.to_vec()),
+    })
+    .collect::<Vec<_>>();
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(api.removed.is_empty(), "non-source deletion: {api:?}");
+    assert!(
+        api.parse_truncations.is_empty(),
+        "non-source deletion: {api:?}"
+    );
+}
+
+/// 削除前の Rust crate に FFI 面が無ければ、Swift の同名型・利用は旧 Rust 型への参照にならない。
+/// 同名 Swift 定義が複数ある場合も、残存定義数だけを根拠に blocking に戻さない。
+#[test]
+fn detect_api_changes_rust_to_swift_rewrite_with_no_ffi_is_informational() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let deleted_src = "pub struct Record { pub value: String }\npub enum Phase { Ready, Done }\n";
+    git_commit_files(
+        repo,
+        &[
+            (
+                "core/Cargo.toml",
+                "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"cdylib\"]\n",
+            ),
+            ("core/src/lib.rs", deleted_src),
+        ],
+        "base",
+    );
+    fs::remove_file(repo.join("core/src/lib.rs")).expect("remove Rust source");
+    fs::create_dir_all(repo.join("App")).expect("create Swift directory");
+    fs::write(repo.join("App/Record.swift"), "struct Record { let value: String }\nenum Phase { case ready, done }\nfunc useRecord() { let _ = Record(value: \"x\"); let _ = Phase.ready }\n").expect("write Swift source");
+    fs::create_dir_all(repo.join("OtherModule")).expect("create second Swift module");
+    fs::write(
+        repo.join("OtherModule/Record.swift"),
+        "struct Record { let value: Int }\n",
+    )
+    .expect("write second Swift source");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "core/src/lib.rs".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![],
+        deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    for name in ["Record", "Phase"] {
+        assert!(
+            api.removed_dead.iter().any(|s| s.name == name),
+            "{name} should be informational: {api:?}"
+        );
+        assert!(
+            !api.removed.iter().any(|s| s.name == name),
+            "{name} should not block: {api:?}"
+        );
+    }
+}
+
+/// 拡張子の折り畳みや別名の include で FFI を見落とす場合は降格しない。
+#[test]
+fn detect_api_changes_rust_swift_uncertain_ffi_sources_stay_blocking() {
+    for (source_path, source) in [
+        (
+            "core/src/ffi.RS",
+            "#[no_mangle] pub extern \"C\" fn ffi() {}\n",
+        ),
+        (
+            "core/src/ffi.rſ",
+            "#[no_mangle] pub extern \"C\" fn ffi() {}\n",
+        ),
+        ("core/src/loader.rs", "#[path = \"ffi.inc\"] mod ffi;\n"),
+        (
+            "core/src/loader.rs",
+            "use std::include as load; load!(\"ffi.inc\");\n",
+        ),
+        ("core/src/loader.rs", "include!{\"ffi.inc\"}\n"),
+        (
+            "core/src/loader.rs",
+            "#[cfg_attr(all(), path = \"ffi.inc\")] mod ffi;\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let deleted_src = "pub struct Record { pub value: i32 }\n";
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "core/Cargo.toml",
+                    "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                ),
+                ("core/src/lib.rs", deleted_src),
+                (source_path, source),
+            ],
+            "base",
+        );
+        fs::remove_file(repo.join("core/src/lib.rs")).expect("remove Rust source");
+        fs::create_dir_all(repo.join("App")).expect("create Swift directory");
+        fs::write(
+            repo.join("App/Caller.swift"),
+            "func useOld() { let _ = Record.self }\n",
+        )
+        .expect("write Swift source");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "core/src/lib.rs".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: vec![],
+            deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            api.removed.iter().any(|s| s.name == "Record"),
+            "{source_path} must remain blocking: {api:?}"
+        );
+    }
+}
+
+/// FFI で公開されていた Rust の関数・型は、Swift の同名利用が残る限り blocking を保つ。
+#[test]
+fn detect_api_changes_rust_ffi_rewrite_keeps_blocking() {
+    for (deleted_src, name) in [
+        (
+            "#[no_mangle]\npub extern \"C\" fn openStore() {}\n",
+            "openStore",
+        ),
+        ("#[repr(C)]\npub struct Point { pub x: i32 }\n", "Point"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "core/Cargo.toml",
+                    "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"cdylib\"]\n",
+                ),
+                ("core/src/lib.rs", deleted_src),
+            ],
+            "base",
+        );
+        fs::remove_file(repo.join("core/src/lib.rs")).expect("remove Rust source");
+        fs::create_dir_all(repo.join("App")).expect("create Swift directory");
+        fs::write(
+            repo.join("App/Caller.swift"),
+            format!("func useOld() {{ let _ = {name} }}\n"),
+        )
+        .expect("write Swift source");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "core/src/lib.rs".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: vec![],
+            deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            api.removed.iter().any(|s| s.name == name),
+            "{name} must remain blocking: {api:?}"
+        );
+    }
+}
+
+/// 別 crate に FFI ブリッジがある場合も、旧型を Swift から使い得るので blocking。
+#[test]
+fn detect_api_changes_rust_ffi_in_another_crate_keeps_blocking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let deleted_src = "pub struct Record { pub value: i32 }\n";
+    git_commit_files(
+        repo,
+        &[
+            (
+                "core/Cargo.toml",
+                "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("core/src/lib.rs", deleted_src),
+            (
+                "bridge/Cargo.toml",
+                "[package]\nname = \"bridge\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ncore = { path = \"../core\" }\n",
+            ),
+            (
+                "bridge/src/lib.rs",
+                "use core::Record;\n#[no_mangle]\npub extern \"C\" fn new_record() -> *mut Record { std::ptr::null_mut() }\n",
+            ),
+        ],
+        "base",
+    );
+    fs::remove_file(repo.join("core/src/lib.rs")).expect("remove Rust source");
+    fs::create_dir_all(repo.join("App")).expect("create Swift directory");
+    fs::write(
+        repo.join("App/Caller.swift"),
+        "func useOld() { let _ = Record.self }\n",
+    )
+    .expect("write Swift source");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "core/src/lib.rs".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![],
+        deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed.iter().any(|s| s.name == "Record"),
+        "cross-crate FFI must remain blocking: {api:?}"
+    );
+}
+
+/// Swift 以外の言語は今回の降格に含めず、既存の保守的な判定を維持する。
+#[test]
+fn detect_api_changes_rust_rewrite_python_refs_keep_blocking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let deleted_src = "pub struct Record { pub value: i32 }\n";
+    git_commit_files(
+        repo,
+        &[
+            (
+                "core/Cargo.toml",
+                "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("core/src/lib.rs", deleted_src),
+        ],
+        "base",
+    );
+    fs::remove_file(repo.join("core/src/lib.rs")).expect("remove Rust source");
+    fs::write(
+        repo.join("caller.py"),
+        "def use_old():\n    return Record()\n",
+    )
+    .expect("write Python source");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "core/src/lib.rs".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![],
+        deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed.iter().any(|s| s.name == "Record"),
+        "Python reference must remain blocking: {api:?}"
+    );
+}
+
+/// Swift の同名参照を除外できても、Rust 側に残った参照は削除 API の利用として扱う。
+#[test]
+fn detect_api_changes_rust_rewrite_mixed_refs_keep_blocking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let deleted_src = "pub struct Record { pub value: i32 }\n";
+    git_commit_files(
+        repo,
+        &[
+            (
+                "core/Cargo.toml",
+                "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("core/src/lib.rs", deleted_src),
+        ],
+        "base",
+    );
+    fs::remove_file(repo.join("core/src/lib.rs")).expect("remove Rust source");
+    fs::create_dir_all(repo.join("App")).expect("create Swift directory");
+    fs::write(
+        repo.join("App/Caller.swift"),
+        "func useOld() { let _ = Record.self }\n",
+    )
+    .expect("write Swift source");
+    fs::write(
+        repo.join("caller.rs"),
+        "fn use_old(value: Record) { let _ = value; }\n",
+    )
+    .expect("write Rust source");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "core/src/lib.rs".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![],
+        deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed.iter().any(|s| s.name == "Record"),
+        "same-language reference must remain blocking: {api:?}"
+    );
+}
+
+/// 複数の他言語定義に対する従来の定義数ガードは、Swift の修正で緩めない。
+#[test]
+fn detect_api_changes_python_class_with_two_php_definitions_stays_blocking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let deleted_src = "class Config:\n    pass\n";
+    git_commit_files(
+        repo,
+        &[
+            ("pkg/config.py", deleted_src),
+            ("a.php", "<?php\nclass Config {}\n"),
+            ("b.php", "<?php\nclass Config {}\n"),
+        ],
+        "base",
+    );
+    fs::remove_file(repo.join("pkg/config.py")).expect("remove Python source");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "pkg/config.py".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![],
+        deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed.iter().any(|s| s.name == "Config"),
+        "other languages keep the old definition-count guard: {api:?}"
+    );
+}
+
+/// Swift の同名定義だけが複数残る場合は、使用参照ゼロでも FFI 証拠に応じて分類する。
+/// Rust 定義が混じる対照では定義数ガードを維持する。
+#[test]
+fn detect_api_changes_rust_swift_duplicate_definitions_respect_ffi() {
+    for case in ["plain", "ffi", "mixed"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let deleted_src = if case == "ffi" {
+            "#[repr(C)]\npub struct Record { pub value: i32 }\n"
+        } else {
+            "pub struct Record { pub value: i32 }\n"
+        };
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "core/Cargo.toml",
+                    "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                ),
+                ("core/src/lib.rs", deleted_src),
+            ],
+            "base",
+        );
+        fs::remove_file(repo.join("core/src/lib.rs")).expect("remove old Rust source");
+        fs::create_dir_all(repo.join("App")).expect("create Swift directory");
+        fs::create_dir_all(repo.join("OtherModule")).expect("create second module");
+        fs::write(repo.join("App/Record.swift"), "struct Record {}\n")
+            .expect("write Swift definition");
+        fs::write(repo.join("OtherModule/Record.swift"), "struct Record {}\n")
+            .expect("write second Swift definition");
+        if case == "mixed" {
+            fs::write(
+                repo.join("core/src/another.rs"),
+                "pub struct Record { pub changed: u8 }\n",
+            )
+            .expect("write Rust definition");
+        }
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "core/src/lib.rs".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: vec![],
+            deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert_eq!(
+            api.removed.iter().any(|s| s.name == "Record"),
+            case != "plain",
+            "case={case}: {api:?}"
+        );
+        assert_eq!(
+            api.removed_dead.iter().any(|s| s.name == "Record"),
+            case == "plain",
+            "case={case}: {api:?}"
+        );
+    }
+}
+
+/// 旧ツリーの gitlink 内は検査できないため、Swift の同名参照を除外しない。
+#[test]
+fn detect_api_changes_rust_swift_gitlink_keeps_blocking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let deleted_src = "pub struct Record { pub value: i32 }\n";
+    git_commit_files(
+        repo,
+        &[
+            (
+                "core/Cargo.toml",
+                "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("core/src/lib.rs", deleted_src),
+        ],
+        "base",
+    );
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("read HEAD");
+    assert!(head.status.success());
+    let head = String::from_utf8(head.stdout).expect("utf-8 commit");
+    let add = Command::new("git")
+        .args(["update-index", "--add", "--cacheinfo"])
+        .arg(format!("160000,{},ffi", head.trim()))
+        .current_dir(repo)
+        .status()
+        .expect("stage gitlink");
+    assert!(add.success());
+    let commit = Command::new("git")
+        .args(["commit", "-m", "add gitlink"])
+        .current_dir(repo)
+        .status()
+        .expect("commit gitlink");
+    assert!(commit.success());
+    fs::remove_file(repo.join("core/src/lib.rs")).expect("remove Rust source");
+    fs::create_dir_all(repo.join("App")).expect("create Swift directory");
+    fs::write(
+        repo.join("App/Caller.swift"),
+        "func useOld() { let _ = Record.self }\n",
+    )
+    .expect("write Swift source");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "core/src/lib.rs".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![],
+        deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed.iter().any(|s| s.name == "Record"),
+        "gitlink must keep blocking: {api:?}"
+    );
+}
+
+/// 追跡済み Markdown 文書へのリンクは除外し、ソースリンクは blocking を保つ。
+#[cfg(unix)]
+#[test]
+fn detect_api_changes_rust_swift_document_and_source_symlinks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let deleted_src = "pub struct Record { pub value: i32 }\n";
+    git_commit_files(
+        repo,
+        &[
+            (
+                "core/Cargo.toml",
+                "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("core/src/lib.rs", deleted_src),
+            ("AGENTS.md", "# Project notes\n"),
+        ],
+        "base",
+    );
+    std::os::unix::fs::symlink("AGENTS.md", repo.join("CLAUDE.md")).expect("create document link");
+    assert!(
+        Command::new("git")
+            .args(["add", "CLAUDE.md"])
+            .current_dir(repo)
+            .status()
+            .expect("stage link")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["commit", "-m", "add document link"])
+            .current_dir(repo)
+            .status()
+            .expect("commit link")
+            .success()
+    );
+    fs::remove_file(repo.join("core/src/lib.rs")).expect("remove Rust source");
+    fs::create_dir_all(repo.join("App")).expect("create Swift directory");
+    fs::write(
+        repo.join("App/Caller.swift"),
+        "func useOld() { let _ = Record.self }\n",
+    )
+    .expect("write Swift source");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "core/src/lib.rs".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![],
+        deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed_dead.iter().any(|s| s.name == "Record"),
+        "document link must not block: {api:?}"
+    );
+
+    std::os::unix::fs::symlink("missing.rs", repo.join("ffi.rs")).expect("create source link");
+    assert!(
+        Command::new("git")
+            .args(["add", "ffi.rs"])
+            .current_dir(repo)
+            .status()
+            .expect("stage source link")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["commit", "-m", "add source link"])
+            .current_dir(repo)
+            .status()
+            .expect("commit source link")
+            .success()
+    );
+    let blocked = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        blocked.removed.iter().any(|s| s.name == "Record"),
+        "source link must remain blocking: {blocked:?}"
+    );
+}
+
+/// --dir がサブディレクトリでも、旧リポジトリ外側の bridge を見逃さない。
+/// UDL と manifest だけの証拠、証拠無しの対照も同じ入力で検証する。
+#[test]
+fn detect_api_changes_rust_swift_subdirectory_checks_repository_wide_ffi() {
+    for bridge in ["none", "rust", "udl", "manifest"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let deleted_src = "pub struct Record { pub value: i32 }\n";
+        let mut files = vec![
+            (
+                "apps/core/Cargo.toml",
+                "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("apps/core/src/lib.rs", deleted_src),
+        ];
+        match bridge {
+            "rust" => files.push((
+                "ffi/src/lib.rs",
+                "#[no_mangle]\npub extern \"C\" fn record_new() {}\n",
+            )),
+            "udl" => files.push(("ffi/api.udl", "namespace records {};\n")),
+            "manifest" => files.push(("ffi/Cargo.toml", "[dependencies]\nuniffi = \"0.1\"\n")),
+            _ => {}
+        }
+        git_commit_files(repo, &files, "base");
+        fs::remove_file(repo.join("apps/core/src/lib.rs")).expect("remove Rust source");
+        fs::create_dir_all(repo.join("apps/App")).expect("create Swift directory");
+        fs::write(
+            repo.join("apps/App/Caller.swift"),
+            "func useOld() { let _ = Record.self }\n",
+        )
+        .expect("write Swift source");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "core/src/lib.rs".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: vec![],
+            deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+        }];
+        let api = detect_api_changes(
+            repo.join("apps").to_str().expect("utf-8 path"),
+            "HEAD",
+            &diff_files,
+        );
+        assert_eq!(
+            api.removed.iter().any(|s| s.name == "Record"),
+            bridge != "none",
+            "bridge={bridge}: {api:?}"
+        );
+        assert_eq!(
+            api.removed_dead.iter().any(|s| s.name == "Record"),
+            bridge == "none",
+            "bridge={bridge}: {api:?}"
+        );
+    }
+}
+
 /// GitLab #33: PHP メソッドへの Eloquent リレーション戻り型付与 (`monitorLogs()` →
 /// `monitorLogs(): HasOne`) は removed ではなく modified。Laravel entrypoint 除外が
 /// API 差分経路 (exclude_framework_entrypoints=false) に効いて新側だけ除外され、

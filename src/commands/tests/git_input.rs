@@ -18,6 +18,64 @@ use std::io::Cursor;
 #[allow(unused_imports)]
 use std::process::Command;
 
+/// 利用者がサブモジュール内部の diff を選んでも、gitlink のポインタ差分として扱う。
+#[test]
+fn run_git_diff_submodule_setting_keeps_gitlink_deletion_parseable() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let source = root.path().join("nested");
+    fs::create_dir_all(&source).expect("mkdir nested");
+    init_git_repo_for_test(&source);
+    git_commit_files(
+        &source,
+        &[("index.js", "export const value = 1;\n")],
+        "base",
+    );
+
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&repo).expect("mkdir repo");
+    init_git_repo_for_test(&repo);
+    assert!(
+        Command::new("git")
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                source.to_str().expect("utf-8 source"),
+                "vendor/chart.js",
+            ])
+            .current_dir(&repo)
+            .status()
+            .expect("git submodule add")
+            .success()
+    );
+    git_commit_files(&repo, &[], "add gitlink");
+    assert!(
+        Command::new("git")
+            .args(["config", "diff.submodule", "diff"])
+            .current_dir(&repo)
+            .status()
+            .expect("git config")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["rm", "--cached", "vendor/chart.js"])
+            .current_dir(&repo)
+            .status()
+            .expect("git rm")
+            .success()
+    );
+    let repo_str = repo.to_str().expect("utf-8 repo");
+    let diff = crate::commands::run_git_diff(repo_str, "HEAD", true).expect("staged diff");
+    assert!(diff.contains("deleted file mode 160000"), "{diff}");
+    assert!(diff.contains("-Subproject commit "), "{diff}");
+    assert!(!diff.contains("vendor/chart.js/index.js"), "{diff}");
+    let parsed = crate::engine::diff::parse_unified_diff(&diff);
+    let api = crate::commands::api_changes::detect_api_changes(repo_str, "HEAD", &parsed);
+    assert!(api.parse_truncations.is_empty(), "{api:?}");
+}
+
 // --- git worktree 判定 & 非 git ディレクトリの graceful skip ---
 
 #[test]

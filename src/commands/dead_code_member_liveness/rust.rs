@@ -5,6 +5,9 @@ use aho_corasick::AhoCorasick;
 use tree_sitter::Node;
 
 use crate::engine::parser;
+use crate::engine::rust_macro_name::{
+    has_token_tree_ancestor, is_field_name_in_token_tree, last_macro_identifier,
+};
 use crate::engine::rust_targets::RustTargets;
 use crate::language::LangId;
 
@@ -434,18 +437,25 @@ fn rust_attribute_selects_path(source: &[u8]) -> bool {
 fn has_dynamic_rust_macro(source: &[u8], root: Node<'_>) -> bool {
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
+        if node.kind() == "identifier"
+            && has_token_tree_ancestor(node)
+            && !is_field_name_in_token_tree(node, source)
+            && node.utf8_text(source).ok().is_none_or(|name| {
+                matches!(
+                    name.strip_prefix("r#").unwrap_or(name),
+                    "include" | "paste" | "concat_idents" | "format_ident" | "seq" | "quote"
+                )
+            })
+        {
+            return true;
+        }
         if node.kind() == "macro_invocation"
-            && node
-                .child_by_field_name("macro")
-                .and_then(|name| name.utf8_text(source).ok())
-                .and_then(|name| name.rsplit("::").next())
-                .map(str::trim)
-                .is_some_and(|name| {
-                    matches!(
-                        name,
-                        "include" | "paste" | "concat_idents" | "format_ident" | "seq" | "quote"
-                    )
-                })
+            && last_macro_identifier(node, source).is_none_or(|name| {
+                matches!(
+                    name,
+                    "include" | "paste" | "concat_idents" | "format_ident" | "seq" | "quote"
+                )
+            })
         {
             return true;
         }
@@ -992,4 +1002,39 @@ fn candidate_has_unambiguous_unit_value(root: &Path, candidate: &Candidate) -> b
         }
     }
     unit_structs == 1 && simple_methods == 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_dynamic_rust_macro;
+    use crate::engine::parser;
+    use crate::language::LangId;
+
+    #[test]
+    fn spaced_or_commented_include_is_a_dynamic_source_barrier() {
+        for source in [
+            "std :: include!(\"extra.rs\");\n",
+            "std /*a*/ :: /*b*/ include!{\"extra.rs\"}\n",
+            "r#include![\"extra.rs\"];\n",
+            "macro_rules! m { () => { include /*c*/ !(\"extra.rs\"); } }\n",
+            "macro_rules! m { () => { use std::include as load; load!(\"extra.rs\"); } }\n",
+            "macro_rules! m { () => { x . include!(\"extra.rs\"); } }\n",
+        ] {
+            let tree = parser::parse_source(source.as_bytes(), LangId::Rust).expect("parse Rust");
+            assert!(
+                !tree.root_node().has_error(),
+                "unexpected parse error: {source}"
+            );
+            assert!(
+                has_dynamic_rust_macro(source.as_bytes(), tree.root_node()),
+                "dynamic source was missed: {source}"
+            );
+        }
+        let source = b"println!(\"include is text\");\n";
+        let tree = parser::parse_source(source, LangId::Rust).expect("parse Rust");
+        assert!(!has_dynamic_rust_macro(source, tree.root_node()));
+        let source = b"fn f() { println!(\"{}\", args.include); }\n";
+        let tree = parser::parse_source(source, LangId::Rust).expect("parse Rust");
+        assert!(!has_dynamic_rust_macro(source, tree.root_node()));
+    }
 }

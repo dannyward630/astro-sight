@@ -104,6 +104,7 @@ pub(crate) fn detect_api_changes(
     // 全リポジトリ走査 (O(候補数 × 全ファイル)) を chunk 単位の batch 検索に集約する。
     let mut prepared: Vec<PreparedDiffFile> = Vec::with_capacity(diff_files.len());
     let mut index_names: HashSet<String> = HashSet::new();
+    let mut unverified_deleted_paths: HashSet<String> = HashSet::new();
     // 変更 / 削除ファイルの旧版はここで 1 プロセスの `git cat-file --batch` から読む。
     let base_blobs = crate::commands::git_input::GitBlobBatch::new(dir, base);
     for df in diff_files {
@@ -133,9 +134,23 @@ pub(crate) fn detect_api_changes(
             continue;
         }
         if df.new_path == "/dev/null" {
-            let old_syms = extract_deleted_file_exported_symbols(&base_blobs, df);
-            collect_deleted_bash_index_names(df, old_syms.as_deref(), &mut index_names);
-            prepared.push(PreparedDiffFile::Deleted { old_syms });
+            let facts = extract_deleted_file_exported_symbols(&base_blobs, df);
+            if facts.old_source_unverified && facts.analyzable_source {
+                unverified_deleted_paths.insert(df.old_path.clone());
+                buckets
+                    .parse_truncations
+                    .push(crate::models::truncation::TruncationInfo::new(
+                        Some(df.old_path.clone()),
+                        crate::models::truncation::TruncationReason::DiffBaseMismatch,
+                        "deleted file's old source cannot be verified against the requested base"
+                            .to_string(),
+                    ));
+            }
+            collect_deleted_bash_index_names(df, facts.symbols.as_deref(), &mut index_names);
+            prepared.push(PreparedDiffFile::Deleted {
+                old_syms: facts.symbols,
+                old_source_unverified: facts.old_source_unverified,
+            });
             continue;
         }
         // hunk の無い rename (内容同一) はシンボルが変わらない。旧側が拡張子で判定できる
@@ -146,9 +161,23 @@ pub(crate) fn detect_api_changes(
             let leaves_source = renames_out_of_known_extension(df)
                 && extract_new_file_facts(dir, &df.new_path).language_unknown;
             prepared.push(if leaves_source {
-                let old_syms = extract_deleted_file_exported_symbols(&base_blobs, df);
-                collect_deleted_bash_index_names(df, old_syms.as_deref(), &mut index_names);
-                PreparedDiffFile::Deleted { old_syms }
+                let facts = extract_deleted_file_exported_symbols(&base_blobs, df);
+                if facts.old_source_unverified && facts.analyzable_source {
+                    unverified_deleted_paths.insert(df.old_path.clone());
+                    buckets
+                        .parse_truncations
+                        .push(crate::models::truncation::TruncationInfo::new(
+                        Some(df.old_path.clone()),
+                        crate::models::truncation::TruncationReason::DiffBaseMismatch,
+                        "renamed file's old source cannot be verified against the requested base"
+                            .to_string(),
+                    ));
+                }
+                collect_deleted_bash_index_names(df, facts.symbols.as_deref(), &mut index_names);
+                PreparedDiffFile::Deleted {
+                    old_syms: facts.symbols,
+                    old_source_unverified: facts.old_source_unverified,
+                }
             } else {
                 PreparedDiffFile::Skip
             });
@@ -173,7 +202,10 @@ pub(crate) fn detect_api_changes(
             && facts.language_unknown
         {
             collect_deleted_bash_index_names(df, old_syms.as_deref(), &mut index_names);
-            prepared.push(PreparedDiffFile::Deleted { old_syms });
+            prepared.push(PreparedDiffFile::Deleted {
+                old_syms,
+                old_source_unverified: false,
+            });
             continue;
         }
         let new_syms = facts.exported;
@@ -241,9 +273,12 @@ pub(crate) fn detect_api_changes(
                     );
                 }
             }
-            PreparedDiffFile::Deleted { old_syms } => {
+            PreparedDiffFile::Deleted {
+                old_syms,
+                old_source_unverified,
+            } => {
                 if let Some(old_syms) = old_syms {
-                    process_deleted_file(&inputs, &mut state, df, old_syms);
+                    process_deleted_file(&inputs, &mut state, df, old_syms, *old_source_unverified);
                 }
             }
             PreparedDiffFile::Modified {
@@ -277,8 +312,12 @@ pub(crate) fn detect_api_changes(
     // `is_used_in_diff_paths` 等で `added` から外れた候補も含まれるため、module → package
     // 化のように新規ファイル側のシンボルが同 diff 内の `__init__.py` 等から参照されて
     // `added` に乗らないケースでも `removed` を相殺できる。
+    let (verified_removed, unverified_removed): (Vec<_>, Vec<_>) = buckets
+        .removed
+        .into_iter()
+        .partition(|candidate| !unverified_deleted_paths.contains(&candidate.file));
     let (added, removed, moved, ambiguous_relation_keys) =
-        reconcile_with_moves(buckets.added, buckets.removed, buckets.all_new_candidates);
+        reconcile_with_moves(buckets.added, verified_removed, buckets.all_new_candidates);
 
     // removed のうち HEAD ツリーで他ファイル参照 0 件のものを `removed_dead` に振り分け。
     // 「base 時点で dead だった symbol の整理」だけでなく「base alive → HEAD で関連
@@ -299,8 +338,9 @@ pub(crate) fn detect_api_changes(
     // ならなかった削除は、`old_path` 依存の帰属判定で片方だけ `removed_dead` へ落ちうる
     // ため、blocking と informational に割れたときだけ保守側 (blocking) へ寄せる
     // (揃っているグループは触らない。Issue 2026-08-21-api-consolidation-many-to-one-move)。
-    let (removed_kept, removed_dead) =
-        partition_removed_dead_candidates(dir, removed, &ambiguous_relation_keys);
+    let (mut removed_kept, removed_dead) =
+        partition_removed_dead_candidates(dir, &base_blobs, removed, &ambiguous_relation_keys);
+    removed_kept.extend(unverified_removed);
 
     // cfg の相補的な 2 分岐は公開名として 1 件。同一ファイルの新規候補だけを
     // move 照合が終わった後に畳み、シグネチャ別の対応付け材料は保持する。
@@ -579,6 +619,7 @@ mod python_signature;
 mod ref_index;
 
 mod removed_attribution;
+mod removed_ffi;
 mod removed_scope;
 
 mod rust_public;

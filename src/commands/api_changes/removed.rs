@@ -34,6 +34,7 @@ use super::*;
 ///   import できなくなる」を**情報提供**と結論している)。揃わないときだけ保守側へ倒す
 pub(crate) fn partition_removed_dead_candidates(
     dir: &str,
+    base_blobs: &crate::commands::git_input::GitBlobBatch,
     candidates: Vec<ApiSymbolCandidate>,
     ambiguous_relation_keys: &HashSet<ApiRelationKey>,
 ) -> (Vec<ApiSymbolCandidate>, Vec<ApiSymbolCandidate>) {
@@ -135,6 +136,7 @@ pub(crate) fn partition_removed_dead_candidates(
 
     let empty_defs: HashSet<String> = HashSet::new();
     let empty_attrs: (usize, Vec<RefAttribution>) = (0, Vec::new());
+    let ffi_evidence = super::removed_ffi::RustForeignBindingEvidence::new(dir, base_blobs);
     let mut removed_kept = Vec::new();
     let mut removed_dead = Vec::new();
     for c in candidates {
@@ -152,11 +154,23 @@ pub(crate) fn partition_removed_dead_candidates(
             name: &c.name,
             kind: &c.kind,
         };
+        let needs_foreign_evidence = c.file.ends_with(".rs")
+            && attributions
+                .iter()
+                .chain(definition_attributions.get(&bare).into_iter().flatten())
+                .any(|a| a.ref_lang == Some(crate::language::LangId::Swift));
+        let foreign_bindable = !needs_foreign_evidence || ffi_evidence.may_bind(&c.file);
         // 新しい位置別証明では、未知の class / method / overload 等の残存定義も
         // 無視しない。既存 JS / Bash のファイル単位証明にはこの条件を広げない。
         let definitions_proven = definition_attributions.get(&bare).is_none_or(|defs| {
-            defs.iter()
-                .all(|a| proves_independent_definition(a, &candidate_ref, residual_defs))
+            defs.iter().all(|a| {
+                proves_independent_definition_with_ffi(
+                    a,
+                    &candidate_ref,
+                    residual_defs,
+                    foreign_bindable,
+                )
+            })
         });
         let uses_scope_proof = attributions.iter().any(|a| {
             matches!(
@@ -166,15 +180,26 @@ pub(crate) fn partition_removed_dead_candidates(
         });
         if !attributions.is_empty()
             && (!uses_scope_proof || definitions_proven)
-            && attributions
-                .iter()
-                .all(|a| proves_survivor_origin(a, &candidate_ref, residual_defs))
+            && attributions.iter().all(|a| {
+                proves_survivor_origin_with_ffi(a, &candidate_ref, residual_defs, foreign_bindable)
+            })
         {
             removed_dead.push(c);
             continue;
         }
         // 同名定義が複数残っている → 保守的に removed に残す
-        if *def_count > 1 && !(definitions_proven && c.kind == "function" && !c.name.contains('.'))
+        let definitions_foreign = needs_foreign_evidence
+            && !foreign_bindable
+            && definition_attributions.get(&bare).is_some_and(|defs| {
+                defs.len() == *def_count
+                    && !defs.is_empty()
+                    && defs
+                        .iter()
+                        .all(|a| a.ref_lang == Some(crate::language::LangId::Swift))
+            });
+        if *def_count > 1
+            && !(definitions_proven
+                && (definitions_foreign || (c.kind == "function" && !c.name.contains('.'))))
         {
             removed_kept.push(c);
             continue;

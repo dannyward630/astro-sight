@@ -11,7 +11,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tree_sitter::Node;
 
-use crate::engine::{parser, rust_targets::RustTargets};
+use crate::engine::{
+    parser,
+    rust_macro_name::{
+        has_token_tree_ancestor, is_field_name_in_token_tree, last_macro_identifier,
+    },
+    rust_targets::RustTargets,
+};
 use crate::language::LangId;
 use crate::models::impact::DiffFile;
 
@@ -1346,16 +1352,17 @@ fn source_has_include_macro(source: &[u8]) -> bool {
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
         if node.kind() == "identifier"
-            && node.utf8_text(source).ok() == Some("include")
+            && node
+                .utf8_text(source)
+                .ok()
+                .is_some_and(|name| name.strip_prefix("r#").unwrap_or(name) == "include")
             && has_token_tree_ancestor(node)
+            && !is_field_name_in_token_tree(node, source)
         {
             return true;
         }
         if node.kind() == "macro_invocation"
-            && node
-                .child_by_field_name("macro")
-                .and_then(|name| name.utf8_text(source).ok())
-                .is_none_or(|name| name.rsplit("::").next() == Some("include"))
+            && last_macro_identifier(node, source).is_none_or(|name| name == "include")
         {
             return true;
         }
@@ -1369,16 +1376,6 @@ fn source_has_include_macro(source: &[u8]) -> bool {
         }
         let mut cursor = node.walk();
         pending.extend(node.named_children(&mut cursor));
-    }
-    false
-}
-
-fn has_token_tree_ancestor(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent() {
-        if parent.kind() == "token_tree" {
-            return true;
-        }
-        node = parent;
     }
     false
 }
@@ -1888,6 +1885,12 @@ mod tests {
         )
         .unwrap();
         assert!(!scan_safe_private_import_environment(root.path()));
+        std::fs::write(
+            root.path().join("src/bin/tool.rs"),
+            "std /*a*/ :: /*b*/ include!{\"../a.rs\"}\n",
+        )
+        .unwrap();
+        assert!(!scan_safe_private_import_environment(root.path()));
         std::fs::remove_file(root.path().join("src/bin/tool.rs")).unwrap();
         std::fs::write(
             root.path().join("Cargo.toml"),
@@ -1966,9 +1969,52 @@ mod tests {
             b"macro_rules! inc { () => { include!(\"a.rs\"); } }\ninc!();\n"
         ));
         assert!(source_has_include_macro(b"use std::include as load;\n"));
+        assert!(source_has_include_macro(b"std :: include!(\"a.rs\");\n"));
+        assert!(source_has_include_macro(
+            b"std /*a*/ :: /*b*/ include!{\"a.rs\"}\n"
+        ));
+        assert!(source_has_include_macro(b"include /*c*/ ! [\"a.rs\"];\n"));
+        assert!(source_has_include_macro(b"r#include!(\"a.rs\");\n"));
+        assert!(source_has_include_macro(
+            b"macro_rules! inc { () => { r#include!(\"a.rs\"); } }\n"
+        ));
+        assert!(!source_has_include_macro(
+            b"std :: include_str!(\"a.rs\");\n"
+        ));
+        assert!(!source_has_include_macro(b"my::include_all!(\"a.rs\");\n"));
+        assert!(!source_has_include_macro(
+            b"fn f() { println!(\"{}\", args.include); }\n"
+        ));
+        assert!(source_has_include_macro(
+            b"macro_rules! m { () => { x . include!(\"a.rs\"); } }\n"
+        ));
         assert!(!source_has_include_macro(
             b"fn helper() { println!(\"include! in text\"); }\n"
         ));
+    }
+
+    #[test]
+    fn private_leaf_proof_rejects_commented_include_in_another_source() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "mod a; mod b;\n").unwrap();
+        std::fs::write(root.path().join("src/a.rs"), "fn helper() {}\n").unwrap();
+        std::fs::write(root.path().join("src/b.rs"), "fn call() {}\n").unwrap();
+        let plain = RustPathOwnerProjectProof::new(root.path(), true, true, true, &[], "");
+        assert!(plain.private_source_is_leaf("src/a.rs"));
+
+        std::fs::write(
+            root.path().join("src/b.rs"),
+            "std /*a*/ :: /*b*/ include!{\"a.rs\"}\n",
+        )
+        .unwrap();
+        let included = RustPathOwnerProjectProof::new(root.path(), true, true, true, &[], "");
+        assert!(!included.private_source_is_leaf("src/a.rs"));
     }
 
     #[test]

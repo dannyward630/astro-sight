@@ -2044,3 +2044,20 @@ fn build_review_hook_json_cochange_omits_non_finite_ranking_without_losing_candi
         assert_eq!(compact["i"], full["interpretation"]);
     }
 }
+#[test]
+fn build_review_hook_json_diff_base_mismatch_blocks_without_symbols() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let result = ReviewResult {
+        truncations: vec![crate::models::truncation::TruncationInfo::new(
+            Some("src/old.rs".to_string()),
+            crate::models::truncation::TruncationReason::DiffBaseMismatch,
+            "old source unavailable".to_string(),
+        )],
+        ..Default::default()
+    };
+    let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+    assert!(build.is_blocking, "missing old source must block hook");
+    let value = build.value.expect("hook JSON");
+    assert_eq!(value["trunc"][0]["r"], "diff_base_mismatch");
+    assert_eq!(value["blocking_categories"][0], "api.diff_base_mismatch");
+}

@@ -67,18 +67,38 @@ pub(crate) struct RemovedCandidateRef<'a> {
 
 /// `attr` が「削除ファイル `candidate.old_path` のシンボルではなく残存シンボル由来」と
 /// 証明できるか。`residual_def_paths` は同 bare name の残存定義ファイル集合 (repo 相対)。
+#[cfg(test)]
 pub(crate) fn proves_survivor_origin(
     attr: &RefAttribution,
     candidate: &RemovedCandidateRef<'_>,
     residual_def_paths: &HashSet<String>,
 ) -> bool {
+    proves_survivor_origin_with_ffi(attr, candidate, residual_def_paths, true)
+}
+
+pub(crate) fn cross_language_unbindable(
+    ref_lang: Option<LangId>,
+    candidate: &RemovedCandidateRef<'_>,
+    foreign_bindable: bool,
+) -> bool {
+    let (Some(reference), Some(old)) = (ref_lang, path_lang(candidate.old_path)) else {
+        return false;
+    };
+    !reference.can_reference_definition_in(old)
+        || (reference == LangId::Swift && old == LangId::Rust && !foreign_bindable)
+}
+
+pub(crate) fn proves_survivor_origin_with_ffi(
+    attr: &RefAttribution,
+    candidate: &RemovedCandidateRef<'_>,
+    residual_def_paths: &HashSet<String>,
+    foreign_bindable: bool,
+) -> bool {
     // 参照ファイルの言語から削除ファイルの言語へ識別子束縛の経路が無いなら、同名でも
     // 別物と断言できる。polyglot リポジトリでは汎用名 (`search` / `init`) の bare name
     // 参照の大半がこれに当たる (Issue 2026-08-06-api-rm-atomic-module-deletion では
     // 2,522 件中 2,521 件が Python 削除に対する PHP / C / JS / TS の同名参照だった)。
-    if let (Some(ref_lang), Some(old_lang)) = (attr.ref_lang, path_lang(candidate.old_path))
-        && !ref_lang.can_reference_definition_in(old_lang)
-    {
+    if cross_language_unbindable(attr.ref_lang, candidate, foreign_bindable) {
         return true;
     }
     match &attr.origin {
@@ -133,21 +153,19 @@ pub(crate) fn proves_survivor_origin(
 }
 
 /// 定義数ガードの緩和では、既存のファイル単位 SelfDefined を証明に使わない。
-pub(crate) fn proves_independent_definition(
+pub(crate) fn proves_independent_definition_with_ffi(
     attr: &RefAttribution,
     candidate: &RemovedCandidateRef<'_>,
     residual_def_paths: &HashSet<String>,
+    foreign_bindable: bool,
 ) -> bool {
-    let cross_language = match (attr.ref_lang, path_lang(candidate.old_path)) {
-        (Some(reference), Some(old)) => !reference.can_reference_definition_in(old),
-        _ => false,
-    };
+    let cross_language = cross_language_unbindable(attr.ref_lang, candidate, foreign_bindable);
     (cross_language
         || matches!(
             &attr.origin,
             RefOrigin::IndependentDefinition { .. } | RefOrigin::LocalValue
         ))
-        && proves_survivor_origin(attr, candidate, residual_def_paths)
+        && proves_survivor_origin_with_ffi(attr, candidate, residual_def_paths, foreign_bindable)
 }
 
 /// 削除元 Python ファイルのシンボルへ属性アクセスで到達しうるモジュール名。

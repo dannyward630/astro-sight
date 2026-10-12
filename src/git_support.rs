@@ -28,10 +28,13 @@ pub const DEFAULT_BLAME_BASE: &str = "HEAD";
 /// - `color.diff` / `color.ui = always`: 行頭に ANSI エスケープが付く → `--no-color`
 /// - textconv (`diff=<driver>` 属性 + `diff.<driver>.textconv`): 変換後テキストの diff に
 ///   なり、解析対象のファイル内容と行が一致しない → `--no-textconv`
-pub(crate) const GIT_DIFF_PARSEABLE_OUTPUT_ARGS: [&str; 5] = [
+/// - `diff.submodule=diff`: gitlink の更新がサブモジュール内部のファイル差分に展開され、
+///   親リポジトリに存在しないソースの削除に見える → `--submodule=short`
+pub(crate) const GIT_DIFF_PARSEABLE_OUTPUT_ARGS: [&str; 6] = [
     "--no-ext-diff",
     "--no-color",
     "--no-textconv",
+    "--submodule=short",
     "--src-prefix=a/",
     "--dst-prefix=b/",
 ];

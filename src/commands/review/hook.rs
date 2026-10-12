@@ -18,6 +18,8 @@ pub(crate) struct HookJsonBuild {
 /// 最終フィルタ後の判定と説明を同じ集合から生成する。列挙順を出力順として固定する。
 #[derive(Serialize, PartialEq, Eq, PartialOrd, Ord)]
 enum HookBlockingCategory {
+    #[serde(rename = "api.diff_base_mismatch")]
+    ApiDiffBaseMismatch,
     #[serde(rename = "impacts")]
     Impacts,
     #[serde(rename = "api.rm")]
@@ -667,8 +669,16 @@ pub(crate) fn build_review_hook_json_for_diff(
         );
     }
 
-    // trunc: [{f,r,d?}] — 解析対象から外したものの申告。情報提供のみ。
+    // trunc: [{f,r,d?}] — 解析対象から外したものの申告。
+    // 削除前ソースと base の不整合だけは API 判定不能として停止する。
     if !result.truncations.is_empty() {
+        if result
+            .truncations
+            .iter()
+            .any(|t| t.reason == crate::models::truncation::TruncationReason::DiffBaseMismatch)
+        {
+            blocking_categories.push(HookBlockingCategory::ApiDiffBaseMismatch);
+        }
         has_any_output = true;
         let truncs: Vec<HookTruncation<'_>> = result
             .truncations
@@ -676,6 +686,9 @@ pub(crate) fn build_review_hook_json_for_diff(
             .map(|t| HookTruncation {
                 f: t.path.as_deref(),
                 r: match t.reason {
+                    crate::models::truncation::TruncationReason::DiffBaseMismatch => {
+                        "diff_base_mismatch"
+                    }
                     crate::models::truncation::TruncationReason::ParseErrorRegion => {
                         "parse_error_region"
                     }
