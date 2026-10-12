@@ -86,7 +86,7 @@ pub(crate) fn collect_rust_rs_files(
             // 末尾の `"` で `.rs` 判定から落ちる。crate が非 ASCII 名のディレクトリ配下にあると
             // base 側の全ファイルが消えて `pub use` の辺を 1 本も集められず、再エクスポートで
             // 公開していた API の削除が api.rm / rm_dead のどちらにも出なかった。
-            let out = std::process::Command::new("git")
+            let out = crate::git_support::git_command_for_dir(dir)
                 .args(["ls-tree", "-r", "-z", "--name-only", rev, "--", src_str])
                 .current_dir(dir)
                 .output()

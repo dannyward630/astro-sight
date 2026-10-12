@@ -1018,7 +1018,7 @@ fn is_untracked_path(dir: &str, path: &str) -> bool {
         return false;
     }
     // パスに glob 文字 (`[id].tsx` 等) が含まれても別ファイルに一致させない。
-    let output = std::process::Command::new("git")
+    let output = crate::git_support::git_command_for_dir(dir)
         .args(["--literal-pathspecs", "ls-files", "-z", "--", path])
         .current_dir(dir)
         .output();
@@ -1084,7 +1084,12 @@ pub(crate) fn changed_new_lines_for_file(
     // blocking に残る (`GIT_DIFF_PARSEABLE_OUTPUT_ARGS` の doc 参照)。
     let mut args: Vec<&str> = vec!["-c", "core.quotepath=off", "diff"];
     args.extend(crate::git_support::GIT_DIFF_PARSEABLE_OUTPUT_ARGS);
-    args.extend(["--relative", base, "-M", "--"]);
+    args.extend(["--relative", base]);
+    let snapshot_tree = crate::git_support::index_snapshot_tree(dir);
+    if let Some(tree) = snapshot_tree.as_deref() {
+        args.push(tree);
+    }
+    args.extend(["-M", "--"]);
     if old_path != "/dev/null" && old_path != new_path {
         if validate_git_revision(old_path, "diff file path").is_err() {
             return HashSet::new();
@@ -1092,7 +1097,7 @@ pub(crate) fn changed_new_lines_for_file(
         args.push(old_path);
     }
     args.push(new_path);
-    let output = std::process::Command::new("git")
+    let output = crate::git_support::git_command_for_dir(dir)
         .args(&args)
         .current_dir(dir)
         .output();

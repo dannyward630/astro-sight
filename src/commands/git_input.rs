@@ -70,7 +70,7 @@ pub fn resolve_blame_source_files(
         // なら prefix が空で従来と同一出力。
         // `--name-only` の出力は現行の git では色・外部 diff の影響を受けないが、
         // 出力を解析する git diff 呼び出しの引数は 1 箇所の定義に揃えておく。
-        let output = std::process::Command::new("git")
+        let output = crate::git_support::git_command_for_dir(dir)
             .args([
                 "-c",
                 "core.quotepath=off",
@@ -140,7 +140,7 @@ pub fn resolve_blame_source_files(
 pub(crate) fn git_show_blob(dir: &str, rev: &str, path: &str) -> Option<Vec<u8>> {
     validate_git_revision(rev, "git revision").ok()?;
     validate_git_revision(path, "diff file path").ok()?;
-    let output = std::process::Command::new("git")
+    let output = crate::git_support::git_command_for_dir(dir)
         .args(["show", &format!("{rev}:{}", cwd_relative_git_path(path))])
         .current_dir(dir)
         .output()
@@ -275,7 +275,7 @@ struct CatFileBatch {
 impl CatFileBatch {
     /// `dir` を cwd に起動する。起動できなければ `None`。
     fn spawn(dir: &str) -> Option<Self> {
-        let mut child = std::process::Command::new("git")
+        let mut child = crate::git_support::git_command_for_dir(dir)
             .args(["cat-file", "--batch"])
             .current_dir(dir)
             .stdin(std::process::Stdio::piped())
@@ -429,7 +429,7 @@ pub(crate) enum GitDiffInput {
 /// worktree / submodule / bare repo に堅牢。`LC_ALL=C` で stderr 文言のロケール依存を
 /// 排除し `"not a git repository"` のマッチを安定させる。
 pub(crate) fn is_git_work_tree(dir: &str) -> Result<bool> {
-    let output = std::process::Command::new("git")
+    let output = crate::git_support::git_command_for_dir(dir)
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(dir)
         .env("LC_ALL", "C")
@@ -484,7 +484,7 @@ pub(crate) fn resolve_git_diff(dir: &str, base: &str, staged: bool) -> Result<Gi
 /// 見ないよう、呼び出し側は返されたコミット ID を全段階へ渡す。
 fn resolve_commit_revision(dir: &str, revision: &str) -> Result<String> {
     let commit_expr = format!("{revision}^{{commit}}");
-    let output = std::process::Command::new("git")
+    let output = crate::git_support::git_command_for_dir(dir)
         .args(["rev-parse", "--verify", "--quiet", &commit_expr])
         .current_dir(dir)
         .env("LC_ALL", "C")
@@ -621,12 +621,16 @@ fn run_git_diff_collecting_truncations(
             .iter()
             .map(|arg| arg.to_string()),
     );
-    if staged {
+    let snapshot_tree = crate::git_support::index_snapshot_tree(dir);
+    if staged && snapshot_tree.is_none() {
         args.push("--cached".to_string());
     }
     args.push(base.to_string());
+    if let Some(tree) = snapshot_tree {
+        args.push(tree);
+    }
 
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::git_support::git_command_for_dir(dir)
         .args(&args)
         .current_dir(dir)
         .stdout(std::process::Stdio::piped())
@@ -1169,7 +1173,7 @@ fn simple_line_diff_hunk(old_lines: &[&str], new_lines: &[&str]) -> String {
 /// stdout を NUL 区切りの byte slice 単位で UTF-8 検証し、非 UTF-8 パスは要素ごとに skip する
 /// (from_utf8_lossy の置換文字混入を避ける)。
 fn list_untracked_files(dir: &str) -> Result<Vec<String>> {
-    let output = std::process::Command::new("git")
+    let output = crate::git_support::git_command_for_dir(dir)
         .args(["ls-files", "--others", "--exclude-standard", "-z"])
         .current_dir(dir)
         .output()

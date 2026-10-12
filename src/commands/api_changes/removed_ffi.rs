@@ -2,7 +2,6 @@
 //! 推定できない場合は可能性ありとして api.rm を維持する。
 
 use std::cell::OnceCell;
-use std::process::Command;
 
 use crate::commands::git_input::GitBlobBatch;
 use crate::engine::parser;
@@ -43,7 +42,7 @@ impl<'a> RustForeignBindingEvidence<'a> {
         if validate_git_revision(self.blobs.rev(), "base").is_err() {
             return true;
         }
-        let root = match Command::new("git")
+        let root = match crate::git_support::git_command_for_dir(self.dir)
             .args(["rev-parse", "--show-toplevel"])
             .current_dir(self.dir)
             .output()
@@ -55,7 +54,7 @@ impl<'a> RustForeignBindingEvidence<'a> {
             return true;
         };
         let root = root.trim_end_matches('\n');
-        let superproject = match Command::new("git")
+        let superproject = match crate::git_support::git_command_for_dir(root)
             .args(["rev-parse", "--show-superproject-working-tree"])
             .current_dir(root)
             .output()
@@ -67,7 +66,7 @@ impl<'a> RustForeignBindingEvidence<'a> {
             return true;
         }
         let root_blobs = GitBlobBatch::new(root, self.blobs.rev());
-        let output = match Command::new("git")
+        let output = match crate::git_support::git_command_for_dir(root)
             .args(["ls-tree", "--full-tree", "-r", "-z"])
             .arg(self.blobs.rev())
             .current_dir(root)

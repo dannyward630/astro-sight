@@ -8,6 +8,46 @@ use anyhow::{Result, bail};
 
 use crate::error::{AstroError, ErrorCode};
 
+pub(crate) const INDEX_SNAPSHOT_MARKER: &str = "astro-sight-index-snapshot";
+
+pub(crate) fn index_snapshot_tree(dir: impl AsRef<std::path::Path>) -> Option<String> {
+    let canonical = std::fs::canonicalize(dir).ok()?;
+    for parent in canonical.ancestors() {
+        let marker = parent.join(".git").join(INDEX_SNAPSHOT_MARKER);
+        if marker.is_file() {
+            let tree = std::fs::read_to_string(marker).ok()?;
+            let tree = tree.trim();
+            return (matches!(tree.len(), 40 | 64) && tree.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| tree.to_owned());
+        }
+    }
+    None
+}
+
+/// 一時リポジトリには hook が渡した元の index / worktree 環境を持ち込まない。
+pub(crate) fn isolated_git_command() -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
+pub(crate) fn git_command_for_dir(dir: impl AsRef<std::path::Path>) -> std::process::Command {
+    let dir = dir.as_ref();
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if canonical
+        .ancestors()
+        .any(|parent| parent.join(".git").join(INDEX_SNAPSHOT_MARKER).is_file())
+    {
+        isolated_git_command()
+    } else {
+        std::process::Command::new("git")
+    }
+}
+
 /// cochange の既定 base。context / impact / review / dead-code と揃えて
 /// 「未コミットの作業ツリー変更」を既定の解析対象にする。
 pub const DEFAULT_BLAME_BASE: &str = "HEAD";
@@ -30,13 +70,18 @@ pub const DEFAULT_BLAME_BASE: &str = "HEAD";
 ///   なり、解析対象のファイル内容と行が一致しない → `--no-textconv`
 /// - `diff.submodule=diff`: gitlink の更新がサブモジュール内部のファイル差分に展開され、
 ///   親リポジトリに存在しないソースの削除に見える → `--submodule=short`
-pub(crate) const GIT_DIFF_PARSEABLE_OUTPUT_ARGS: [&str; 6] = [
+pub(crate) const GIT_DIFF_PARSEABLE_OUTPUT_ARGS: [&str; 11] = [
     "--no-ext-diff",
     "--no-color",
     "--no-textconv",
     "--submodule=short",
     "--src-prefix=a/",
     "--dst-prefix=b/",
+    "--diff-algorithm=myers",
+    "--unified=3",
+    "--inter-hunk-context=0",
+    "--indent-heuristic",
+    "--full-index",
 ];
 
 /// `git diff` / `git show` / `git blame` に渡す revision または path を検証する。

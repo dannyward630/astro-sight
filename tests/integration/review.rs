@@ -6,6 +6,316 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn staged_api_contracts_and_callers_use_the_index_snapshot() {
+    for (api_path, caller_path, before, after, import, bad, good, symbol) in [
+        (
+            "pkg/api.py",
+            "pkg/caller.py",
+            "def price(amount):\n    return amount\n",
+            "def price(amount, tax):\n    return amount + tax\n",
+            "from pkg.api import price\n\ndef use():\n    return ",
+            "price(1) + 0",
+            "price(1, 2)",
+            "price",
+        ),
+        (
+            "pkg/api.py",
+            "pkg/caller.py",
+            "class Service:\n    def price(self, amount):\n        return amount\n",
+            "class Service:\n    def price(self, amount, tax):\n        return amount + tax\n",
+            "from pkg.api import Service\n\ndef use():\n    return ",
+            "Service().price(1) + 0",
+            "Service().price(1, 2)",
+            "Service.price",
+        ),
+        (
+            "api.ts",
+            "caller.ts",
+            "export function price(amount: number) { return amount; }\n",
+            "export function price(amount: number, tax: number) { return amount + tax; }\n",
+            "import { price } from './api';\nexport const result = ",
+            "price(1) + 0",
+            "price(1, 2)",
+            "price",
+        ),
+    ] {
+        for index_valid in [false, true] {
+            let repo = TestRepo::new();
+            repo.create_dir_all("pkg");
+            repo.write("pkg/__init__.py", "");
+            repo.write(api_path, before);
+            repo.write(
+                caller_path,
+                format!("{import}{}\n", bad.trim_end_matches(" + 0")),
+            );
+            repo.init_git();
+            repo.commit_all("base");
+            repo.write(api_path, after);
+            repo.write(
+                caller_path,
+                format!("{import}{}\n", if index_valid { good } else { bad }),
+            );
+            repo.stage_all();
+            // 作業ツリーでは API を旧契約へ戻し、呼び出しを index と逆にする。
+            repo.write(api_path, before);
+            repo.write(
+                caller_path,
+                format!("{import}{}\n", if index_valid { bad } else { good }),
+            );
+            let state = || {
+                Command::new("git")
+                    .args(["status", "--porcelain=v1"])
+                    .current_dir(repo.root())
+                    .output()
+                    .unwrap()
+                    .stdout
+            };
+            let worktrees = || {
+                Command::new("git")
+                    .args(["worktree", "list", "--porcelain"])
+                    .current_dir(repo.root())
+                    .output()
+                    .unwrap()
+                    .stdout
+            };
+            let initial_state = state();
+            let initial_worktrees = worktrees();
+            let result = repo.run_json("review", &["--git", "--staged"]);
+            assert!(
+                !result.to_string().contains("astro-sight-index-"),
+                "temporary path leaked: {result}"
+            );
+            let contains = |bucket: &str| {
+                result["api_changes"][bucket]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|entry| entry["name"] == symbol)
+            };
+            assert_eq!(
+                contains("modified_closed_in_diff"),
+                index_valid,
+                "{api_path}/{symbol}/{index_valid}: {result}"
+            );
+            assert_eq!(
+                contains("modified"),
+                !index_valid,
+                "{api_path}/{symbol}/{index_valid}: {result}"
+            );
+            assert_eq!(state(), initial_state, "original index/worktree changed");
+            assert_eq!(
+                worktrees(),
+                initial_worktrees,
+                "snapshot worktree was not removed"
+            );
+        }
+    }
+}
+
+#[test]
+fn staged_review_isolates_the_hook_git_environment_and_alternate_index() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("pkg");
+    repo.write("pkg/__init__.py", "");
+    let before = "class Service:\n    def price(self, amount):\n        return amount\n";
+    repo.write("pkg/api.py", before);
+    repo.write(
+        "pkg/caller.py",
+        "from pkg.api import Service\n\ndef use():\n    return Service().price(1)\n",
+    );
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write(
+        "pkg/api.py",
+        "class Service:\n    def price(self, amount, tax):\n        return amount + tax\n",
+    );
+    repo.write(
+        "pkg/caller.py",
+        "from pkg.api import Service\n\ndef use():\n    return Service().price(1) + 0\n",
+    );
+    repo.stage_all();
+    let alternate = repo.path(".git/alternate-index");
+    std::fs::copy(repo.path(".git/index"), &alternate).unwrap();
+    repo.git(["reset", "--mixed", "-q", "HEAD"]);
+    repo.write("pkg/api.py", before);
+    repo.write(
+        "pkg/caller.py",
+        "from pkg.api import Service\n\ndef use():\n    return Service().price(1, 2)\n",
+    );
+    let entries = || {
+        Command::new("git")
+            .args(["ls-files", "--stage"])
+            .env("GIT_INDEX_FILE", &alternate)
+            .current_dir(repo.root())
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let initial = entries();
+    let original_bytes = std::fs::read(&alternate).unwrap();
+    let lock = repo.path(".git/alternate-index.lock");
+    std::fs::write(&lock, b"held by a hook").unwrap();
+    let output = cargo_bin()
+        .args(["review", "--git", "--staged", "--dir"])
+        .arg(repo.root())
+        .env("GIT_DIR", repo.path(".git"))
+        .env("GIT_WORK_TREE", repo.root())
+        .env("GIT_INDEX_FILE", &alternate)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        result["api_changes"]["modified"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "Service.price"),
+        "{result}"
+    );
+    assert!(
+        !result["api_changes"]["modified_closed_in_diff"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|c| c["name"] == "Service.price"),
+        "{result}"
+    );
+    assert_eq!(entries(), initial, "hook index entries changed");
+    assert_eq!(
+        std::fs::read(&alternate).unwrap(),
+        original_bytes,
+        "hook index bytes changed"
+    );
+    assert!(lock.exists(), "hook index lock changed");
+}
+
+#[test]
+fn explicit_review_rejects_new_side_line_offsets_that_do_not_match() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("pkg");
+    repo.write("pkg/__init__.py", "");
+    repo.write("pkg/api.py", "def price(amount):\n    return amount\n");
+    repo.write(
+        "pkg/caller.py",
+        "from pkg.api import price\n\ndef use():\n    return price(1)\n",
+    );
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write(
+        "pkg/api.py",
+        "def price(amount, tax):\n    return amount + tax\n",
+    );
+    let updated = "from pkg.api import price\n\ndef use():\n    return price(1, 2)\n";
+    repo.write("pkg/caller.py", updated);
+    let diff = String::from_utf8(
+        Command::new("git")
+            .args(["diff", "HEAD"])
+            .current_dir(repo.root())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let result = repo.run_json("review", &["--diff", &diff]);
+    assert!(
+        result["api_changes"]["modified_closed_in_diff"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "price"),
+        "{result}"
+    );
+    repo.write("pkg/caller.py", format!("\n{updated}"));
+    let output = cargo_bin()
+        .args(["review", "--diff", &diff, "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "mismatched explicit diff succeeded"
+    );
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(diagnostic.contains("declared line offsets"), "{diagnostic}");
+}
+
+#[test]
+fn staged_snapshot_preserves_locked_split_index_and_ignores_unparsed_assets() {
+    let repo = TestRepo::new();
+    repo.write("api.py", "def price(amount):\n    return amount\n");
+    repo.write(
+        "caller.py",
+        "from api import price\n\ndef use():\n    return price(1)\n",
+    );
+    repo.write("binary.png", "not a parsed source");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("/does-not-exist", repo.path("external-link")).unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        std::fs::write(
+            repo.root()
+                .join(std::ffi::OsString::from_vec(b"asset-\xff.png".to_vec())),
+            b"ignored",
+        )
+        .unwrap();
+    }
+    repo.init_git();
+    repo.commit_all("base");
+    repo.git(["config", "diff.algorithm", "histogram"]);
+    repo.git(["config", "diff.context", "15"]);
+    repo.git(["config", "diff.interHunkContext", "20"]);
+    repo.git(["config", "core.abbrev", "12"]);
+    repo.write(
+        "api.py",
+        "def price(amount, tax):\n    return amount + tax\n",
+    );
+    repo.write(
+        "caller.py",
+        "from api import price\n\ndef use():\n    return price(1, 2)\n",
+    );
+    // 解析対象でない index blob は snapshot の容量制限に入れない。
+    std::fs::File::create(repo.path("binary.png"))
+        .unwrap()
+        .set_len(101 * 1024 * 1024)
+        .unwrap();
+    repo.stage_all();
+    repo.git(["update-index", "--split-index"]);
+    let index = std::fs::read(repo.path(".git/index")).unwrap();
+    std::fs::write(
+        repo.path(".git/index.lock"),
+        b"held by another Git operation",
+    )
+    .unwrap();
+    let result = repo.run_json("review", &["--git", "--staged"]);
+    assert!(
+        result["api_changes"]["modified_closed_in_diff"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "price"),
+        "{result}"
+    );
+    assert_eq!(
+        std::fs::read(repo.path(".git/index")).unwrap(),
+        index,
+        "original index bytes changed"
+    );
+    assert!(repo.path(".git/index.lock").exists());
+}
+
+#[test]
 fn review_hook_non_direct_const_values_keep_priority_with_companion_types_and_comments() {
     let companion =
         "type Handlers = { marker: true };\ntype HandlerMap = Record<string, unknown>;\n";
