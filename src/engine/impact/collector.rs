@@ -68,6 +68,8 @@ pub(super) struct RefEventMini {
     /// `finish_file` の high vs low routing に使う (Issue 2026-06-05-multi-attachment-conversations-fp /
     /// Issue 2026-06-13-ai-status-json-symbol-fp)。
     pub(super) local_shadow_hint: bool,
+    /// Barrel origin evidence only applies to a value/type use of the imported binding.
+    pub(super) ts_import_binding_use: bool,
     /// Rust: context 行に macro 呼び出し (`ident!(` 等) があるか。証拠なしの bare identifier でも
     /// macro 引数なら macro 展開で path が補われ得るため high 維持する (fail-closed)。
     pub(super) ref_in_macro: bool,
@@ -163,6 +165,7 @@ struct RouteDecisionContext<'a> {
     path_str: &'a str,
     import_facts_cache: &'a mut LruCache<String, Option<RefFileFacts>>,
     reexport_moves: &'a super::reexport_move::ReexportMoveIndex,
+    ts_barrels: &'a super::ts_barrels::TsBarrelIndex,
 }
 
 impl RouteDecisionContext<'_> {
@@ -233,7 +236,14 @@ impl RouteDecisionContext<'_> {
                 should_route_ts_importless_ref_low(
                     true,
                     true,
-                    has_direct_import,
+                    has_direct_import
+                        || (event.ts_import_binding_use
+                            && !event.local_shadow_hint
+                            && self.ts_barrels.proves_origin(
+                                self.path_str,
+                                symbol_name,
+                                &file_context.new_path,
+                            )),
                     event.local_shadow_hint,
                 )
             } else {
@@ -336,6 +346,7 @@ pub(super) struct ImpactCollector<'a> {
     /// 「定義を別モジュールへ移動し旧公開パスを `pub use` で維持した」変更の索引。
     /// 旧パス側に残る未変更参照を informational へ降格するために参照する。
     pub(super) reexport_moves: &'a super::reexport_move::ReexportMoveIndex,
+    pub(super) ts_barrels: &'a super::ts_barrels::TsBarrelIndex,
 }
 
 impl<'a> refs::RefVisitor for ImpactCollector<'a> {
@@ -439,6 +450,13 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         } else {
             false
         };
+        let ts_import_binding_use = self.ref_lang.is_some_and(lang_is_ts_family)
+            && node.is_some_and(|node| {
+                matches!(
+                    node.kind(),
+                    "identifier" | "type_identifier" | "shorthand_property_identifier"
+                )
+            });
 
         // Rust の証拠なし bare identifier を low に落とす際、macro 引数だけは high 維持するため
         // context 行の macro 呼び出し有無を見ておく (non-Rust では使わないので Rust のみ算出)。
@@ -654,6 +672,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             rust_alias_import_used,
             confidence: confidence_u8,
             local_shadow_hint,
+            ts_import_binding_use,
             ref_in_macro,
             rust_macro_callee,
             rust_receiver_member,
@@ -863,6 +882,7 @@ impl<'a> ImpactCollector<'a> {
             path_str: self.path_str,
             import_facts_cache: self.import_facts_cache,
             reexport_moves: self.reexport_moves,
+            ts_barrels: self.ts_barrels,
         };
         for e in self.ref_events.drain(..) {
             let sym_ix_usize = e.sym_ix as usize;
@@ -1186,6 +1206,7 @@ mod tests {
             rust_alias_import_used: false,
             confidence,
             local_shadow_hint: false,
+            ts_import_binding_use: false,
             ref_in_macro: false,
             rust_macro_callee: false,
             rust_receiver_member: false,
@@ -1297,6 +1318,7 @@ mod tests {
         // 再輸出移動の索引は空 = 降格なし。本テストは3バケットの優先順位だけを固定する
         // (再輸出移動の判定は `reexport_move` のユニットテストと E2E が担当)。
         let reexport_moves = super::super::reexport_move::ReexportMoveIndex::build("");
+        let ts_barrels = super::super::ts_barrels::TsBarrelIndex::default();
         RouteDecisionContext {
             // TS/Rust のファイル解析を伴う補正は既存の import_facts テストに任せ、
             // ここでは3バケットの優先順位だけを固定する。
@@ -1306,6 +1328,7 @@ mod tests {
             path_str: "src/caller.rs",
             import_facts_cache: &mut cache,
             reexport_moves: &reexport_moves,
+            ts_barrels: &ts_barrels,
         }
         .decide(event, context, "target", false, base_low, false)
     }

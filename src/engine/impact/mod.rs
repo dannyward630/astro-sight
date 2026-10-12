@@ -15,6 +15,7 @@ mod rust_std_origin;
 mod rust_visibility_scope;
 mod signature;
 pub(crate) mod test_context;
+mod ts_barrels;
 mod types;
 
 use std::borrow::Cow;

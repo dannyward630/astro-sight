@@ -276,3 +276,7 @@ tree-sitter で動かない言語を追加するには:
 2. `LangId` も対応する variant を追加し `detected()` を更新
 3. `src/engine/lexer/mod.rs` に `LexerProfile` を新規追加 (keywords / コメント / 文字列区切り / 定義 keyword)
 4. `profile_for()` の match arm に追加
+
+### TS/JS のバレル経由 impact
+
+`engine/impact/ts_barrels.rs` は、変更名を named import した利用ファイルから named re-export / `export *` をたどり、変更元の同名 export へ一意に到達した参照だけを通常の impact に昇格する。バレルの export 行は従来どおり情報提供に残す。モジュールは必要になったときだけ解析して共有キャッシュへ保持する。相対パスとルートの `tsconfig.json` / `jsconfig.json` に直接書かれた `paths` を扱い、近くに別の設定がある場合や、解析エラー・競合する export・解決不能な候補がある場合は証明しない。index 側を解析する `--staged` では作業ツリーから証拠を取らない。別名 import や推移的な設定継承は証明対象外。

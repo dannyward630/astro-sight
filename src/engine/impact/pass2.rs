@@ -14,6 +14,7 @@ use lru::LruCache;
 use crate::engine::refs;
 
 use super::collector::{ImpactCollector, WorkerState};
+use super::ts_barrels::TsBarrelIndex;
 use super::types::{StringPool, SymEntries, TypedCallerMap, new_typed_caller_map};
 use super::{FileContext, TARGET_FILE_CACHE_SIZE, ci_key};
 
@@ -367,6 +368,11 @@ pub(super) fn stream_caller_maps_and_defs(
     else {
         return empty_result();
     };
+    let ts_barrels = if options.new_side == crate::models::impact::DiffNewSide::WorkingTree {
+        TsBarrelIndex::build(dir, &files, file_contexts)
+    } else {
+        TsBarrelIndex::default()
+    };
 
     // 全 chunk を通して 1 つの StringPool を共有する。workers=1 なら lock 競合は発生しない。
     let string_pool = std::sync::Mutex::new(StringPool::new());
@@ -470,6 +476,7 @@ pub(super) fn stream_caller_maps_and_defs(
                             dir: dir_str,
                             ref_lang,
                             reexport_moves,
+                            ts_barrels: &ts_barrels,
                         };
                         if refs::visit_refs_and_defs_in_file_cb(
                             all_symbol_names,
