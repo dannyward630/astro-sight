@@ -418,6 +418,601 @@ fn python_same_name_methods_close_only_when_all_definitions_and_callers_change()
 }
 
 #[test]
+fn python_changed_method_call_requires_new_argument_before_closing() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+
+    for (label, caller, should_close) in [
+        (
+            "unrelated caller edit",
+            "from pkg.service import Service\n\ndef run() -> int:\n    return Service().price(1) + 0\n",
+            false,
+        ),
+        (
+            "required argument supplied",
+            "from pkg.service import Service\n\ndef run() -> int:\n    return Service().price(1, 2)\n",
+            true,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("pkg/__init__.py", ""),
+                (
+                    "pkg/service.py",
+                    "class Service:\n    def price(self, amount: int) -> int:\n        return amount\n",
+                ),
+                (
+                    "pkg/caller.py",
+                    "from pkg.service import Service\n\ndef run() -> int:\n    return Service().price(1)\n",
+                ),
+            ],
+            "base",
+        );
+        std::fs::write(
+            repo.join("pkg/service.py"),
+            "class Service:\n    def price(self, amount: int, tax: int) -> int:\n        return amount + tax\n",
+        )
+        .expect("write service");
+        std::fs::write(repo.join("pkg/caller.py"), caller).expect("write caller");
+        let changes = detect_api_changes_from_worktree(repo);
+        assert_eq!(
+            changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|change| change.name == "Service.price"),
+            should_close,
+            "{label}: {changes:?}"
+        );
+        assert_eq!(
+            changes
+                .modified
+                .iter()
+                .any(|change| change.name == "Service.price"),
+            !should_close,
+            "{label}: {changes:?}"
+        );
+    }
+}
+
+#[test]
+fn python_method_receiver_binding_controls_argument_check() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+    for (label, before, after, should_close) in [
+        (
+            "bound missing",
+            "Service().price(1)",
+            "Service().price(1) + 0",
+            false,
+        ),
+        (
+            "bound updated",
+            "Service().price(1)",
+            "Service().price(1, 2)",
+            true,
+        ),
+        (
+            "local missing",
+            "obj = Service()\n    return obj.price(1)",
+            "obj = Service()\n    return obj.price(1) + 0",
+            false,
+        ),
+        (
+            "local updated",
+            "obj = Service()\n    return obj.price(1)",
+            "obj = Service()\n    return obj.price(1, 2)",
+            true,
+        ),
+        (
+            "unbound missing",
+            "Service.price(Service(), 1)",
+            "Service.price(Service(), 1) + 0",
+            false,
+        ),
+        (
+            "unbound updated",
+            "Service.price(Service(), 1)",
+            "Service.price(Service(), 1, 2)",
+            true,
+        ),
+        (
+            "unknown alias",
+            "Service.price(Service(), 1)",
+            "Alias = Service\n    return Alias.price(Service(), 1, 2)",
+            false,
+        ),
+        (
+            "comprehension shadows class",
+            "Service.price(Service(), 1)",
+            "[Service.price(1, 2, 3) for Service in []]",
+            false,
+        ),
+        (
+            "lambda shadows class",
+            "Service.price(Service(), 1)",
+            "(lambda Service: Service.price(1, 2, 3))(Service())",
+            false,
+        ),
+        (
+            "rebound local receiver",
+            "obj = Service()\n    return obj.price(1)",
+            "obj = Service()\n    obj = Service\n    return obj.price(1, 2)",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let before_call = if before.contains("\n") {
+            before.to_owned()
+        } else {
+            format!("return {before}")
+        };
+        let after_call = if after.contains("\n") {
+            after.to_owned()
+        } else {
+            format!("return {after}")
+        };
+        git_commit_files(
+            repo,
+            &[
+                ("pkg/__init__.py", ""),
+                (
+                    "pkg/service.py",
+                    "class Service:\n    def price(self, amount: int) -> int:\n        return amount\n",
+                ),
+                (
+                    "pkg/caller.py",
+                    &format!("from pkg.service import Service\n\ndef run():\n    {before_call}\n"),
+                ),
+            ],
+            "base",
+        );
+        std::fs::write(repo.join("pkg/service.py"), "class Service:\n    def price(self, amount: int, tax: int) -> int:\n        return amount + tax\n").expect("write service");
+        std::fs::write(
+            repo.join("pkg/caller.py"),
+            format!("from pkg.service import Service\n\ndef run():\n    {after_call}\n"),
+        )
+        .expect("write caller");
+        let changes = detect_api_changes_from_worktree(repo);
+        assert_eq!(
+            changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|c| c.name == "Service.price"),
+            should_close,
+            "{label}: {changes:?}"
+        );
+        assert_eq!(
+            changes.modified.iter().any(|c| c.name == "Service.price"),
+            !should_close,
+            "{label}: {changes:?}"
+        );
+    }
+}
+
+#[test]
+fn python_method_decorators_use_their_binding_contract() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+    for (label, decorator, first, before, after, should_close) in [
+        (
+            "class missing",
+            "@classmethod",
+            "cls",
+            "Service.price(1)",
+            "Service.price(1) + 0",
+            false,
+        ),
+        (
+            "class updated",
+            "@classmethod",
+            "cls",
+            "Service.price(1)",
+            "Service.price(1, 2)",
+            true,
+        ),
+        (
+            "static missing",
+            "@staticmethod",
+            "amount",
+            "Service.price(1)",
+            "Service.price(1) + 0",
+            false,
+        ),
+        (
+            "static updated",
+            "@staticmethod",
+            "amount",
+            "Service.price(1)",
+            "Service.price(1, 2)",
+            true,
+        ),
+        (
+            "unknown decorator",
+            "@wrapper",
+            "self",
+            "Service.price(Service(), 1)",
+            "Service.price(Service(), 1, 2)",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let old_params = if first == "amount" {
+            "amount: int"
+        } else {
+            "cls, amount: int"
+        };
+        let new_params = if first == "amount" {
+            "amount: int, tax: int"
+        } else {
+            "cls, amount: int, tax: int"
+        };
+        let old_service = format!(
+            "class Service:\n    {decorator}\n    def price({old_params}) -> int:\n        return amount\n"
+        );
+        let new_service = format!(
+            "class Service:\n    {decorator}\n    def price({new_params}) -> int:\n        return amount + tax\n"
+        );
+        git_commit_files(
+            repo,
+            &[
+                ("pkg/__init__.py", ""),
+                ("pkg/service.py", &old_service),
+                (
+                    "pkg/caller.py",
+                    &format!(
+                        "from pkg.service import Service\n\ndef run():\n    return {before}\n"
+                    ),
+                ),
+            ],
+            "base",
+        );
+        std::fs::write(repo.join("pkg/service.py"), new_service).expect("write service");
+        std::fs::write(
+            repo.join("pkg/caller.py"),
+            format!("from pkg.service import Service\n\ndef run():\n    return {after}\n"),
+        )
+        .expect("write caller");
+        let changes = detect_api_changes_from_worktree(repo);
+        assert_eq!(
+            changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|c| c.name == "Service.price"),
+            should_close,
+            "{label}: {changes:?}"
+        );
+        assert_eq!(
+            changes.modified.iter().any(|c| c.name == "Service.price"),
+            !should_close,
+            "{label}: {changes:?}"
+        );
+    }
+}
+
+#[test]
+fn python_self_method_call_checks_the_new_parameters() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+    for (caller, should_close) in [
+        ("return self.price(1) + 0", false),
+        ("return self.price(1, 2)", true),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("pkg/__init__.py", ""),
+                (
+                    "pkg/service.py",
+                    "class Service:\n    def price(self, amount):\n        return amount\n\n    def run(self):\n        return self.price(1)\n",
+                ),
+                (
+                    "pkg/caller.py",
+                    "from pkg.service import Service\n\ndef use():\n    return Service().price(1)\n",
+                ),
+            ],
+            "base",
+        );
+        std::fs::write(repo.join("pkg/service.py"), format!("class Service:\n    def price(self, amount, tax):\n        return amount + tax\n\n    def run(self):\n        {caller}\n")).expect("write service");
+        std::fs::write(
+            repo.join("pkg/caller.py"),
+            "from pkg.service import Service\n\ndef use():\n    return Service().price(1, 2)\n",
+        )
+        .expect("write caller");
+        let changes = detect_api_changes_from_worktree(repo);
+        assert_eq!(
+            changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|c| c.name == "Service.price"),
+            should_close,
+            "{caller}: {changes:?}"
+        );
+        assert_eq!(
+            changes.modified.iter().any(|c| c.name == "Service.price"),
+            !should_close,
+            "{caller}: {changes:?}"
+        );
+    }
+}
+
+#[test]
+fn python_same_name_methods_check_their_own_argument_contracts() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+    for (catalog_call, ledger_call, catalog_closed, ledger_closed) in [
+        (
+            "Catalog().price('a', 'u')",
+            "Ledger().price('a', 'u', 'r')",
+            true,
+            true,
+        ),
+        (
+            "Catalog().price('a', 'u')",
+            "Ledger().price('a', 'r') + 0",
+            true,
+            false,
+        ),
+        ("0", "Ledger().price('a', 'u', 'r')", false, true),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("pkg/__init__.py", ""),
+                (
+                    "pkg/catalog.py",
+                    "class Catalog:\n    def price(self, sku):\n        return len(sku)\n",
+                ),
+                (
+                    "pkg/ledger.py",
+                    "class Ledger:\n    def price(self, sku, region):\n        return len(sku) + len(region)\n",
+                ),
+                (
+                    "pkg/caller.py",
+                    "from pkg.catalog import Catalog\nfrom pkg.ledger import Ledger\n\ndef total():\n    return Catalog().price('a') + Ledger().price('a', 'r')\n",
+                ),
+            ],
+            "base",
+        );
+        std::fs::write(repo.join("pkg/catalog.py"), "class Catalog:\n    def price(self, sku, currency):\n        return len(sku) + len(currency)\n").expect("write catalog");
+        std::fs::write(repo.join("pkg/ledger.py"), "class Ledger:\n    def price(self, sku, currency, region):\n        return len(sku) + len(currency) + len(region)\n").expect("write ledger");
+        std::fs::write(repo.join("pkg/caller.py"), format!("from pkg.catalog import Catalog\nfrom pkg.ledger import Ledger\n\ndef total():\n    return {catalog_call} + {ledger_call}\n")).expect("write caller");
+        let changes = detect_api_changes_from_worktree(repo);
+        for (name, expected) in [
+            ("Catalog.price", catalog_closed),
+            ("Ledger.price", ledger_closed),
+        ] {
+            assert_eq!(
+                changes
+                    .modified_closed_in_diff
+                    .iter()
+                    .any(|c| c.name == name),
+                expected,
+                "{name}: {changes:?}"
+            );
+            assert_eq!(
+                changes.modified.iter().any(|c| c.name == name),
+                !expected,
+                "{name}: {changes:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn python_bound_receiver_keyword_is_checked_before_kwargs() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+    for (separator, keyword, should_close) in [
+        ("", "self=Service()", false),
+        ("", "extra=1", true),
+        ("/, ", "self=Service()", true),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("pkg/__init__.py", ""),
+                (
+                    "pkg/service.py",
+                    &format!(
+                        "class Service:\n    def price(self, {separator}amount, **kwargs):\n        return amount\n"
+                    ),
+                ),
+                (
+                    "pkg/caller.py",
+                    "from pkg.service import Service\n\ndef use():\n    return Service().price(1)\n",
+                ),
+            ],
+            "base",
+        );
+        std::fs::write(repo.join("pkg/service.py"), format!("class Service:\n    def price(self, {separator}amount, tax, **kwargs):\n        return amount + tax\n")).expect("write service");
+        std::fs::write(repo.join("pkg/caller.py"), format!("from pkg.service import Service\n\ndef use():\n    return Service().price(1, 2, {keyword})\n")).expect("write caller");
+        let changes = detect_api_changes_from_worktree(repo);
+        assert_eq!(
+            changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|c| c.name == "Service.price"),
+            should_close,
+            "{separator} / {keyword}: {changes:?}"
+        );
+        assert_eq!(
+            changes.modified.iter().any(|c| c.name == "Service.price"),
+            !should_close,
+            "{separator} / {keyword}: {changes:?}"
+        );
+    }
+}
+
+#[test]
+fn python_self_receiver_does_not_exclude_a_method_selected_by_mro() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            ("pkg/__init__.py", ""),
+            (
+                "pkg/service.py",
+                "class Service:\n    def price(self, a, b):\n        return a + b\n",
+            ),
+            (
+                "pkg/other.py",
+                "class Other:\n    def price(self, a):\n        return a\n\n    def run(self):\n        return self.price(1)\n",
+            ),
+            (
+                "pkg/caller.py",
+                "from pkg.service import Service\nfrom pkg.other import Other\n\nclass Combined(Service, Other):\n    pass\n\ndef use():\n    return Service().price(1, 2) + Combined().run()\n",
+            ),
+        ],
+        "base",
+    );
+    std::fs::write(
+        repo.join("pkg/service.py"),
+        "class Service:\n    def price(self, a, b, c):\n        return a + b + c\n",
+    )
+    .expect("write service");
+    std::fs::write(repo.join("pkg/other.py"), "class Other:\n    def price(self, a, b):\n        return a + b\n\n    def run(self):\n        return self.price(1, 2)\n").expect("write other");
+    std::fs::write(repo.join("pkg/caller.py"), "from pkg.service import Service\nfrom pkg.other import Other\n\nclass Combined(Service, Other):\n    pass\n\ndef use():\n    return Service().price(1, 2, 3) + Combined().run()\n").expect("write caller");
+    let changes = detect_api_changes_from_worktree(repo);
+    assert!(
+        changes.modified.iter().any(|c| c.name == "Service.price"),
+        "{changes:?}"
+    );
+    assert!(
+        !changes
+            .modified_closed_in_diff
+            .iter()
+            .any(|c| c.name == "Service.price"),
+        "{changes:?}"
+    );
+}
+
+#[test]
+fn python_class_change_keeps_existing_closed_in_diff_behavior() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            ("pkg/__init__.py", ""),
+            (
+                "pkg/service.py",
+                "class Base:\n    pass\n\nclass Service:\n    pass\n",
+            ),
+            (
+                "pkg/caller.py",
+                "from pkg.service import Service\n\ndef run():\n    return Service()\n",
+            ),
+        ],
+        "base",
+    );
+    std::fs::write(
+        repo.join("pkg/service.py"),
+        "class Base:\n    pass\n\nclass Service(Base):\n    pass\n",
+    )
+    .expect("write service");
+    std::fs::write(
+        repo.join("pkg/caller.py"),
+        "from pkg.service import Service\n\ndef run():\n    return Service()  # updated\n",
+    )
+    .expect("write caller");
+    let changes = detect_api_changes_from_worktree(repo);
+    assert!(
+        changes
+            .modified_closed_in_diff
+            .iter()
+            .any(|c| c.name == "Service"),
+        "{changes:?}"
+    );
+    assert!(
+        !changes.modified.iter().any(|c| c.name == "Service"),
+        "{changes:?}"
+    );
+}
+
+#[test]
+fn python_method_import_resolution_handles_multiple_names_and_src_layout() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+    for (prefix, import_line) in [
+        ("pkg", "from pkg.service import Service, Other"),
+        ("src/pkg", "from pkg.service import Service"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let init = format!("{prefix}/__init__.py");
+        let service = format!("{prefix}/service.py");
+        let caller = format!("{prefix}/caller.py");
+        git_commit_files(
+            repo,
+            &[
+                (&init, ""),
+                (
+                    &service,
+                    "class Service:\n    def price(self, amount):\n        return amount\n\nclass Other:\n    pass\n",
+                ),
+                (
+                    &caller,
+                    &format!("{import_line}\n\ndef use():\n    return Service().price(1)\n"),
+                ),
+            ],
+            "base",
+        );
+        std::fs::write(repo.join(&service), "class Service:\n    def price(self, amount, tax):\n        return amount + tax\n\nclass Other:\n    pass\n").expect("write service");
+        std::fs::write(
+            repo.join(&caller),
+            format!("{import_line}\n\ndef use():\n    return Service().price(1, 2)\n"),
+        )
+        .expect("write caller");
+        let changes = detect_api_changes_from_worktree(repo);
+        assert!(
+            changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|c| c.name == "Service.price"),
+            "{prefix}: {changes:?}"
+        );
+        assert!(
+            !changes.modified.iter().any(|c| c.name == "Service.price"),
+            "{prefix}: {changes:?}"
+        );
+    }
+}
+
+#[test]
 fn python_same_name_test_fake_does_not_block_updated_method_and_callers() {
     use crate::commands::tests::common::{
         detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,

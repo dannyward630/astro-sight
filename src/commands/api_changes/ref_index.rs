@@ -378,6 +378,23 @@ pub(crate) fn is_modified_closed_in_diff(
         {
             continue;
         }
+        if target_lang == Some(crate::language::LangId::Python)
+            && kind == "function"
+            && name.contains('.')
+        {
+            use super::python_call_arity::MethodCallMatch;
+            match super::python_call_arity::changed_method_call_matches_signature(
+                dir,
+                target_new_path,
+                name,
+                r,
+                caches,
+            ) {
+                MethodCallMatch::Target => {}
+                MethodCallMatch::Other => continue,
+                MethodCallMatch::Unknown => return false,
+            }
+        }
         effective_call_refs += 1;
         if matches!(
             target_lang,
@@ -829,6 +846,10 @@ pub(crate) struct ApiClosureCaches {
     /// Python の変更後関数契約。参照ごとの定義ファイル再走査を避ける。
     pub(super) python_call_contracts:
         std::collections::HashMap<(String, String), Option<super::python_call_arity::CallContract>>,
+    pub(super) python_method_contracts: std::collections::HashMap<
+        (String, String),
+        Option<super::python_call_arity::MethodContract>,
+    >,
     /// JS / TS / TSX の変更後関数契約。参照ごとの定義ファイル再走査を避ける。
     pub(super) js_call_contracts:
         std::collections::HashMap<(String, String), Option<super::js_ts_call_arity::CallContract>>,
