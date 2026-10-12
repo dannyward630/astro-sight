@@ -209,9 +209,6 @@ fn has_foreign_marker(content: &[u8]) -> bool {
         "interoptopus",
         "flapigen",
         "rust_swig",
-        "include!",
-        "includeas",
-        "#[path=",
     ]
     .iter()
     .any(|marker| compact.contains(marker))
@@ -225,7 +222,7 @@ fn has_rust_dynamic_path(source: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(source) else {
         return true;
     };
-    if !text.contains("path") || !(text.contains("cfg_attr") || text.contains("#[path")) {
+    if !text.contains("path") && !text.contains("include") {
         return false;
     }
     let Ok(tree) = parser::parse_source(source, LangId::Rust) else {
@@ -235,23 +232,7 @@ fn has_rust_dynamic_path(source: &[u8]) -> bool {
     if root.has_error() {
         return true;
     }
-    let mut pending = vec![root];
-    while let Some(node) = pending.pop() {
-        if matches!(node.kind(), "attribute_item" | "inner_attribute_item") {
-            let Ok(attribute) = node.utf8_text(source) else {
-                return true;
-            };
-            let compact: String = attribute.chars().filter(|ch| !ch.is_whitespace()).collect();
-            if compact.starts_with("#[path=")
-                || compact.starts_with("#[cfg_attr(") && compact.contains("path=")
-            {
-                return true;
-            }
-        }
-        let mut cursor = node.walk();
-        pending.extend(node.named_children(&mut cursor));
-    }
-    false
+    crate::engine::rust_dynamic_source::tree_includes_external_source(root, source)
 }
 
 #[cfg(test)]
@@ -272,22 +253,22 @@ mod tests {
             b"#[no_mangle] pub extern \"C\" fn open() {}"
         ));
         assert!(has_foreign_marker(b"uniffi::setup_scaffolding!();"));
-        assert!(has_foreign_marker(
+        assert!(has_rust_dynamic_path(
             b"include!(concat!(env!(\"OUT_DIR\"), \"/ffi.rs\"));"
         ));
         assert!(has_foreign_marker(&[0xff]));
         assert!(is_bridge_file("src/api.udl"));
         assert!(is_bridge_file("include/api.modulemap"));
         assert!(is_bridge_file("include/API.H"));
-        assert!(has_foreign_marker(b"#[path = \"ffi.inc\"] mod ffi;"));
-        assert!(has_foreign_marker(
+        assert!(has_rust_dynamic_path(b"#[path = \"ffi.inc\"] mod ffi;"));
+        assert!(has_rust_dynamic_path(
             b"use std::include as load; load!(\"ffi.inc\");"
         ));
-        assert!(has_foreign_marker(
+        assert!(has_rust_dynamic_path(
             b"use std::{include as load}; load!(\"ffi.inc\");"
         ));
-        assert!(has_foreign_marker(b"include!{\"ffi.inc\"}"));
-        assert!(has_foreign_marker(b"include![\"ffi.inc\"];"));
+        assert!(has_rust_dynamic_path(b"include!{\"ffi.inc\"}"));
+        assert!(has_rust_dynamic_path(b"include![\"ffi.inc\"];"));
         assert!(has_rust_dynamic_path(
             b"#[cfg_attr(all(), path = \"ffi.inc\")] mod ffi;"
         ));

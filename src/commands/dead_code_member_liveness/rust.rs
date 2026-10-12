@@ -421,29 +421,19 @@ fn has_metavar_concat(source: &[u8]) -> bool {
     false
 }
 
-fn rust_attribute_selects_path(source: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(source) else {
-        return true;
-    };
-    let Some(body) = text.strip_prefix("#[") else {
-        return false;
-    };
-    let body = body.trim_start();
-    body.strip_prefix("path")
-        .is_some_and(|rest| rest.trim_start().starts_with('='))
-        || body.starts_with("cfg_attr") && contains_identifier(body.as_bytes(), "path")
-}
-
 fn has_dynamic_rust_macro(source: &[u8], root: Node<'_>) -> bool {
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
+        if crate::engine::rust_dynamic_source::node_includes_external_source(node, source) {
+            return true;
+        }
         if node.kind() == "identifier"
             && has_token_tree_ancestor(node)
             && !is_field_name_in_token_tree(node, source)
             && node.utf8_text(source).ok().is_none_or(|name| {
                 matches!(
                     name.strip_prefix("r#").unwrap_or(name),
-                    "include" | "paste" | "concat_idents" | "format_ident" | "seq" | "quote"
+                    "paste" | "concat_idents" | "format_ident" | "seq" | "quote"
                 )
             })
         {
@@ -453,29 +443,21 @@ fn has_dynamic_rust_macro(source: &[u8], root: Node<'_>) -> bool {
             && last_macro_identifier(node, source).is_none_or(|name| {
                 matches!(
                     name,
-                    "include" | "paste" | "concat_idents" | "format_ident" | "seq" | "quote"
+                    "paste" | "concat_idents" | "format_ident" | "seq" | "quote"
                 )
             })
         {
             return true;
         }
         if node.kind() == "use_declaration"
-            && [
-                "include",
-                "paste",
-                "concat_idents",
-                "format_ident",
-                "seq",
-                "quote",
-            ]
-            .iter()
-            .any(|name| contains_identifier(&source[node.byte_range()], name))
+            && ["paste", "concat_idents", "format_ident", "seq", "quote"]
+                .iter()
+                .any(|name| contains_identifier(&source[node.byte_range()], name))
         {
             return true;
         }
         if node.kind() == "attribute_item"
-            && (contains_identifier(&source[node.byte_range()], "proc_macro_derive")
-                || rust_attribute_selects_path(&source[node.byte_range()]))
+            && contains_identifier(&source[node.byte_range()], "proc_macro_derive")
         {
             return true;
         }
@@ -1019,6 +1001,10 @@ mod tests {
             "macro_rules! m { () => { include /*c*/ !(\"extra.rs\"); } }\n",
             "macro_rules! m { () => { use std::include as load; load!(\"extra.rs\"); } }\n",
             "macro_rules! m { () => { x . include!(\"extra.rs\"); } }\n",
+            "# [path = \"extra.inc\"] mod extra;\n",
+            "#[path /*note*/ = \"extra.inc\"] mod extra;\n",
+            "#[cfg_attr(all(), path = \"extra.inc\")] mod extra;\n",
+            "macro_rules! m { () => { # [cfg_attr(all(), path = \"extra.inc\")] mod extra; } }\n",
         ] {
             let tree = parser::parse_source(source.as_bytes(), LangId::Rust).expect("parse Rust");
             assert!(

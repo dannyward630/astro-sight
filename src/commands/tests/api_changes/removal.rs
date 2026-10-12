@@ -284,6 +284,16 @@ fn detect_api_changes_rust_swift_uncertain_ffi_sources_stay_blocking() {
             "#[no_mangle] pub extern \"C\" fn ffi() {}\n",
         ),
         ("core/src/loader.rs", "#[path = \"ffi.inc\"] mod ffi;\n"),
+        ("core/src/loader.rs", "# [path = \"ffi.inc\"] mod ffi;\n"),
+        (
+            "core/src/loader.rs",
+            "#[path /*note*/ = \"ffi.inc\"] mod ffi;\n",
+        ),
+        ("core/src/loader.rs", "include /*note*/ !(\"ffi.inc\");\n"),
+        (
+            "core/src/loader.rs",
+            "macro_rules! load { () => { #[cfg_attr(all(), path = \"ffi.inc\")] mod ffi; } }\n",
+        ),
         (
             "core/src/loader.rs",
             "use std::include as load; load!(\"ffi.inc\");\n",

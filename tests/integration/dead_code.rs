@@ -1045,39 +1045,46 @@ fn dead_code_rust_explicit_target_roots_keep_other_crate_calls_uncertain() {
 
 #[test]
 fn dead_code_rust_path_attribute_keeps_unscanned_calls_uncertain() {
-    let repo = TestRepo::new();
-    repo.create_dir_all("src");
-    repo.write(
-        "Cargo.toml",
-        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    );
-    repo.write(
-        "src/lib.rs",
-        "pub mod a; pub mod b; #[path = \"calls.inc\"] mod calls;\n",
-    );
-    repo.write(
-        "src/a.rs",
-        "pub struct A; impl A { pub fn put_u16(&mut self) {} }\n",
-    );
-    repo.write(
-        "src/b.rs",
-        "pub struct B; impl B { pub fn put_u16(&mut self) {} }\n",
-    );
-    repo.write(
-        "src/calls.inc",
-        "pub fn call() { let mut value = crate::b::B; value.put_u16(); }\n",
-    );
-    let result = repo.run_json("dead-code", &[]);
-    assert!(
-        !result["dead_symbols"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["name"]
-                .as_str()
-                .is_some_and(|name| name.ends_with(".put_u16"))),
-        "{result}"
-    );
+    for attribute in [
+        "#[path = \"calls.inc\"]",
+        "# [path = \"calls.inc\"]",
+        "#[path /*note*/ = \"calls.inc\"]",
+        "#[cfg_attr(all(), path = \"calls.inc\")]",
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write(
+            "src/lib.rs",
+            &format!("pub mod a; pub mod b; {attribute} mod calls;\n"),
+        );
+        repo.write(
+            "src/a.rs",
+            "pub struct A; impl A { pub fn put_u16(&mut self) {} }\n",
+        );
+        repo.write(
+            "src/b.rs",
+            "pub struct B; impl B { pub fn put_u16(&mut self) {} }\n",
+        );
+        repo.write(
+            "src/calls.inc",
+            "pub fn call() { let mut value = crate::b::B; value.put_u16(); }\n",
+        );
+        let result = repo.run_json("dead-code", &[]);
+        assert!(
+            !result["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with(".put_u16"))),
+            "{attribute}: {result}"
+        );
+    }
 }
 
 #[test]
