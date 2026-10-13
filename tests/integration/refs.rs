@@ -407,6 +407,121 @@ fn refs_counts_object_shorthand_value_but_not_destructuring_binding() {
     );
 }
 
+/// JS/TS の private 名 (`#load`) を `refs --name '#load'` で辿れることを固定する。
+///
+/// 旧実装は `private_property_identifier` を識別子として扱わなかったため、定義
+/// (`#load() {}`) も呼び出し (`this.#load()`) もあるのに 0 件を返していた。
+/// 0 件の AST 検索は「参照なし」として扱う運用なので、最悪方向の誤りになる。
+///
+/// **対照ケースを内蔵する**: `#load` と公開名 `load` は JS では別の名前。
+/// `refs --name load` が `#load` の行を拾わないこと、単一検索と `--names` の結果が
+/// 一致することも同じテストで確かめる。
+#[test]
+fn refs_finds_js_private_names_without_conflating_public_names() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let class_body = "export class Svc {\n\
+                      \x20 #count = 0;\n\
+                      \x20 #load() {\n\
+                      \x20   return 1;\n\
+                      \x20 }\n\
+                      \x20 load() {\n\
+                      \x20   return 2;\n\
+                      \x20 }\n\
+                      \x20 run(other) {\n\
+                      \x20   return this.#load() + this.#count + (#count in other ? 1 : 0);\n\
+                      \x20 }\n\
+                      }\n";
+    std::fs::write(dir.path().join("svc.ts"), class_body).expect("write ts fixture");
+    std::fs::write(dir.path().join("svc.js"), class_body).expect("write js fixture");
+    let dir_arg = dir.path().to_str().expect("utf-8 path");
+
+    let run_refs = |args: &[&str]| -> Vec<serde_json::Value> {
+        let output = cargo_bin()
+            .args(["refs"])
+            .args(args)
+            .args(["--dir", dir_arg])
+            .output()
+            .expect("failed to run");
+        assert!(
+            output.status.success(),
+            "refs failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("invalid JSON"))
+            .collect()
+    };
+    let hits = |result: &serde_json::Value| -> Vec<(String, u64, String)> {
+        let mut out: Vec<(String, u64, String)> = result["refs"]
+            .as_array()
+            .map(|refs| {
+                refs.iter()
+                    .map(|r| {
+                        (
+                            r["path"].as_str().unwrap_or_default().to_string(),
+                            r["ln"].as_u64().unwrap_or_default(),
+                            r["kind"].as_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    };
+
+    let private = run_refs(&["--name", "#load"]);
+    let private_hits = hits(&private[0]);
+    for file in ["svc.ts", "svc.js"] {
+        // 定義 (`#load() {`) は def、`this.#load()` は ref
+        assert!(
+            private_hits.contains(&(file.to_string(), 2, "def".to_string())),
+            "{file}: `#load()` should be the definition: {private_hits:?}"
+        );
+        assert!(
+            private_hits.contains(&(file.to_string(), 9, "ref".to_string())),
+            "{file}: `this.#load()` should be a reference: {private_hits:?}"
+        );
+    }
+
+    // private フィールドの `#count in other` (brand check) も参照として拾う
+    let count_hits = hits(&run_refs(&["--name", "#count"])[0]);
+    assert!(
+        count_hits
+            .iter()
+            .filter(|(file, line, _)| file == "svc.ts" && *line == 9)
+            .count()
+            >= 2,
+        "`this.#count` and `#count in other` should both be references: {count_hits:?}"
+    );
+
+    // 対照: 公開名 `load` は private 名 `#load` の行を拾わない
+    let public_hits = hits(&run_refs(&["--name", "load"])[0]);
+    assert_eq!(
+        public_hits,
+        vec![
+            ("svc.js".to_string(), 5, "def".to_string()),
+            ("svc.ts".to_string(), 5, "def".to_string()),
+        ],
+        "public `load` must not match `#load`: {public_hits:?}"
+    );
+
+    // 単一検索と `--names` のバッチ検索が同じ結果を返す
+    let batch = run_refs(&["--names", "#load,load"]);
+    let batch_private = batch
+        .iter()
+        .find(|r| r["symbol"] == "#load")
+        .expect("batch result for #load");
+    let batch_public = batch
+        .iter()
+        .find(|r| r["symbol"] == "load")
+        .expect("batch result for load");
+    assert_eq!(hits(batch_private), private_hits);
+    assert_eq!(hits(batch_public), public_hits);
+}
+
 /// TS の computed member 名 `class A { [SOME_KEY]() {} }` は定数への**参照**であって
 /// 定義ではないことを固定する。
 ///

@@ -514,6 +514,10 @@ pub(crate) fn is_identifier_kind(kind: &str) -> bool {
             // 出し、それ以外の文脈は `is_ignored_identifier_context` が除外する
             // (束縛を参照として数えると dead-code が fail-open する)。
             | "shorthand_property_identifier_pattern"
+            // JS/TS の private 名 (`#load() {}` / `this.#load()` / `#n in obj`)。ノードの
+            // テキストは `#` を含むので `refs --name '#load'` だけに一致し、公開名 `load`
+            // とは取り違えない。ここに無いと定義も呼び出しもあるのに 0 件を返していた。
+            | "private_property_identifier"
             | "simple_identifier"
             | "namespace_identifier"
             | "package_identifier"

@@ -38,6 +38,13 @@ fn is_identifier_kind_accepts_shorthand_value_and_binding_pattern() {
     assert!(is_identifier_kind("shorthand_property_identifier_pattern"));
 }
 
+/// JS/TS の private 名 (`#load`) も走査対象の識別子に入れる。
+/// 外すと `refs --name '#load'` が定義と `this.#load()` の呼び出しを 1 件も返さない。
+#[test]
+fn is_identifier_kind_accepts_js_private_names() {
+    assert!(is_identifier_kind("private_property_identifier"));
+}
+
 /// shorthand の束縛パターンは変数宣言の束縛位置だけを残し、他の文脈は除外する。
 #[test]
 fn shorthand_binding_pattern_is_ignored_outside_variable_declarations() {
