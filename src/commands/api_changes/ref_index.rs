@@ -534,17 +534,124 @@ pub(crate) fn is_modified_closed_in_diff(
     input: ModifiedClosureInput<'_>,
     caches: &mut ApiClosureCaches,
 ) -> bool {
+    let mut diff_files = DiffFileLookup::new(input.diff_files, input.dir);
+    let Some(target) = prepare_closure_target(&input, &mut diff_files, caches) else {
+        return false;
+    };
+    // import / use 宣言の参照は signature 変更に追随する必要がない (名前だけの import で、
+    // 通常は変更されず context 行に残る) ため除外し、実際の呼び出し参照のみを対象とする。
+    // 呼び出し参照が 1 件も無ければ (import のみ / 呼び出しが diff 外にある可能性) closed
+    // 扱いにせず blocking。
+    // 行頭テキスト判定 (ref_is_import_line) は複数行 grouped use ブロックの継続行
+    // (`    a, b, cmd_cochange, ...` のように `use ` で始まらない行) を拾えないため、
+    // AST ベースの import 行集合でも除外する。import/use 文内の参照は signature 変更に
+    // 追随する必要がない (api.mod 誤検出 2026-05-31: grouped use 継続行を未更新 caller と
+    // 誤判定して blocking していた問題への対応)。
+    // 2 つのキャッシュは detect_api_changes スコープで生成して全 modified シンボルで共有する。
+    // per-symbol の git diff サブプロセス起動と tree-sitter parse を unique file 単位に削減する。
+    let call_refs = collect_call_refs(target.refs, input.dir, target.bare, caches);
+    if call_refs.is_empty() {
+        return false;
+    }
+    // 全ての呼び出し参照が、diff 内ファイルかつ実際の追加/変更行 (context 行ではない) にあるか。
+    // shadow 除外で全参照が消えた場合は「対象 API の caller を 1 件も確認できていない」
+    // ため closed にしない (除外前の空チェックだけだと fail-open になる)。空集合に対する
+    // `all` は true なので、確認できた参照の数を数えて判定する。
+    let mut effective_call_refs = 0usize;
+    for r in &call_refs {
+        match classify_reference_owner(&input, &target, r, caches) {
+            ReferenceOwner::Target => {}
+            ReferenceOwner::Other => continue,
+            ReferenceOwner::Unknown => return false,
+        }
+        effective_call_refs += 1;
+        if !prove_reference_updated(&input, &target, r, &mut diff_files, caches) {
+            return false;
+        }
+    }
+    effective_call_refs > 0
+}
+
+/// 閉包判定の対象。変更対象ファイル内の定義が 1 つに特定でき、他ファイルの同名定義の
+/// 扱いも決まったときだけ作る。
+struct ClosureTarget<'a> {
+    bare: &'a str,
+    target_lang: Option<crate::language::LangId>,
+    /// Python のクラス直下のメソッド (`Class.method`)。
+    python_method: bool,
+    refs: &'a [crate::models::reference::SymbolReference],
+    /// 変更対象ファイル以外にも同名の定義がある。
+    has_foreign_defs: bool,
+    /// (Python のメソッドで) 他ファイルの同名定義がすべてこの diff の追加行にある。
+    python_foreign_defs_updated: bool,
+}
+
+/// 呼び出し参照 1 件の帰属。
+enum ReferenceOwner {
+    /// 変更対象の定義への参照。追随を証明する対象として数える。
+    Target,
+    /// 別の定義への参照。判定から外す。
+    Other,
+    /// 帰属を決められない。閉じない。
+    Unknown,
+}
+
+/// 参照パス → 一致する diff ファイル (diff の並びで最初に一致したもの) のメモ。
+/// `diff_path_matches_ref` は一致しない組で canonicalize を 2 回呼ぶため、参照ごとに
+/// diff ファイルを先頭から照合し直さず、参照パスごとに 1 回だけ照合する。
+struct DiffFileLookup<'a> {
+    diff_files: &'a [crate::models::impact::DiffFile],
+    dir: &'a str,
+    memo: std::collections::HashMap<String, Option<usize>>,
+}
+
+impl<'a> DiffFileLookup<'a> {
+    fn new(diff_files: &'a [crate::models::impact::DiffFile], dir: &'a str) -> Self {
+        Self {
+            diff_files,
+            dir,
+            memo: std::collections::HashMap::new(),
+        }
+    }
+
+    fn find(&mut self, ref_path: &str) -> Option<&'a crate::models::impact::DiffFile> {
+        let index = match self.memo.get(ref_path) {
+            Some(index) => *index,
+            None => {
+                let index = self.diff_files.iter().position(|df| {
+                    df.new_path != "/dev/null"
+                        && diff_path_matches_ref(&df.new_path, ref_path, self.dir)
+                });
+                self.memo.insert(ref_path.to_string(), index);
+                index
+            }
+        };
+        index.map(|index| &self.diff_files[index])
+    }
+}
+
+/// 全体の前提を確かめて閉包判定の対象を作る。どれか 1 つでも満たさなければ None (閉じない)。
+///
+/// 同名定義が複数ある場合: 変更対象ファイル (`target_new_path`) 内の定義が 1 つに
+/// 特定できなければ None。他ファイルの同名定義は、JS/TS/TSX のトップレベル関数 (bare 名)
+/// なら参照ごとの shadow 解決 ([`classify_reference_owner`]) へ進む。Python の method
+/// qualname は、他ファイルの同名定義がすべて追加行にあると証明できる場合だけ通す。
+fn prepare_closure_target<'a>(
+    input: &ModifiedClosureInput<'a>,
+    diff_files: &mut DiffFileLookup<'a>,
+    caches: &mut ApiClosureCaches,
+) -> Option<ClosureTarget<'a>> {
     use crate::models::reference::RefKind;
-    let ModifiedClosureInput {
+    let &ModifiedClosureInput {
         index,
         dir,
         name,
         kind,
         base,
         target_new_path,
-        diff_files,
-        arg_evidence,
+        ref arg_evidence,
         public_name_differs,
+        ..
     } = input;
     let bare = bare_name(name);
     let target_lang =
@@ -553,18 +660,16 @@ pub(crate) fn is_modified_closed_in_diff(
         && kind == "function"
         && name.contains('.');
     if public_name_differs {
-        return false;
+        return None;
     }
-    let Some(refs) = index.refs_for(bare) else {
-        return false;
-    };
+    let refs = index.refs_for(bare)?;
     // 別名で import / use / 再 export された名前 (`run as r`) の呼び出しは名前索引に現れず、
     // 見えた呼び出しが全部更新済みでも未更新の利用者が残り得る。言語を問わず閉じない。
     if refs.iter().any(|r| {
         r.kind != Some(crate::models::reference::RefKind::Definition)
             && ref_import_role(dir, r, bare, caches) == Some(RefImportRole::Aliased)
     }) {
-        return false;
+        return None;
     }
     // `.vue` などの解析できない埋め込みソースにある利用は refs に現れない。名前が現れ得る
     // ソースがあれば、見えた呼び出しだけで追随済みとは言えない。
@@ -577,12 +682,12 @@ pub(crate) fn is_modified_closed_in_diff(
         )
     ) && embedded_js_sources_may_mention(dir, &[bare], caches)
     {
-        return false;
+        return None;
     }
     if matches!(arg_evidence, ClosureArgEvidence::PythonProtocolParams(_))
         && !super::python_protocol_arg::imports_are_unaliased(dir, refs, bare, caches)
     {
-        return false;
+        return None;
     }
     // 変更対象ファイル内の定義が 1 つに特定できなければ曖昧なので保守的に blocking。
     let defs: Vec<&crate::models::reference::SymbolReference> = refs
@@ -600,7 +705,7 @@ pub(crate) fn is_modified_closed_in_diff(
         .collect();
     let target_def_count = target_defs.len();
     if target_def_count != 1 {
-        return false;
+        return None;
     }
     // 他ファイルの同名定義がある場合、Python メソッドでは全定義の名前位置がこの
     // diff の追加行にあることを証明できれば、呼び出し側の追随判定へ進む。
@@ -626,15 +731,15 @@ pub(crate) fn is_modified_closed_in_diff(
                 {
                     return false;
                 }
-                let Some(df) = diff_files.iter().find(|df| {
-                    df.new_path != "/dev/null" && diff_path_matches_ref(&df.new_path, &r.path, dir)
-                }) else {
+                let Some(df) = diff_files.find(&r.path) else {
                     return false;
                 };
                 caches
                     .changed_new_lines
                     .entry(df.new_path.clone())
-                    .or_insert_with(|| changed_new_lines_for_diff_file(dir, base, df))
+                    .or_insert_with(|| {
+                        std::rc::Rc::new(changed_new_lines_for_diff_file(dir, base, df))
+                    })
                     .contains(&r.line)
             });
     if has_foreign_defs
@@ -651,62 +756,48 @@ pub(crate) fn is_modified_closed_in_diff(
                 )
             ))
     {
-        return false;
+        return None;
     }
-    // import / use 宣言の参照は signature 変更に追随する必要がない (名前だけの import で、
-    // 通常は変更されず context 行に残る) ため除外し、実際の呼び出し参照のみを対象とする。
-    // 呼び出し参照が 1 件も無ければ (import のみ / 呼び出しが diff 外にある可能性) closed
-    // 扱いにせず blocking。
-    // 行頭テキスト判定 (ref_is_import_line) は複数行 grouped use ブロックの継続行
-    // (`    a, b, cmd_cochange, ...` のように `use ` で始まらない行) を拾えないため、
-    // AST ベースの import 行集合でも除外する。import/use 文内の参照は signature 変更に
-    // 追随する必要がない (api.mod 誤検出 2026-05-31: grouped use 継続行を未更新 caller と
-    // 誤判定して blocking していた問題への対応)。
-    // 2 つのキャッシュは detect_api_changes スコープで生成して全 modified シンボルで共有する。
-    // per-symbol の git diff サブプロセス起動と tree-sitter parse を unique file 単位に削減する。
-    let call_refs = collect_call_refs(refs, dir, bare, caches);
-    if call_refs.is_empty() {
-        return false;
+    Some(ClosureTarget {
+        bare,
+        target_lang,
+        python_method,
+        refs,
+        has_foreign_defs,
+        python_foreign_defs_updated,
+    })
+}
+
+/// 呼び出し参照 1 件が変更対象の定義への参照か、別の定義への参照かを決める。
+fn classify_reference_owner(
+    input: &ModifiedClosureInput<'_>,
+    target: &ClosureTarget<'_>,
+    r: &crate::models::reference::SymbolReference,
+    caches: &mut ApiClosureCaches,
+) -> ReferenceOwner {
+    let &ModifiedClosureInput {
+        dir,
+        name,
+        target_new_path,
+        ..
+    } = input;
+    // 他ファイルの同名定義がある場合: 変更対象ファイル以外の参照で、lexical scope が
+    // 同一ファイルの function_declaration に束縛されるものは対象 API と無関係な
+    // ローカル呼び出しなので除外する。解決失敗・property 位置・function 以外の
+    // binding は OtherOrAmbiguous = 除外せず diff の実変更行の確認に掛かる。
+    if target.has_foreign_defs
+        && !target.python_foreign_defs_updated
+        && !target.python_method
+        && !diff_path_matches_ref(target_new_path, &r.path, dir)
+        && resolve_ref_shadow_binding(dir, r, target.bare, caches)
+            == crate::commands::api_changes::js_ts_shadow::LocalResolution::SameFileFunction
+    {
+        return ReferenceOwner::Other;
     }
-    // 全ての呼び出し参照が、diff 内ファイルかつ実際の追加/変更行 (context 行ではない) にあるか。
-    // HunkInfo の new 範囲は context 行を含むため、git diff から実 `+` 行集合を取得して照合する
-    // (codex 指摘: context 行に古い呼び出しが入ると未更新 caller を誤って closed 判定してしまう)。
-    // shadow 除外で全参照が消えた場合は「対象 API の caller を 1 件も確認できていない」
-    // ため closed にしない (除外前の空チェックだけだと fail-open になる)。
-    let mut effective_call_refs = 0usize;
-    for r in &call_refs {
-        // 他ファイルの同名定義がある場合: 変更対象ファイル以外の参照で、lexical scope が
-        // 同一ファイルの function_declaration に束縛されるものは対象 API と無関係な
-        // ローカル呼び出しなので除外する。解決失敗・property 位置・function 以外の
-        // binding は OtherOrAmbiguous = 除外せず下の diff 実変更行チェックに掛かる。
-        if has_foreign_defs
-            && !python_foreign_defs_updated
-            && !python_method
-            && !diff_path_matches_ref(target_new_path, &r.path, dir)
-            && resolve_ref_shadow_binding(dir, r, bare, caches)
-                == crate::commands::api_changes::js_ts_shadow::LocalResolution::SameFileFunction
-        {
-            continue;
-        }
-        if target_lang == Some(crate::language::LangId::Python)
-            && kind == "function"
-            && name.contains('.')
-        {
-            use super::python_call_arity::MethodCallMatch;
-            if has_foreign_defs && !python_foreign_defs_updated {
-                match super::python_call_arity::method_reference_owner(
-                    dir,
-                    target_new_path,
-                    name,
-                    r,
-                    caches,
-                ) {
-                    MethodCallMatch::Target => {}
-                    MethodCallMatch::Other => continue,
-                    MethodCallMatch::Unknown => return false,
-                }
-            }
-            match super::python_call_arity::changed_method_call_matches_signature(
+    if target.python_method {
+        use super::python_call_arity::MethodCallMatch;
+        if target.has_foreign_defs && !target.python_foreign_defs_updated {
+            match super::python_call_arity::method_reference_owner(
                 dir,
                 target_new_path,
                 name,
@@ -714,93 +805,125 @@ pub(crate) fn is_modified_closed_in_diff(
                 caches,
             ) {
                 MethodCallMatch::Target => {}
-                MethodCallMatch::Other => continue,
-                MethodCallMatch::Unknown => return false,
+                MethodCallMatch::Other => return ReferenceOwner::Other,
+                MethodCallMatch::Unknown => return ReferenceOwner::Unknown,
             }
         }
-        effective_call_refs += 1;
-        if matches!(
-            target_lang,
-            Some(
-                crate::language::LangId::Javascript
-                    | crate::language::LangId::Typescript
-                    | crate::language::LangId::Tsx
-            )
-        ) && kind == "function"
-            && !name.contains('.')
-            && !super::js_ts_call_arity::changed_call_matches_signature(
-                dir,
-                target_new_path,
-                bare,
-                r,
-                caches,
-            )
-        {
-            return false;
-        }
-        if target_lang == Some(crate::language::LangId::Python)
-            && kind == "function"
-            && !name.contains('.')
-            && !super::python_call_arity::changed_top_level_call_matches_signature(
-                dir,
-                target_new_path,
-                bare,
-                r,
-                caches,
-            )
-        {
-            return false;
-        }
-        if let ClosureArgEvidence::PythonProtocolParams(proof) = &arg_evidence
-            && proof.closes_reference(dir, r, caches)
-        {
-            continue;
-        }
-        let Some(df) = diff_files.iter().find(|df| {
-            df.new_path != "/dev/null" && diff_path_matches_ref(&df.new_path, &r.path, dir)
-        }) else {
-            return false; // diff 外ファイルの参照 → 未更新 caller の可能性
-        };
-        let changed = caches
-            .changed_new_lines
-            .entry(df.new_path.clone())
-            .or_insert_with(|| changed_new_lines_for_diff_file(dir, base, df));
-        if !changed.contains(&r.line) {
-            // 複数行呼び出し (`startRecording({\n  fps,\n  cursor,\n})`) では識別子行は
-            // 未変更のまま実引数のプロパティ行だけが変わる。JS/TS/TSX で参照が call の
-            // callee を成す場合に限り、enclosing call_expression の行範囲まで広げて
-            // 実変更行との交差を確認する (交差しなければ従来どおり未更新 caller 扱い)。
-            let call_range = enclosing_call_line_range(dir, r, bare, caches);
-            let intersects = call_range.is_some_and(|(start, end)| {
-                let changed = caches.changed_new_lines.get(&df.new_path);
-                changed.is_some_and(|c| (start..=end).any(|line| c.contains(&line)))
-            });
-            if !intersects {
-                // 呼び出し式が完全に無変更でも、引数に渡している共有 const の定義側に
-                // 同一 diff で必須プロパティが追加されていれば追随済み
-                // (`buildX(SHARED_DEPS)` のまま SHARED_DEPS 側だけ更新されるパターン)。
-                let changed_lines = caches
-                    .changed_new_lines
-                    .get(&df.new_path)
-                    .cloned()
-                    .unwrap_or_default();
-                if !closed_via_local_const_argument(
-                    dir,
-                    r,
-                    bare,
-                    match &arg_evidence {
-                        ClosureArgEvidence::TsAddedRequiredProps(props) => Some(*props),
-                        _ => None,
-                    },
-                    &changed_lines,
-                    caches,
-                ) {
-                    return false; // context 行 (未変更) の参照 → 未更新 caller の可能性
-                }
-            }
+        match super::python_call_arity::changed_method_call_matches_signature(
+            dir,
+            target_new_path,
+            name,
+            r,
+            caches,
+        ) {
+            MethodCallMatch::Target => {}
+            MethodCallMatch::Other => return ReferenceOwner::Other,
+            MethodCallMatch::Unknown => return ReferenceOwner::Unknown,
         }
     }
-    effective_call_refs > 0
+    ReferenceOwner::Target
+}
+
+/// 変更対象への呼び出し参照 1 件が、同一 diff で追随済みだと証明できるか。
+///
+/// 証拠は次の順に見る。順序を変えると結果が変わる。
+/// 1. 引数が変更後の signature に合わなければ、変更行にあっても追随済みではない (JS/TS・Python)。
+/// 2. Python の Protocol 引数の証拠は diff 外の参照も閉じる (diff ファイルを探すより先)。
+/// 3. 参照のあるファイルが diff に無ければ未更新の可能性がある。
+/// 4. 参照行、または参照を callee とする複数行の呼び出しが実変更行にあれば追随済み。
+/// 5. 呼び出し式が無変更でも、引数の共有 const の定義側が同一 diff で更新されていれば追随済み。
+fn prove_reference_updated(
+    input: &ModifiedClosureInput<'_>,
+    target: &ClosureTarget<'_>,
+    r: &crate::models::reference::SymbolReference,
+    diff_files: &mut DiffFileLookup<'_>,
+    caches: &mut ApiClosureCaches,
+) -> bool {
+    let &ModifiedClosureInput {
+        dir,
+        name,
+        kind,
+        base,
+        target_new_path,
+        ref arg_evidence,
+        ..
+    } = input;
+    let bare = target.bare;
+    if matches!(
+        target.target_lang,
+        Some(
+            crate::language::LangId::Javascript
+                | crate::language::LangId::Typescript
+                | crate::language::LangId::Tsx
+        )
+    ) && kind == "function"
+        && !name.contains('.')
+        && !super::js_ts_call_arity::changed_call_matches_signature(
+            dir,
+            target_new_path,
+            bare,
+            r,
+            caches,
+        )
+    {
+        return false;
+    }
+    if target.target_lang == Some(crate::language::LangId::Python)
+        && kind == "function"
+        && !name.contains('.')
+        && !super::python_call_arity::changed_top_level_call_matches_signature(
+            dir,
+            target_new_path,
+            bare,
+            r,
+            caches,
+        )
+    {
+        return false;
+    }
+    if let ClosureArgEvidence::PythonProtocolParams(proof) = arg_evidence
+        && proof.closes_reference(dir, r, caches)
+    {
+        return true;
+    }
+    let Some(df) = diff_files.find(&r.path) else {
+        return false; // diff 外ファイルの参照 → 未更新 caller の可能性
+    };
+    // HunkInfo の new 範囲は context 行を含むため、git diff から実 `+` 行集合を取得して照合する
+    // (codex 指摘: context 行に古い呼び出しが入ると未更新 caller を誤って closed 判定してしまう)。
+    let changed = std::rc::Rc::clone(
+        caches
+            .changed_new_lines
+            .entry(df.new_path.clone())
+            .or_insert_with(|| std::rc::Rc::new(changed_new_lines_for_diff_file(dir, base, df))),
+    );
+    if changed.contains(&r.line) {
+        return true;
+    }
+    // 複数行呼び出し (`startRecording({\n  fps,\n  cursor,\n})`) では識別子行は
+    // 未変更のまま実引数のプロパティ行だけが変わる。JS/TS/TSX で参照が call の
+    // callee を成す場合に限り、enclosing call_expression の行範囲まで広げて
+    // 実変更行との交差を確認する (交差しなければ従来どおり未更新 caller 扱い)。
+    if enclosing_call_line_range(dir, r, bare, caches)
+        .is_some_and(|(start, end)| (start..=end).any(|line| changed.contains(&line)))
+    {
+        return true;
+    }
+    // 呼び出し式が完全に無変更でも、引数に渡している共有 const の定義側に
+    // 同一 diff で必須プロパティが追加されていれば追随済み
+    // (`buildX(SHARED_DEPS)` のまま SHARED_DEPS 側だけ更新されるパターン)。
+    // そうでなければ context 行 (未変更) の参照 → 未更新 caller の可能性。
+    closed_via_local_const_argument(
+        dir,
+        r,
+        bare,
+        match arg_evidence {
+            ClosureArgEvidence::TsAddedRequiredProps(props) => Some(*props),
+            _ => None,
+        },
+        &changed,
+        caches,
+    )
 }
 
 /// 参照ファイルを parse (キャッシュ) して shadow binding を解決する。
@@ -1179,8 +1302,9 @@ pub(crate) struct ApiClosureCaches {
     /// `import_statement_lines_for_ref` の (ref path → import 行集合) キャッシュ。
     pub(crate) import_lines: std::collections::HashMap<String, std::collections::HashSet<usize>>,
     /// `changed_new_lines_for_file` の (new_path → 実際に変更/追加された new 行集合) キャッシュ。
+    /// 呼び出し参照の証明の途中で他のキャッシュと同時に使うため、集合は共有で持つ。
     pub(crate) changed_new_lines:
-        std::collections::HashMap<String, std::collections::HashSet<usize>>,
+        std::collections::HashMap<String, std::rc::Rc<std::collections::HashSet<usize>>>,
     /// shadow binding 解決用の (ref path → parse 結果) キャッシュ。`None` = read/parse
     /// 失敗 (毎回再試行しない)。同名定義が複数ある modified シンボルが多数あっても、
     /// 参照ファイル単位で 1 回だけ parse する。

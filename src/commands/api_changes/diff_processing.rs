@@ -635,61 +635,23 @@ fn collect_modified_symbols(
                 lang_id: lang_id_for_file,
             };
             let mut sources = SignatureSourceCache::with_base_blobs(base_blobs);
-            match super::type_annotation::classify_type_annotation_change(&site, &mut sources) {
-                super::type_annotation::TypeAnnotationDetection::Unchanged => {
-                    state.buckets.unchanged_type_annotations.push(ApiSymbol {
-                        name: name.clone(),
-                        kind: kind.clone(),
-                        file: df.new_path.clone(),
-                        refs_internal: 0,
-                    });
-                    continue;
+            // signature が同じなので、型注釈と静的 container の段階だけを見る。
+            let decision = match type_annotation_decision(&site, &mut sources) {
+                Some(decision) => decision,
+                None => {
+                    static_const_decision(&site, &mut sources).unwrap_or(SignatureDecision::Omit)
                 }
-                super::type_annotation::TypeAnnotationDetection::AnnotationOnly => {
-                    state
-                        .buckets
-                        .type_annotation_changes
-                        .push(crate::models::review::TypeAnnotationChange {
-                        change: ApiSymbolChange {
-                            name: name.clone(),
-                            kind: kind.clone(),
-                            file: df.new_path.clone(),
-                            old_signature: Some(old_sig.to_string()),
-                            new_signature: Some(new_sig.clone()),
-                            no_resolved_internal_callers: false,
-                            contract_change: None,
-                        },
-                        reason:
-                            crate::models::review::TypeAnnotationChangeReason::TypeAnnotationOnly,
-                        compatibility:
-                            crate::models::review::TypeAnnotationCompatibility::Unverified,
-                    });
-                    continue;
-                }
-                super::type_annotation::TypeAnnotationDetection::NotApplicable => {}
-            }
-            match super::static_const::classify_static_const_change(&site, &mut sources) {
-                super::static_const::StaticConstChange::Unchanged => {
-                    state.buckets.unchanged_static_consts.push(ApiSymbol {
-                        name: name.clone(),
-                        kind: kind.clone(),
-                        file: df.new_path.clone(),
-                        refs_internal: 0,
-                    });
-                }
-                super::static_const::StaticConstChange::ValueOnly => {
-                    state.buckets.const_value_changes.push(ApiSymbolChange {
-                        name: name.clone(),
-                        kind: kind.clone(),
-                        file: df.new_path.clone(),
-                        old_signature: Some(old_sig.to_string()),
-                        new_signature: Some(new_sig.clone()),
-                        no_resolved_internal_callers: false,
-                        contract_change: None,
-                    });
-                }
-                super::static_const::StaticConstChange::NotApplicable => {}
-            }
+            };
+            let change = ApiSymbolChange {
+                name: name.clone(),
+                kind: kind.clone(),
+                file: df.new_path.clone(),
+                old_signature: Some(old_sig.to_string()),
+                new_signature: Some(new_sig.clone()),
+                no_resolved_internal_callers: false,
+                contract_change: None,
+            };
+            record_signature_decision(inputs, state, change, decision);
             continue;
         }
         if let Some(old_sig) = old_map.get(name.as_str())
@@ -807,6 +769,29 @@ fn collect_modified_symbols(
     }
 }
 
+/// シグネチャ変更 1 件の分類結果。判定 ([`decide_signature_change`]) と bucket への格納
+/// ([`record_signature_decision`]) を分け、格納を 1 か所にまとめる。
+enum SignatureDecision {
+    /// どの bucket にも出さない (同一ファイル内でしか使われていない変更)。
+    Omit,
+    /// 型注釈の表記だけが変わり、型は同じ (unchanged_type_annotations)。
+    UnchangedTypeAnnotation,
+    /// 型注釈だけの変更 (type_annotation_changes)。
+    TypeAnnotationOnly,
+    /// 値バインディングの値だけの変更 (const_value_changes)。
+    ConstValue,
+    /// 型注釈のない静的 container の整形だけの変更 (unchanged_static_consts)。
+    UnchangedStaticConst,
+    /// 呼び出し側を壊さない変更 (compatible_modified)。
+    Compatible(CompatibleApiModification),
+    /// 全 cross-file 参照が同一 diff で追随済み (modified_closed_in_diff)。
+    ClosedInDiff,
+    /// callback 本体だけの変更 (callback_body_changes)。
+    CallbackBodyOnly,
+    /// blocking な api.mod。型契約の種別を確定できたときだけ添える。
+    Blocking(Option<crate::models::review::ApiContractChange>),
+}
+
 /// シグネチャ変更を const_value / compatible_modified (React HOC / Object member 削除) /
 /// modified_closed_in_diff / modified のいずれかに分類する。
 pub(crate) fn classify_signature_change(
@@ -815,23 +800,35 @@ pub(crate) fn classify_signature_change(
     df: &crate::models::impact::DiffFile,
     site: SignatureChangeSite<'_>,
 ) {
+    let decision = decide_signature_change(inputs, state.closure_caches, df, &site);
+    record_signature_decision(inputs, state, site.change, decision);
+}
+
+/// 分類の段階を記述順に評価し、最初に確定した段階の結果を返す。段階の順序がそのまま
+/// 分類の優先順位になる (型契約の変更を互換判定や同一 diff での追随より先に確定させる等)。
+/// bucket は書き換えない (格納は [`record_signature_decision`] だけが行う)。
+fn decide_signature_change(
+    inputs: &DetectionInputs<'_>,
+    caches: &mut ApiClosureCaches,
+    df: &crate::models::impact::DiffFile,
+    site: &SignatureChangeSite<'_>,
+) -> SignatureDecision {
     let &DetectionInputs {
         dir,
         base,
-        diff_files,
         ref_index,
         base_blobs,
         ..
     } = inputs;
-    let SignatureChangeSite {
-        change,
+    let &SignatureChangeSite {
+        ref change,
         kind,
         old_sig,
         new_sig,
         lang_id: lang_id_for_file,
         internally_closed,
     } = site;
-    let name = change.name.clone();
+    let name = change.name.as_str();
     // 宣言名と違う公開名 (default export / 別名 export) の利用者は宣言名の参照に現れない。
     // 参照の集合から互換・追随済みを証明する判定 (JSX だけの利用、省略可能引数の削除、
     // 同一 diff での追随) はどれも使えない。
@@ -841,9 +838,9 @@ pub(crate) fn classify_signature_change(
             base_blobs,
             &df.old_path,
             &df.new_path,
-            state.closure_caches,
+            caches,
         )
-        .is_some_and(|names| names.may_differ(&name));
+        .is_some_and(|names| names.may_differ(name));
     // 以降の互換判定器はすべて同じ現場情報を見る。old/new ソースは最初に必要になった
     // 判定器で 1 度だけ取得して使い回す (旧実装は判定器ごとに git show を起動していた)。
     let site = CompatibleModSite {
@@ -851,186 +848,199 @@ pub(crate) fn classify_signature_change(
         base,
         old_path: &df.old_path,
         new_path: &df.new_path,
-        name: &name,
+        name,
         kind,
         old_sig,
         new_sig,
         lang_id: lang_id_for_file,
     };
-    let sources = &mut SignatureSourceCache::with_base_blobs(inputs.base_blobs);
-    match super::type_annotation::classify_type_annotation_change(&site, sources) {
-        super::type_annotation::TypeAnnotationDetection::Unchanged => {
-            state.buckets.unchanged_type_annotations.push(ApiSymbol {
-                name: change.name,
-                kind: change.kind,
-                file: change.file,
-                refs_internal: 0,
-            });
-            return;
-        }
-        super::type_annotation::TypeAnnotationDetection::AnnotationOnly => {
-            state.buckets.type_annotation_changes.push(
-                crate::models::review::TypeAnnotationChange {
-                    change,
-                    reason: crate::models::review::TypeAnnotationChangeReason::TypeAnnotationOnly,
-                    compatibility: crate::models::review::TypeAnnotationCompatibility::Unverified,
-                },
-            );
-            return;
-        }
-        super::type_annotation::TypeAnnotationDetection::NotApplicable => {}
+    let sources = &mut SignatureSourceCache::with_base_blobs(base_blobs);
+    if let Some(decision) = type_annotation_decision(&site, sources) {
+        return decision;
     }
     // 既存の値変更判定を優先し、直接 TS callable の型注釈は元ソースで照合する。
     if lang_id_for_file.is_some_and(|lid| is_const_value_only_change(old_sig, new_sig, kind, lid))
         && super::ts_signature::ts_const_value_header_guard(&site, sources)
     {
-        state.buckets.const_value_changes.push(change);
-        return;
+        return SignatureDecision::ConstValue;
     }
-    // 型注釈のない静的 container は、構造に加えて葉の値も比較して整形だけを除く。
-    match super::static_const::classify_static_const_change(&site, sources) {
+    if let Some(decision) = static_const_decision(&site, sources) {
+        return decision;
+    }
+    if let Some(decision) = python_contract_decision(&site, sources, internally_closed) {
+        return decision;
+    }
+    if let Some(compat) =
+        compatible_modification(ref_index, &site, sources, caches, public_name_differs)
+    {
+        return SignatureDecision::Compatible(compat);
+    }
+    closure_or_blocking_decision(inputs, caches, df, &site, sources, public_name_differs)
+}
+
+/// 型注釈だけの変更か。
+fn type_annotation_decision(
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache<'_>,
+) -> Option<SignatureDecision> {
+    match super::type_annotation::classify_type_annotation_change(site, sources) {
+        super::type_annotation::TypeAnnotationDetection::Unchanged => {
+            Some(SignatureDecision::UnchangedTypeAnnotation)
+        }
+        super::type_annotation::TypeAnnotationDetection::AnnotationOnly => {
+            Some(SignatureDecision::TypeAnnotationOnly)
+        }
+        super::type_annotation::TypeAnnotationDetection::NotApplicable => None,
+    }
+}
+
+/// 型注釈のない静的 container は、構造に加えて葉の値も比較して整形だけを除く。
+fn static_const_decision(
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache<'_>,
+) -> Option<SignatureDecision> {
+    match super::static_const::classify_static_const_change(site, sources) {
         super::static_const::StaticConstChange::Unchanged => {
-            state.buckets.unchanged_static_consts.push(ApiSymbol {
-                name: change.name,
-                kind: change.kind,
-                file: change.file,
-                refs_internal: 0,
-            });
-            return;
+            Some(SignatureDecision::UnchangedStaticConst)
         }
-        super::static_const::StaticConstChange::ValueOnly => {
-            state.buckets.const_value_changes.push(change);
-            return;
-        }
-        super::static_const::StaticConstChange::NotApplicable => {}
+        super::static_const::StaticConstChange::ValueOnly => Some(SignatureDecision::ConstValue),
+        super::static_const::StaticConstChange::NotApplicable => None,
     }
-    // Python の TypedDict で `total=` が絡む変更は blocking な api.mod に確定させる。
-    // 互換判定器や closed-in-diff 判定より**前**に置くのが要点で、「リポジトリ内の参照が
-    // 同一 diff で更新済み」でも降格させないため (外部リポジトリ / 動的生成された dict は
-    // 静的に追えない。Issue 2026-08-18-python-typeddict-contract-change-classification)。
-    //
-    // **種別を確定できなくても降格させない**。分類できないことは「破壊的でない」証明では
-    // ないため (`NotRequired` 同居で分類を諦めたケースでも bare フィールドの requiredness は
-    // 実際に反転する)。ラベル (`contract_change`) は確定したときだけ添える。
-    match detect_python_typed_dict_total_change(&site, sources) {
+}
+
+/// Python の TypedDict で `total=` が絡む変更は blocking な api.mod に確定させる。
+/// 互換判定器や closed-in-diff 判定より**前**に置くのが要点で、「リポジトリ内の参照が
+/// 同一 diff で更新済み」でも降格させないため (外部リポジトリ / 動的生成された dict は
+/// 静的に追えない。Issue 2026-08-18-python-typeddict-contract-change-classification)。
+///
+/// **種別を確定できなくても降格させない**。分類できないことは「破壊的でない」証明では
+/// ないため (`NotRequired` 同居で分類を諦めたケースでも bare フィールドの requiredness は
+/// 実際に反転する)。ラベル (`contract_change`) は確定したときだけ添える。
+///
+/// | 検出 | `internally_closed` | 結果 |
+/// |---|---|---|
+/// | `NotApplicable` | false | 次の段階へ |
+/// | `NotApplicable` | true | 出さない |
+/// | `PotentialBreakingChange` | false | blocking |
+/// | `PotentialBreakingChange` | true | 出さない |
+/// | `Classified` | どちらでも | 契約ラベル付きの blocking |
+fn python_contract_decision(
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache<'_>,
+    internally_closed: bool,
+) -> Option<SignatureDecision> {
+    match detect_python_typed_dict_total_change(site, sources) {
         // TypedDict の `total=` 変更だと**証明できなかった**ので、同一ファイル内でしか
-        // 使われていないシンボルは従来どおり api.mod に出さない (上の早期 continue の続き)。
+        // 使われていないシンボルは従来どおり api.mod に出さない (呼び出し元の早期除外の続き)。
         // 証明できないケースまで出すと、`class X(Base, total=False)` のような無関係な
         // Python class を新たに blocking にしてしまう。この早期除外そのものの是非は
         // 言語横断の既存ルールなので本 Issue では触らない。
         PythonContractDetection::NotApplicable => {
-            if internally_closed {
-                return;
-            }
+            internally_closed.then_some(SignatureDecision::Omit)
         }
         PythonContractDetection::PotentialBreakingChange if internally_closed => {
-            return;
+            Some(SignatureDecision::Omit)
         }
-        detection => {
-            let mut change = change;
-            if let PythonContractDetection::Classified(contract) = detection {
-                change.contract_change = Some(contract);
-            }
-            change.no_resolved_internal_callers =
-                has_no_resolved_internal_callers(ref_index, dir, &name, state.closure_caches);
-            state.buckets.modified.push(change);
-            return;
+        PythonContractDetection::PotentialBreakingChange => Some(SignatureDecision::Blocking(None)),
+        PythonContractDetection::Classified(contract) => {
+            Some(SignatureDecision::Blocking(Some(contract)))
         }
     }
+}
+
+/// 呼び出し側を壊さない変更を、互換判定器を記述順に試して最初に当てはまったもので返す。
+/// 同じ変更に複数の判定器が当てはまるときは先の判定器の reason を採るので、順序を変えない。
+fn compatible_modification(
+    ref_index: &ApiRefIndex,
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache<'_>,
+    caches: &mut ApiClosureCaches,
+    public_name_differs: bool,
+) -> Option<CompatibleApiModification> {
     // React component を memo / forwardRef 等の HOC でラップしただけは compatible_modified
     if !public_name_differs
-        && let Some(compat) =
-            detect_react_wrapper_compatible_mod(ref_index, &site, sources, state.closure_caches)
+        && let Some(compat) = detect_react_wrapper_compatible_mod(ref_index, site, sources, caches)
     {
-        state.buckets.compatible_modified.push(compat);
-        return;
+        return Some(compat);
     }
     // exported object の未参照プロパティ削除も compatible_modified
-    if let Some(compat) = detect_object_members_compatible_mod(&site, sources) {
-        state.buckets.compatible_modified.push(compat);
-        return;
+    if let Some(compat) = detect_object_members_compatible_mod(site, sources) {
+        return Some(compat);
     }
-    if let Some(compat) = detect_type_members_compatible_mod(&site, sources) {
-        state.buckets.compatible_modified.push(compat);
-        return;
+    if let Some(compat) = detect_type_members_compatible_mod(site, sources) {
+        return Some(compat);
     }
     // TS/TSX の関数末尾へ optional/default 引数を追加しただけなら、既存呼び出しの required
     // arity は変わらないため compatible_modified として扱う。
-    if let Some(compat) = detect_trailing_optional_params_compatible_mod(&site, sources) {
-        state.buckets.compatible_modified.push(compat);
-        return;
+    if let Some(compat) = detect_trailing_optional_params_compatible_mod(site, sources) {
+        return Some(compat);
     }
     if !public_name_differs
         && let Some(compat) = detect_trailing_optional_params_removed_compatible_mod(
             ref_index,
-            &site,
+            site,
             sources,
-            &mut state.closure_caches.optional_removal,
+            &mut caches.optional_removal,
         )
     {
-        state.buckets.compatible_modified.push(compat);
-        return;
+        return Some(compat);
     }
     // TS/TSX の引数 object type literal へ optional プロパティを追加しただけなら、
     // 既存呼び出しが渡す object はそのまま受理されるため compatible_modified として扱う。
-    if let Some(compat) = detect_optional_object_props_compatible_mod(&site, sources) {
-        state.buckets.compatible_modified.push(compat);
-        return;
+    if let Some(compat) = detect_optional_object_props_compatible_mod(site, sources) {
+        return Some(compat);
     }
     // 同一ファイル内で有限 literal union の値集合が old/new 同値と証明できる type alias
     // 変更は、表記・alias 経路だけの変更なので compatible_modified とする。
     // import 越し・循環・非 literal・集合差分ありは判定器が None に倒し blocking を維持する。
-    if let Some(compat) = detect_equivalent_literal_union_alias_compatible_mod(&site, sources) {
-        state.buckets.compatible_modified.push(compat);
-        return;
+    if let Some(compat) = detect_equivalent_literal_union_alias_compatible_mod(site, sources) {
+        return Some(compat);
     }
     // React Server Component の async 化 (async キーワード追加のみ + 全参照が JSX タグ利用)
     // は呼び出し側の書き換えが不要なため compatible_modified として扱う。
     if !public_name_differs
-        && let Some(compat) = detect_async_jsx_component_compatible_mod(
-            ref_index,
-            &site,
-            sources,
-            state.closure_caches,
-        )
+        && let Some(compat) =
+            detect_async_jsx_component_compatible_mod(ref_index, site, sources, caches)
     {
-        state.buckets.compatible_modified.push(compat);
-        return;
+        return Some(compat);
     }
     // 引数なし関数コンポーネントへ default 値の無い全 optional の destructured props を
     // 足しただけで、参照がすべて JSX タグ利用なら `<X />` はそのまま通るため
     // compatible_modified とする (default 値 / `?` 付きは trailing_optional_params が扱う)。
     if !public_name_differs
-        && let Some(compat) = detect_optional_props_jsx_component_compatible_mod(
-            ref_index,
-            &site,
-            sources,
-            state.closure_caches,
-        )
+        && let Some(compat) =
+            detect_optional_props_jsx_component_compatible_mod(ref_index, site, sources, caches)
     {
-        state.buckets.compatible_modified.push(compat);
-        return;
+        return Some(compat);
     }
     // Python のトップレベル関数 / モジュール直下クラスのメソッドへ末尾 optional/default
     // 引数 (`*` 後の kwonly+default 含む) を追加しただけなら、既存呼び出しが壊れないため
     // compatible_modified として扱う。
-    if let Some(compat) = detect_python_trailing_optional_params_compatible_mod(&site, sources) {
-        state.buckets.compatible_modified.push(compat);
-        return;
+    if let Some(compat) = detect_python_trailing_optional_params_compatible_mod(site, sources) {
+        return Some(compat);
     }
     // Python のデフォルト値・型注釈にある純粋な隣接文字列リテラルを分割・結合しただけで、
     // 正規化後のシグネチャ全体が同一なら compatible_modified とする。f-string、escape、
     // 演算子、異種 prefix 等を含む場合は判定器が None に倒し blocking を維持する。
-    if let Some(compat) = detect_python_implicit_string_concat_compatible_mod(&site, sources) {
-        state.buckets.compatible_modified.push(compat);
-        return;
-    }
+    detect_python_implicit_string_concat_compatible_mod(site, sources)
+}
+
+/// 全 cross-file 参照が同一 diff で追随済みなら informational、callback 本体だけの変更なら
+/// その分類、どちらでもなければ blocking な api.mod にする。
+fn closure_or_blocking_decision(
+    inputs: &DetectionInputs<'_>,
+    caches: &mut ApiClosureCaches,
+    df: &crate::models::impact::DiffFile,
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache<'_>,
+    public_name_differs: bool,
+) -> SignatureDecision {
     // object type literal 引数への必須プロパティ追加のみの変更なら、閉包判定へ追加証拠として
     // 渡す (呼び出し式が無変更でも共有 const の定義側が同一 diff で更新されていれば追随済み)。
     // 互換変更ではないので compatible_modified には入れず、あくまで closed 判定の入力。
-    let added_required_props = detect_added_required_object_props(&site, sources);
+    let added_required_props = detect_added_required_object_props(site, sources);
     let python_protocol =
-        super::python_protocol_arg::prepare_protocol_argument_change(&site, sources);
+        super::python_protocol_arg::prepare_protocol_argument_change(site, sources);
     let arg_evidence = match (&added_required_props, &python_protocol) {
         (Some(props), _) => super::ref_index::ClosureArgEvidence::TsAddedRequiredProps(props),
         (None, Some(proof)) => super::ref_index::ClosureArgEvidence::PythonProtocolParams(proof),
@@ -1039,34 +1049,86 @@ pub(crate) fn classify_signature_change(
     // 全 cross-file 参照が同一 diff 内で追随済みなら informational
     if is_modified_closed_in_diff(
         ModifiedClosureInput {
-            index: ref_index,
-            dir,
-            name: &name,
-            kind,
-            base,
+            index: inputs.ref_index,
+            dir: inputs.dir,
+            name: site.name,
+            kind: site.kind,
+            base: inputs.base,
             target_new_path: &df.new_path,
-            diff_files,
+            diff_files: inputs.diff_files,
             arg_evidence,
             public_name_differs,
         },
-        state.closure_caches,
+        caches,
     ) {
-        state.buckets.modified_closed_in_diff.push(change);
-    } else if detect_callback_body_only_change(&site, sources) {
-        state
-            .buckets
-            .callback_body_changes
-            .push(crate::models::review::CallbackBodyChange {
-                change,
-                reason: crate::models::review::CallbackBodyChangeReason::CallbackBodyChange,
-            });
+        SignatureDecision::ClosedInDiff
+    } else if detect_callback_body_only_change(site, sources) {
+        SignatureDecision::CallbackBodyOnly
     } else {
-        // blocking な api.mod にだけ「解決できた呼び出し参照ゼロ」フラグを添える。
-        // 分類も blocking 判定も変えず、トリアージが「呼び出し側を探す」段階を省けるようにする。
-        let mut change = change;
-        change.no_resolved_internal_callers =
-            has_no_resolved_internal_callers(ref_index, dir, &name, state.closure_caches);
-        state.buckets.modified.push(change);
+        SignatureDecision::Blocking(None)
+    }
+}
+
+/// 分類結果を対応する bucket へ格納する。bucket を書き換えるのはここだけ。
+fn record_signature_decision(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+    mut change: ApiSymbolChange,
+    decision: SignatureDecision,
+) {
+    let buckets = &mut *state.buckets;
+    match decision {
+        SignatureDecision::Omit => {}
+        SignatureDecision::UnchangedTypeAnnotation => {
+            buckets.unchanged_type_annotations.push(ApiSymbol {
+                name: change.name,
+                kind: change.kind,
+                file: change.file,
+                refs_internal: 0,
+            });
+        }
+        SignatureDecision::TypeAnnotationOnly => {
+            buckets
+                .type_annotation_changes
+                .push(crate::models::review::TypeAnnotationChange {
+                    change,
+                    reason: crate::models::review::TypeAnnotationChangeReason::TypeAnnotationOnly,
+                    compatibility: crate::models::review::TypeAnnotationCompatibility::Unverified,
+                });
+        }
+        SignatureDecision::ConstValue => buckets.const_value_changes.push(change),
+        SignatureDecision::UnchangedStaticConst => {
+            buckets.unchanged_static_consts.push(ApiSymbol {
+                name: change.name,
+                kind: change.kind,
+                file: change.file,
+                refs_internal: 0,
+            });
+        }
+        SignatureDecision::Compatible(compat) => buckets.compatible_modified.push(compat),
+        SignatureDecision::ClosedInDiff => buckets.modified_closed_in_diff.push(change),
+        SignatureDecision::CallbackBodyOnly => {
+            buckets
+                .callback_body_changes
+                .push(crate::models::review::CallbackBodyChange {
+                    change,
+                    reason: crate::models::review::CallbackBodyChangeReason::CallbackBodyChange,
+                });
+        }
+        SignatureDecision::Blocking(contract) => {
+            if let Some(contract) = contract {
+                change.contract_change = Some(contract);
+            }
+            // blocking な api.mod にだけ「解決できた呼び出し参照ゼロ」フラグを添える。
+            // 分類も blocking 判定も変えず、トリアージが「呼び出し側を探す」段階を省けるようにする。
+            change.no_resolved_internal_callers = has_no_resolved_internal_callers(
+                inputs.ref_index,
+                inputs.dir,
+                &change.name,
+                state.closure_caches,
+            );
+            buckets.modified.push(change);
+        }
     }
 }
 
