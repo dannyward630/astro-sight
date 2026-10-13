@@ -956,41 +956,45 @@ fn collect_identifiers(
     counts: &mut BindingCounts,
     record_attribute_writes: bool,
 ) {
-    match node.kind() {
-        // `t.TypedDict = Fake` / `del t.TypedDict` はローカル名を束縛しないが、
-        // module のメンバを差し替える。正規化した完全名を記録して
-        // qualified import の証明を無効化できるようにする。
-        "attribute" => {
-            if record_attribute_writes && let Some(path) = attribute_path(node, source) {
-                counts.attribute_writes.insert(path);
+    // 分解代入の入れ子は入力次第で深くなるため、再帰せず明示スタックで前順に辿る。
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            // `t.TypedDict = Fake` / `del t.TypedDict` はローカル名を束縛しないが、
+            // module のメンバを差し替える。正規化した完全名を記録して
+            // qualified import の証明を無効化できるようにする。
+            "attribute" => {
+                if record_attribute_writes && let Some(path) = attribute_path(node, source) {
+                    counts.attribute_writes.insert(path);
+                }
             }
-        }
-        // `d[k] = v` はローカル名を束縛しない。`globals()[...] = x` は call 側で検出済み。
-        "subscript" => {}
-        "identifier" => {
-            if let Some(text) = node_text(node, source) {
-                counts.add(text);
+            // `d[k] = v` はローカル名を束縛しない。`globals()[...] = x` は call 側で検出済み。
+            "subscript" => {}
+            "identifier" => {
+                if let Some(text) = node_text(node, source) {
+                    counts.add(text);
+                }
             }
-        }
-        "dotted_name" => {
-            // `import typing.abc` が束縛するのは先頭の `typing`。
-            // `from x import a` の `a` は 1 セグメントなので同じ扱いで足りる。
-            if let Some(first) = node.named_child(0)
-                && let Some(text) = node_text(first, source)
-            {
-                counts.add(text);
+            "dotted_name" => {
+                // `import typing.abc` が束縛するのは先頭の `typing`。
+                // `from x import a` の `a` は 1 セグメントなので同じ扱いで足りる。
+                if let Some(first) = node.named_child(0)
+                    && let Some(text) = node_text(first, source)
+                {
+                    counts.add(text);
+                }
             }
-        }
-        // `import X as Y` / `from m import X as Y` がローカルに束縛するのは alias だけ。
-        "aliased_import" => {
-            if let Some(alias) = node.child_by_field_name("alias") {
-                collect_identifiers(alias, source, counts, record_attribute_writes);
+            // `import X as Y` / `from m import X as Y` がローカルに束縛するのは alias だけ。
+            "aliased_import" => {
+                if let Some(alias) = node.child_by_field_name("alias") {
+                    stack.push(alias);
+                }
             }
-        }
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                collect_identifiers(child, source, counts, record_attribute_writes);
+            _ => {
+                let mut cursor = node.walk();
+                let start = stack.len();
+                stack.extend(node.named_children(&mut cursor));
+                stack[start..].reverse();
             }
         }
     }
@@ -999,20 +1003,28 @@ fn collect_identifiers(
 /// `attribute` ノードを空白・括弧に依存しない `a.b.c` 形式へ正規化する。
 /// 生テキストのまま比較すると `t . TypedDict = Fake` や `(t).TypedDict = Fake` を取りこぼす。
 pub(super) fn attribute_path(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "identifier" => node_text(node, source),
-        "attribute" => {
-            let object = node.child_by_field_name("object")?;
-            let attribute = node.child_by_field_name("attribute")?;
-            Some(format!(
-                "{}.{}",
-                attribute_path(object, source)?,
-                node_text(attribute, source)?
-            ))
+    // 属性の連鎖と括弧の入れ子は入力次第で深くなるため、再帰せずループで受け手側へ辿り、
+    // 外側から集めた属性名を最後に逆順で連結する。
+    let mut segments = Vec::new();
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" => {
+                segments.push(node_text(current, source)?);
+                break;
+            }
+            "attribute" => {
+                let object = current.child_by_field_name("object")?;
+                let attribute = current.child_by_field_name("attribute")?;
+                segments.push(node_text(attribute, source)?);
+                current = object;
+            }
+            "parenthesized_expression" => current = current.named_child(0)?,
+            _ => return None,
         }
-        "parenthesized_expression" => attribute_path(node.named_child(0)?, source),
-        _ => None,
     }
+    segments.reverse();
+    Some(segments.join("."))
 }
 
 /// module 直下の `class_definition` を集める。
@@ -2107,5 +2119,105 @@ mod tests {
             plain.total_flip_moves_any_field(),
             "透過 wrapper を剥がした先が組み込み型なら total の影響を証明できる"
         );
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn attribute_path_recursive(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+        match node.kind() {
+            "identifier" => node_text(node, source),
+            "attribute" => {
+                let object = node.child_by_field_name("object")?;
+                let attribute = node.child_by_field_name("attribute")?;
+                Some(format!(
+                    "{}.{}",
+                    attribute_path_recursive(object, source)?,
+                    node_text(attribute, source)?
+                ))
+            }
+            "parenthesized_expression" => attribute_path_recursive(node.named_child(0)?, source),
+            _ => None,
+        }
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn collect_identifiers_recursive(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        counts: &mut BindingCounts,
+        record_attribute_writes: bool,
+    ) {
+        match node.kind() {
+            "attribute" => {
+                if record_attribute_writes
+                    && let Some(path) = attribute_path_recursive(node, source)
+                {
+                    counts.attribute_writes.insert(path);
+                }
+            }
+            "subscript" => {}
+            "identifier" => {
+                if let Some(text) = node_text(node, source) {
+                    counts.add(text);
+                }
+            }
+            "dotted_name" => {
+                if let Some(first) = node.named_child(0)
+                    && let Some(text) = node_text(first, source)
+                {
+                    counts.add(text);
+                }
+            }
+            "aliased_import" => {
+                if let Some(alias) = node.child_by_field_name("alias") {
+                    collect_identifiers_recursive(alias, source, counts, record_attribute_writes);
+                }
+            }
+            _ => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    collect_identifiers_recursive(child, source, counts, record_attribute_writes);
+                }
+            }
+        }
+    }
+
+    /// ループ・明示スタック版が、浅い入力のすべての部分木で再帰版と同じ結果を返す。
+    #[test]
+    fn attribute_path_and_collect_identifiers_match_recursive_version() {
+        let src = "import typing.abc, os as o\nfrom m import (a, b as c)\n\
+                   t . TypedDict = Fake\n(t).x.y = 1\na, (b, [c, *d]) = pair\n\
+                   d[k] = v\nf().g = 1\ndel t.TypedDict, x\n((p.q)).r = s\n\
+                   match v:\n    case t.TypedDict(): pass\n    case [x, {\"k\": y}]: pass\n";
+        let tree = parser::parse_source(src.as_bytes(), LangId::Python).unwrap();
+        let mut paths = 0;
+        let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+            tree.root_node(),
+            crate::engine::tree_walk::Children::All,
+            |node, _| {
+                let expected = attribute_path_recursive(node, src.as_bytes());
+                assert_eq!(
+                    attribute_path(node, src.as_bytes()),
+                    expected,
+                    "{}",
+                    node.to_sexp()
+                );
+                paths += usize::from(expected.is_some_and(|path| path.contains('.')));
+                for record in [true, false] {
+                    let mut iterative = BindingCounts::default();
+                    let mut recursive = BindingCounts::default();
+                    collect_identifiers(node, src.as_bytes(), &mut iterative, record);
+                    collect_identifiers_recursive(node, src.as_bytes(), &mut recursive, record);
+                    assert_eq!(iterative.counts, recursive.counts, "{}", node.to_sexp());
+                    assert_eq!(
+                        iterative.attribute_writes,
+                        recursive.attribute_writes,
+                        "{}",
+                        node.to_sexp()
+                    );
+                }
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+            },
+        );
+        assert!(paths >= 5, "属性の連鎖を正規化する場合も比べる");
     }
 }

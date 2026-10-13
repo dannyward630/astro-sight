@@ -150,24 +150,55 @@ struct CallbackEvidence<'a> {
 
 /// 引数に直接置かれた関数と tagged template だけを辿る。
 /// object 引数は関数値だけを辿り、array、IIFE の callee、new/await は辿らない。
+///
+/// カリー化 (`f(a)(b)…`) と引数の中の呼び出しは入力次第でいくらでも深く入れ子になるため、
+/// 再帰せず明示スタックで辿る。callee の部分木を引数より先に、引数は左から順に処理する
+/// (再帰版と同じ順で `out` に積む)。
 fn callback_body_spans<'a>(value: Node<'a>, out: &mut CallbackEvidence<'a>) -> bool {
-    let value = unwrap_transparent_expression(value);
-    if value.kind() != "call_expression" {
-        return false;
+    enum Work<'a> {
+        /// 呼び出しなら callee と引数を辿る。呼び出しでなければ何もしない。
+        Call(Node<'a>),
+        /// 呼び出しの引数 1 つ。
+        Arg(Node<'a>),
     }
-    let Some(args) = value
-        .child_by_field_name("arguments")
-        .filter(|n| n.kind() == "arguments")
-    else {
-        return false; // 宣言の値そのものが tagged template なら対象外。
-    };
-    if let Some(callee) = value.child_by_field_name("function") {
+    /// 透過的な wrapper を剥がした呼び出しの引数リスト (tagged template は除く) と callee。
+    fn call_parts(value: Node<'_>) -> Option<(Node<'_>, Option<Node<'_>>)> {
+        let value = unwrap_transparent_expression(value);
+        if value.kind() != "call_expression" {
+            return None;
+        }
+        let args = value
+            .child_by_field_name("arguments")
+            .filter(|n| n.kind() == "arguments")?;
+        Some((args, value.child_by_field_name("function")))
+    }
+    fn push_call<'a>(args: Node<'a>, callee: Option<Node<'a>>, stack: &mut Vec<Work<'a>>) {
+        let mut cursor = args.walk();
+        let start = stack.len();
+        stack.extend(args.named_children(&mut cursor).map(Work::Arg));
+        stack[start..].reverse();
         // カリー化された呼び出しだけを辿り、関数そのものを実行する IIFE は省かない。
-        callback_body_spans(callee, out);
+        if let Some(callee) = callee {
+            stack.push(Work::Call(callee));
+        }
     }
-    let mut cursor = args.walk();
-    for arg in args.named_children(&mut cursor) {
-        let arg = unwrap_transparent_expression(arg);
+
+    // 宣言の値そのものが tagged template なら対象外。
+    let Some((args, callee)) = call_parts(value) else {
+        return false;
+    };
+    let mut stack = Vec::new();
+    push_call(args, callee, &mut stack);
+    while let Some(work) = stack.pop() {
+        let arg = match work {
+            Work::Call(node) => {
+                if let Some((args, callee)) = call_parts(node) {
+                    push_call(args, callee, &mut stack);
+                }
+                continue;
+            }
+            Work::Arg(arg) => unwrap_transparent_expression(arg),
+        };
         match arg.kind() {
             "arrow_function" | "function_expression" | "generator_function" => {
                 if let Some(body) = arg.child_by_field_name("body") {
@@ -178,9 +209,7 @@ fn callback_body_spans<'a>(value: Node<'a>, out: &mut CallbackEvidence<'a>) -> b
                 Some(template) if template.kind() == "template_string" => {
                     out.templates.push(template);
                 }
-                _ => {
-                    callback_body_spans(arg, out);
-                }
+                _ => stack.push(Work::Call(arg)),
             },
             "object" => object_callback_body_spans(arg, &mut out.bodies),
             _ => {}
@@ -639,5 +668,88 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn callback_body_spans_recursive<'a>(value: Node<'a>, out: &mut CallbackEvidence<'a>) -> bool {
+        let value = unwrap_transparent_expression(value);
+        if value.kind() != "call_expression" {
+            return false;
+        }
+        let Some(args) = value
+            .child_by_field_name("arguments")
+            .filter(|n| n.kind() == "arguments")
+        else {
+            return false;
+        };
+        if let Some(callee) = value.child_by_field_name("function") {
+            callback_body_spans_recursive(callee, out);
+        }
+        let mut cursor = args.walk();
+        for arg in args.named_children(&mut cursor) {
+            let arg = unwrap_transparent_expression(arg);
+            match arg.kind() {
+                "arrow_function" | "function_expression" | "generator_function" => {
+                    if let Some(body) = arg.child_by_field_name("body") {
+                        out.bodies.push((body.start_byte(), body.end_byte()));
+                    }
+                }
+                "call_expression" => match arg.child_by_field_name("arguments") {
+                    Some(template) if template.kind() == "template_string" => {
+                        out.templates.push(template);
+                    }
+                    _ => {
+                        callback_body_spans_recursive(arg, out);
+                    }
+                },
+                "object" => object_callback_body_spans(arg, &mut out.bodies),
+                _ => {}
+            }
+        }
+        true
+    }
+
+    /// 明示スタック版が、浅い入力で再帰版と同じ戻り値・同じ順の本体と template を返す。
+    #[test]
+    fn callback_body_spans_matches_recursive_version() {
+        for value in [
+            "wrap(async req => { return 1; })",
+            "wrap(wrap(req => 1))",
+            "factory(req => 1)(() => 2)",
+            "a(() => 1)(b(() => 2), q`x${y}`)(c => 3)",
+            "a(b(c(() => 1))(() => 2))(d(() => 3), e => 4)",
+            "view('totals').as(q`select ${name} from items`)",
+            "wrap({ fn: () => 1, nested: { g() { return 2; } } }, (() => 3))",
+            "(wrap as Handler)(() => 1)(<Fn>(() => 2))",
+            "wrap(inner(outer(() => 1)), () => 2, q`t`)",
+            "wrap(...args, function* () { yield 1; }, function named() {})",
+            "(() => wrap)()(() => 1)",
+            "q`select ${name}`",
+            "new Wrap(() => 1)",
+            "1",
+        ] {
+            let source = format!("export const handle = {value};");
+            let tree = parser::parse_source(source.as_bytes(), LangId::Typescript).unwrap();
+            let (declarator, _) =
+                unique_top_level_const(tree.root_node(), source.as_bytes(), "handle")
+                    .expect(&source);
+            let init = declarator.child_by_field_name("value").expect("value");
+            let mut iterative = CallbackEvidence::default();
+            let mut recursive = CallbackEvidence::default();
+            assert_eq!(
+                callback_body_spans(init, &mut iterative),
+                callback_body_spans_recursive(init, &mut recursive),
+                "{value}"
+            );
+            assert_eq!(iterative.bodies, recursive.bodies, "{value}");
+            let ids = |evidence: &CallbackEvidence<'_>| {
+                evidence
+                    .templates
+                    .iter()
+                    .map(|t| t.id())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(ids(&iterative), ids(&recursive), "{value}");
+        }
     }
 }

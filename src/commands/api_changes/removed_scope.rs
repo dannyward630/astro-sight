@@ -108,32 +108,35 @@ pub(super) fn python_independent_positions(root: Node<'_>, source: &[u8], name: 
 }
 
 /// tree-sitter に Load フラグは無いため、読み取りと確定できる親だけを許す。
-pub(super) fn python_is_load(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    let in_field = |field| {
-        parent
-            .child_by_field_name(field)
-            .is_some_and(|n| n.id() == node.id())
-    };
-    match parent.kind() {
-        "call" => in_field("function"),
-        "attribute" => in_field("object"),
-        "assignment" | "augmented_assignment" => in_field("right"),
-        "named_expression" | "keyword_argument" => in_field("value"),
-        "argument_list"
-        | "return_statement"
-        | "expression_statement"
-        | "binary_operator"
-        | "unary_operator"
-        | "boolean_operator"
-        | "comparison_operator"
-        | "not_operator"
-        | "conditional_expression" => true,
-        // tuple/list は代入先にも現れるため、親の読み取り位置まで辿る。
-        "parenthesized_expression" | "tuple" | "list" | "set" => python_is_load(parent),
-        _ => false,
+pub(super) fn python_is_load(mut node: Node<'_>) -> bool {
+    // 括弧・tuple の入れ子は入力次第で深くなるため、再帰せずループで親方向へ辿る。
+    loop {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        let in_field = |field| {
+            parent
+                .child_by_field_name(field)
+                .is_some_and(|n| n.id() == node.id())
+        };
+        match parent.kind() {
+            "call" => return in_field("function"),
+            "attribute" => return in_field("object"),
+            "assignment" | "augmented_assignment" => return in_field("right"),
+            "named_expression" | "keyword_argument" => return in_field("value"),
+            "argument_list"
+            | "return_statement"
+            | "expression_statement"
+            | "binary_operator"
+            | "unary_operator"
+            | "boolean_operator"
+            | "comparison_operator"
+            | "not_operator"
+            | "conditional_expression" => return true,
+            // tuple/list は代入先にも現れるため、親の読み取り位置まで辿る。
+            "parenthesized_expression" | "tuple" | "list" | "set" => node = parent,
+            _ => return false,
+        }
     }
 }
 
@@ -239,5 +242,74 @@ pub(super) fn module_key(path: &str) -> String {
             .into_owned()
     } else {
         path.with_extension("").to_string_lossy().into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn python_is_load_recursive(node: Node<'_>) -> bool {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        let in_field = |field| {
+            parent
+                .child_by_field_name(field)
+                .is_some_and(|n| n.id() == node.id())
+        };
+        match parent.kind() {
+            "call" => in_field("function"),
+            "attribute" => in_field("object"),
+            "assignment" | "augmented_assignment" => in_field("right"),
+            "named_expression" | "keyword_argument" => in_field("value"),
+            "argument_list"
+            | "return_statement"
+            | "expression_statement"
+            | "binary_operator"
+            | "unary_operator"
+            | "boolean_operator"
+            | "comparison_operator"
+            | "not_operator"
+            | "conditional_expression" => true,
+            "parenthesized_expression" | "tuple" | "list" | "set" => {
+                python_is_load_recursive(parent)
+            }
+            _ => false,
+        }
+    }
+
+    /// ループ版が、浅い入力のすべてのノードで再帰版と同じ判定を返す。
+    #[test]
+    fn python_is_load_matches_recursive_version() {
+        let src = "a, (b, [c]) = ((d), e)\nf((g, [h]))\nx = {i, (j)}\nk.l = (m)\nn += (o, p)\n\
+                   return_value = q if (r) else s\nfor t in (u, v): pass\ndel (w)\nprint(not (y))\n\
+                   z = [aa for bb in (cc)]\n";
+        let tree =
+            crate::engine::parser::parse_source(src.as_bytes(), crate::language::LangId::Python)
+                .unwrap();
+        let mut loads = 0;
+        let mut stores = 0;
+        let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+            tree.root_node(),
+            crate::engine::tree_walk::Children::All,
+            |node, _| {
+                let expected = python_is_load_recursive(node);
+                assert_eq!(python_is_load(node), expected, "{}", node.to_sexp());
+                if node.kind() == "identifier" {
+                    if expected {
+                        loads += 1;
+                    } else {
+                        stores += 1;
+                    }
+                }
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+            },
+        );
+        assert!(
+            loads >= 5 && stores >= 5,
+            "読み取りと書き込みの両方を比べる"
+        );
     }
 }

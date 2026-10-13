@@ -17,46 +17,59 @@ pub(crate) fn collect_pub_use_edges(
     current_module: &[String],
     edges: &mut Vec<RustPubUseEdge>,
 ) -> Option<()> {
-    match node.kind() {
-        "use_declaration" => {
-            if !rust_node_has_unrestricted_pub_visibility(node, source) {
-                return Some(());
+    use std::rc::Rc;
+
+    // 左の子から順に処理するため、子を逆順に積む。所属モジュールは同じ親の子どうしで共有する。
+    fn push_children<'tree>(
+        stack: &mut Vec<(tree_sitter::Node<'tree>, Rc<Vec<String>>)>,
+        node: tree_sitter::Node<'tree>,
+        module: &Rc<Vec<String>>,
+    ) {
+        let mut cursor = node.walk();
+        let start = stack.len();
+        stack.extend(
+            node.children(&mut cursor)
+                .map(|child| (child, Rc::clone(module))),
+        );
+        stack[start..].reverse();
+    }
+
+    // ファイル全体を辿るので、再帰せず明示スタックで前順に辿る。要素は (ノード, 所属モジュール)。
+    let mut stack = vec![(node, Rc::new(current_module.to_vec()))];
+    while let Some((node, current_module)) = stack.pop() {
+        match node.kind() {
+            "use_declaration" => {
+                if !rust_node_has_unrestricted_pub_visibility(node, source) {
+                    continue;
+                }
+                let argument = node.child_by_field_name("argument")?;
+                expand_rust_use_tree_edges_ast(
+                    argument,
+                    source,
+                    &[],
+                    &current_module,
+                    &current_module,
+                    None,
+                    edges,
+                )?;
             }
-            let argument = node.child_by_field_name("argument")?;
-            expand_rust_use_tree_edges_ast(
-                argument,
-                source,
-                &[],
-                current_module,
-                current_module,
-                None,
-                edges,
-            )?;
-        }
-        "mod_item" => {
-            // #[path = "..."] でファイル名と module 名がずれる場合、source_module の解決を保守的に
-            // 諦めて index 全体を None にする (codex Warning #3 対応、fail-closed)。
-            if rust_mod_item_has_path_attribute(node, source) {
-                return None;
+            "mod_item" => {
+                // #[path = "..."] でファイル名と module 名がずれる場合、source_module の解決を保守的に
+                // 諦めて index 全体を None にする (codex Warning #3 対応、fail-closed)。
+                if rust_mod_item_has_path_attribute(node, source) {
+                    return None;
+                }
+                let name = node
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(str::to_string);
+                let mut next_module = current_module.as_ref().clone();
+                if let Some(seg) = name {
+                    next_module.push(seg);
+                }
+                push_children(&mut stack, node, &Rc::new(next_module));
             }
-            let name = node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source).ok())
-                .map(str::to_string);
-            let mut next_module = current_module.to_vec();
-            if let Some(seg) = name {
-                next_module.push(seg);
-            }
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                collect_pub_use_edges(child, source, &next_module, edges)?;
-            }
-        }
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                collect_pub_use_edges(child, source, current_module, edges)?;
-            }
+            _ => push_children(&mut stack, node, &current_module),
         }
     }
     Some(())

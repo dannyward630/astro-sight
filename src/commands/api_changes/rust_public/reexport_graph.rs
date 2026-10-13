@@ -414,6 +414,9 @@ struct ModuleVisibilityCollector<'a, 'b> {
 }
 
 impl ModuleVisibilityCollector<'_, '_> {
+    /// `node` 配下の `mod` 宣言を前順に辿り、module 集合と pub な子の一覧を作る。
+    /// inline module の入れ子は入力次第で深くなるため、再帰せず明示スタックで辿る。
+    /// 要素は (ノード, 所属モジュール, 子 `mod name;` の解決基準 dir)。
     fn collect(
         &mut self,
         node: tree_sitter::Node<'_>,
@@ -421,67 +424,84 @@ impl ModuleVisibilityCollector<'_, '_> {
         current_segments: &[String],
         base_dir: &std::path::Path,
     ) -> Option<()> {
-        match node.kind() {
-            "mod_item" => {
-                if rust_mod_item_has_path_attribute(node, source_bytes) {
-                    return None;
-                }
-                let name = node
-                    .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(source_bytes).ok())
-                    .map(str::to_string)?;
-                let is_pub = rust_node_has_unrestricted_pub_visibility(node, source_bytes);
-                let mut child_segments = current_segments.to_vec();
-                child_segments.push(name.clone());
-                if is_pub {
-                    self.result
-                        .entry(current_segments.to_vec())
-                        .or_default()
-                        .push(name.clone());
-                }
-                self.result.entry(child_segments.clone()).or_default();
-                let mut has_inline_body = false;
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    if child.kind() == "declaration_list" {
-                        has_inline_body = true;
-                        let inline_base = base_dir.join(&name);
-                        let mut inner_cursor = child.walk();
-                        for inner in child.named_children(&mut inner_cursor) {
-                            self.collect(inner, source_bytes, &child_segments, &inline_base)?;
+        use std::path::PathBuf;
+        use std::rc::Rc;
+
+        let mut stack: Vec<(tree_sitter::Node<'_>, Rc<Vec<String>>, Rc<PathBuf>)> = vec![(
+            node,
+            Rc::new(current_segments.to_vec()),
+            Rc::new(base_dir.to_path_buf()),
+        )];
+        while let Some((node, current_segments, base_dir)) = stack.pop() {
+            let start = stack.len();
+            match node.kind() {
+                "mod_item" => {
+                    if rust_mod_item_has_path_attribute(node, source_bytes) {
+                        return None;
+                    }
+                    let name = node
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source_bytes).ok())
+                        .map(str::to_string)?;
+                    let is_pub = rust_node_has_unrestricted_pub_visibility(node, source_bytes);
+                    let mut child_segments = current_segments.as_ref().clone();
+                    child_segments.push(name.clone());
+                    if is_pub {
+                        self.result
+                            .entry(current_segments.as_ref().clone())
+                            .or_default()
+                            .push(name.clone());
+                    }
+                    self.result.entry(child_segments.clone()).or_default();
+                    let child_segments = Rc::new(child_segments);
+                    let mut has_inline_body = false;
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        if child.kind() == "declaration_list" {
+                            has_inline_body = true;
+                            let inline_base = Rc::new(base_dir.join(&name));
+                            let mut inner_cursor = child.walk();
+                            stack.extend(child.named_children(&mut inner_cursor).map(|inner| {
+                                (inner, Rc::clone(&child_segments), Rc::clone(&inline_base))
+                            }));
+                        }
+                    }
+                    if !has_inline_body {
+                        let as_mod = base_dir.join(&name).join("mod.rs");
+                        let as_file = base_dir.join(format!("{name}.rs"));
+                        let child_segments = child_segments.as_ref().clone();
+                        if read_rust_module_source(
+                            self.source,
+                            self.dir,
+                            &self.info.crate_root_rel,
+                            &as_mod,
+                        )
+                        .is_some()
+                        {
+                            self.frontier.push((child_segments, as_mod));
+                        } else if read_rust_module_source(
+                            self.source,
+                            self.dir,
+                            &self.info.crate_root_rel,
+                            &as_file,
+                        )
+                        .is_some()
+                        {
+                            self.frontier.push((child_segments, as_file));
                         }
                     }
                 }
-                if !has_inline_body {
-                    let as_mod = base_dir.join(&name).join("mod.rs");
-                    let as_file = base_dir.join(format!("{name}.rs"));
-                    if read_rust_module_source(
-                        self.source,
-                        self.dir,
-                        &self.info.crate_root_rel,
-                        &as_mod,
-                    )
-                    .is_some()
-                    {
-                        self.frontier.push((child_segments, as_mod));
-                    } else if read_rust_module_source(
-                        self.source,
-                        self.dir,
-                        &self.info.crate_root_rel,
-                        &as_file,
-                    )
-                    .is_some()
-                    {
-                        self.frontier.push((child_segments, as_file));
-                    }
+                _ => {
+                    let mut cursor = node.walk();
+                    stack.extend(
+                        node.named_children(&mut cursor).map(|child| {
+                            (child, Rc::clone(&current_segments), Rc::clone(&base_dir))
+                        }),
+                    );
                 }
             }
-            _ => {
-                let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
-                    self.collect(child, source_bytes, current_segments, base_dir)?;
-                }
-            }
+            // 左の子から順に処理するため、今回積んだ分を逆順にする。
+            stack[start..].reverse();
         }
         Some(())
     }
@@ -501,5 +521,352 @@ pub(crate) fn read_rs_blob(
             std::fs::read(abs).ok()
         }
         RustSourceTree::Base { blobs } => blobs.read(file.to_str()?),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl ModuleVisibilityCollector<'_, '_> {
+        /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+        fn collect_recursive(
+            &mut self,
+            node: tree_sitter::Node<'_>,
+            source_bytes: &[u8],
+            current_segments: &[String],
+            base_dir: &std::path::Path,
+        ) -> Option<()> {
+            match node.kind() {
+                "mod_item" => {
+                    if rust_mod_item_has_path_attribute(node, source_bytes) {
+                        return None;
+                    }
+                    let name = node
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source_bytes).ok())
+                        .map(str::to_string)?;
+                    let is_pub = rust_node_has_unrestricted_pub_visibility(node, source_bytes);
+                    let mut child_segments = current_segments.to_vec();
+                    child_segments.push(name.clone());
+                    if is_pub {
+                        self.result
+                            .entry(current_segments.to_vec())
+                            .or_default()
+                            .push(name.clone());
+                    }
+                    self.result.entry(child_segments.clone()).or_default();
+                    let mut has_inline_body = false;
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        if child.kind() == "declaration_list" {
+                            has_inline_body = true;
+                            let inline_base = base_dir.join(&name);
+                            let mut inner_cursor = child.walk();
+                            for inner in child.named_children(&mut inner_cursor) {
+                                self.collect_recursive(
+                                    inner,
+                                    source_bytes,
+                                    &child_segments,
+                                    &inline_base,
+                                )?;
+                            }
+                        }
+                    }
+                    if !has_inline_body {
+                        let as_mod = base_dir.join(&name).join("mod.rs");
+                        let as_file = base_dir.join(format!("{name}.rs"));
+                        if read_rust_module_source(
+                            self.source,
+                            self.dir,
+                            &self.info.crate_root_rel,
+                            &as_mod,
+                        )
+                        .is_some()
+                        {
+                            self.frontier.push((child_segments, as_mod));
+                        } else if read_rust_module_source(
+                            self.source,
+                            self.dir,
+                            &self.info.crate_root_rel,
+                            &as_file,
+                        )
+                        .is_some()
+                        {
+                            self.frontier.push((child_segments, as_file));
+                        }
+                    }
+                }
+                _ => {
+                    let mut cursor = node.walk();
+                    for child in node.named_children(&mut cursor) {
+                        self.collect_recursive(child, source_bytes, current_segments, base_dir)?;
+                    }
+                }
+            }
+            Some(())
+        }
+    }
+
+    type Collected = (
+        Option<()>,
+        Vec<(Vec<String>, Vec<String>)>,
+        Vec<(Vec<String>, std::path::PathBuf)>,
+    );
+
+    fn run_collector(dir: &str, source: &str, recursive: bool) -> Collected {
+        let info = RustPrivateModuleInfo {
+            crate_root_rel: std::path::PathBuf::new(),
+            src_root_rel: std::path::PathBuf::from("src"),
+            module_segments: Vec::new(),
+        };
+        let tree = parser::parse_source(source.as_bytes(), crate::language::LangId::Rust).unwrap();
+        let mut result = std::collections::HashMap::new();
+        let mut frontier = Vec::new();
+        let mut collector = ModuleVisibilityCollector {
+            source: RustSourceTree::Worktree,
+            dir,
+            info: &info,
+            result: &mut result,
+            frontier: &mut frontier,
+        };
+        let base = std::path::Path::new("");
+        let outcome = if recursive {
+            collector.collect_recursive(tree.root_node(), source.as_bytes(), &[], base)
+        } else {
+            collector.collect(tree.root_node(), source.as_bytes(), &[], base)
+        };
+        // HashMap の反復順は実行ごとに変わるので、キーで並べて比べる (値の Vec の順は保つ)。
+        let mut result: Vec<_> = result.into_iter().collect();
+        result.sort();
+        (outcome, result, frontier)
+    }
+
+    /// 明示スタック版が、浅い入力で再帰版と同じ module 集合・pub な子の並び・
+    /// 未解決の子ファイルの積み順を返す。`#[path]` で判定を諦める場合も一致する。
+    #[test]
+    fn module_visibility_collector_matches_recursive_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for file in [
+            "src/a.rs",
+            "src/b/mod.rs",
+            "src/inline/deeper/leaf.rs",
+            "src/inline/file_child.rs",
+        ] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let dir = root.to_str().unwrap();
+        let lib = "pub mod a;\nmod b;\npub mod inline {\n    pub mod deeper { pub mod leaf; mod hidden {} }\n\
+                   mod private_inline { pub mod x {} pub mod y {} }\n    pub mod file_child;\n}\n\
+                   mod missing;\nfn f() { mod in_fn { pub mod nested {} } }\npub(crate) mod restricted {}\n\
+                   pub mod z {}\n";
+        let iterative = run_collector(dir, lib, false);
+        assert_eq!(iterative, run_collector(dir, lib, true));
+        assert_eq!(iterative.0, Some(()));
+        assert!(
+            iterative.2.len() >= 4,
+            "子ファイルの解決も比べる: {:?}",
+            iterative.2
+        );
+
+        let with_path = "pub mod a;\npub mod inline {\n    #[path = \"x.rs\"]\n    mod p;\n}\n";
+        let iterative = run_collector(dir, with_path, false);
+        assert_eq!(iterative.0, None);
+        assert_eq!(iterative.0, run_collector(dir, with_path, true).0);
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn walk_for_inline_mod_containing_recursive(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        symbol_name: &str,
+        inside_inline_mod: bool,
+    ) -> bool {
+        let kind = node.kind();
+        if inside_inline_mod
+            && matches!(
+                kind,
+                "function_item"
+                    | "struct_item"
+                    | "enum_item"
+                    | "type_item"
+                    | "const_item"
+                    | "static_item"
+                    | "trait_item"
+                    | "mod_item"
+                    | "union_item"
+            )
+            && let Some(name_node) = node.child_by_field_name("name")
+            && name_node.utf8_text(source).map(str::trim) == Ok(symbol_name)
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            let next_inside = if kind == "mod_item" && child.kind() == "declaration_list" {
+                true
+            } else {
+                inside_inline_mod
+            };
+            if walk_for_inline_mod_containing_recursive(child, source, symbol_name, next_inside) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 明示スタック版が、浅い入力のすべての部分木・名前で再帰版と同じ判定を返す。
+    #[test]
+    fn walk_for_inline_mod_containing_matches_recursive_version() {
+        let src = "pub fn top() {}\nmod outer {\n    pub fn inner() {}\n    mod nested { struct Deep; }\n}\n\
+                   mod file_only;\nimpl X { fn method() {} }\nconst C: u8 = 0;\n";
+        let tree = parser::parse_source(src.as_bytes(), crate::language::LangId::Rust).unwrap();
+        let names = [
+            "top",
+            "inner",
+            "Deep",
+            "nested",
+            "outer",
+            "file_only",
+            "method",
+            "C",
+        ];
+        let mut found = 0;
+        let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+            tree.root_node(),
+            crate::engine::tree_walk::Children::All,
+            |node, _| {
+                for name in names {
+                    for inside in [false, true] {
+                        let expected = walk_for_inline_mod_containing_recursive(
+                            node,
+                            src.as_bytes(),
+                            name,
+                            inside,
+                        );
+                        assert_eq!(
+                            walk_for_inline_mod_containing(node, src.as_bytes(), name, inside),
+                            expected,
+                            "{name} inside={inside}: {}",
+                            node.to_sexp()
+                        );
+                        found += usize::from(expected);
+                    }
+                }
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+            },
+        );
+        assert!(found > 0);
+        assert!(walk_for_inline_mod_containing(
+            tree.root_node(),
+            src.as_bytes(),
+            "Deep",
+            false
+        ));
+        assert!(!walk_for_inline_mod_containing(
+            tree.root_node(),
+            src.as_bytes(),
+            "top",
+            false
+        ));
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn collect_pub_use_edges_recursive(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        current_module: &[String],
+        edges: &mut Vec<RustPubUseEdge>,
+    ) -> Option<()> {
+        match node.kind() {
+            "use_declaration" => {
+                if !rust_node_has_unrestricted_pub_visibility(node, source) {
+                    return Some(());
+                }
+                let argument = node.child_by_field_name("argument")?;
+                expand_rust_use_tree_edges_ast(
+                    argument,
+                    source,
+                    &[],
+                    current_module,
+                    current_module,
+                    None,
+                    edges,
+                )?;
+            }
+            "mod_item" => {
+                if rust_mod_item_has_path_attribute(node, source) {
+                    return None;
+                }
+                let name = node
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(str::to_string);
+                let mut next_module = current_module.to_vec();
+                if let Some(seg) = name {
+                    next_module.push(seg);
+                }
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    collect_pub_use_edges_recursive(child, source, &next_module, edges)?;
+                }
+            }
+            _ => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    collect_pub_use_edges_recursive(child, source, current_module, edges)?;
+                }
+            }
+        }
+        Some(())
+    }
+
+    /// 明示スタック版が、浅い入力で再帰版と同じ edge を同じ順に集め、判定不能
+    /// (`#[path]` / 解決できない `super::`) も同じく None を返す。
+    #[test]
+    fn collect_pub_use_edges_matches_recursive_version() {
+        let cases = [
+            "pub use a::b;\npub use crate::c::{d, e as f};\nuse private::g;\n\
+             pub mod m {\n    pub use super::h::*;\n    mod n { pub use self::i as j; pub(crate) use k::l; }\n}\n\
+             pub use m::n;\nfn body() { pub use inner::x; }\n",
+            "pub mod m {\n    #[path = \"x.rs\"]\n    mod p;\n    pub use q::r;\n}\n",
+            "pub use super::super::too_far;\n",
+        ];
+        for src in cases {
+            let tree = parser::parse_source(src.as_bytes(), crate::language::LangId::Rust).unwrap();
+            for module in [Vec::new(), vec!["base".to_string()]] {
+                let mut edges = Vec::new();
+                let mut edges_recursive = Vec::new();
+                let result =
+                    collect_pub_use_edges(tree.root_node(), src.as_bytes(), &module, &mut edges);
+                assert_eq!(
+                    result,
+                    collect_pub_use_edges_recursive(
+                        tree.root_node(),
+                        src.as_bytes(),
+                        &module,
+                        &mut edges_recursive
+                    ),
+                    "{src}"
+                );
+                if result.is_some() {
+                    assert_eq!(
+                        format!("{edges:?}"),
+                        format!("{edges_recursive:?}"),
+                        "{src}"
+                    );
+                }
+            }
+        }
+        let tree =
+            parser::parse_source(cases[0].as_bytes(), crate::language::LangId::Rust).unwrap();
+        let mut edges = Vec::new();
+        assert!(
+            collect_pub_use_edges(tree.root_node(), cases[0].as_bytes(), &[], &mut edges).is_some()
+        );
+        assert!(edges.len() >= 5, "{edges:?}");
     }
 }

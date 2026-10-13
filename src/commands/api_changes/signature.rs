@@ -611,50 +611,74 @@ fn pattern_has_non_static_element(pattern: tree_sitter::Node<'_>) -> bool {
 
 /// `node` (パターン) から束縛 `target` へ至る経路だけを残したパターン文字列を作る。
 /// 例: `{ a, b: { c } }` の `c` → `{ b: { c } }`、`[x, , y]` の `y` → `[, , y]`。
+///
+/// 分割代入の入れ子は入力次第で深くなるため、再帰せずループで `target` まで降りながら
+/// 経路の各段 (object のキー / 配列の添字) を記録し、最後に内側から外側へ組み立てる。
 fn binding_path_text(
     node: tree_sitter::Node<'_>,
     target: tree_sitter::Node<'_>,
     source: &[u8],
 ) -> Option<String> {
+    enum Step {
+        /// `{ key: <内側> }`
+        Pair(String),
+        /// `[` + 添字ぶんの `, ` + `<内側>]`
+        Index(usize),
+    }
     let text = |n: tree_sitter::Node<'_>| n.utf8_text(source).ok().map(str::to_string);
     let contains = |outer: tree_sitter::Node<'_>| {
         outer.start_byte() <= target.start_byte() && target.end_byte() <= outer.end_byte()
     };
-    if node.id() == target.id() {
-        return text(node);
-    }
-    let mut cursor = node.walk();
-    match node.kind() {
-        "object_pattern" => {
-            let child = node
-                .named_children(&mut cursor)
-                .find(|child| contains(*child))?;
-            match child.kind() {
-                "shorthand_property_identifier_pattern" => Some(format!("{{ {} }}", text(child)?)),
-                "pair_pattern" => {
-                    let key = text(child.child_by_field_name("key")?)?;
-                    let inner =
-                        binding_path_text(child.child_by_field_name("value")?, target, source)?;
-                    Some(format!("{{ {key}: {inner} }}"))
-                }
-                _ => None,
-            }
+    let mut steps = Vec::new();
+    let mut node = node;
+    let innermost = loop {
+        if node.id() == target.id() {
+            break text(node)?;
         }
-        "array_pattern" => {
-            // 添字 = 対象要素より前の `,` の数 (穴 `[, x]` も 1 要素として数える)。
-            let mut index = 0usize;
-            for child in node.children(&mut cursor) {
-                if child.kind() == "," {
-                    index += 1;
-                } else if child.is_named() && contains(child) {
-                    let inner = binding_path_text(child, target, source)?;
-                    return Some(format!("[{}{inner}]", ", ".repeat(index)));
+        let mut cursor = node.walk();
+        match node.kind() {
+            "object_pattern" => {
+                let child = node
+                    .named_children(&mut cursor)
+                    .find(|child| contains(*child))?;
+                match child.kind() {
+                    "shorthand_property_identifier_pattern" => {
+                        break format!("{{ {} }}", text(child)?);
+                    }
+                    "pair_pattern" => {
+                        steps.push(Step::Pair(text(child.child_by_field_name("key")?)?));
+                        node = child.child_by_field_name("value")?;
+                    }
+                    _ => return None,
                 }
             }
-            None
+            "array_pattern" => {
+                // 添字 = 対象要素より前の `,` の数 (穴 `[, x]` も 1 要素として数える)。
+                let mut index = 0usize;
+                let mut next = None;
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "," {
+                        index += 1;
+                    } else if child.is_named() && contains(child) {
+                        next = Some(child);
+                        break;
+                    }
+                }
+                steps.push(Step::Index(index));
+                node = next?;
+            }
+            _ => return None,
         }
-        _ => None,
-    }
+    };
+    Some(
+        steps
+            .into_iter()
+            .rev()
+            .fold(innermost, |inner, step| match step {
+                Step::Pair(key) => format!("{{ {key}: {inner} }}"),
+                Step::Index(index) => format!("[{}{inner}]", ", ".repeat(index)),
+            }),
+    )
 }
 
 #[derive(PartialEq, Eq)]
@@ -687,16 +711,21 @@ pub(crate) fn find_first_descendant_of_kinds<'a>(
     node: tree_sitter::Node<'a>,
     kinds: &[&str],
 ) -> Option<tree_sitter::Node<'a>> {
-    if kinds.contains(&node.kind()) {
-        return Some(node);
+    // 一致しなければ木全体を辿るので、再帰せず木の深さに依存しない前順の走査で辿る。
+    match crate::engine::tree_walk::walk_preorder(
+        node,
+        crate::engine::tree_walk::Children::Named,
+        |node, _| {
+            if kinds.contains(&node.kind()) {
+                std::ops::ControlFlow::Break(node)
+            } else {
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+            }
+        },
+    ) {
+        std::ops::ControlFlow::Break(found) => Some(found),
+        std::ops::ControlFlow::Continue(()) => None,
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_first_descendant_of_kinds(child, kinds) {
-            return Some(found);
-        }
-    }
-    None
 }
 
 /// value 手前で切った宣言テキストを正規化する。末尾に残る `=` と前後・連続空白を畳む。
@@ -927,23 +956,23 @@ pub(crate) const TAURI_INJECTED_TYPES: &[&str] = &[
 ];
 
 /// Rust の型ノードから base 名 (パス・参照・ジェネリクスを剥がした末尾型名) を取り出す。
-pub(crate) fn rust_type_base_name(ty: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    match ty.kind() {
-        "type_identifier" => ty.utf8_text(source).ok().map(str::to_string),
-        // tauri::AppHandle → name 子 'AppHandle'
-        "scoped_type_identifier" => ty
-            .child_by_field_name("name")
-            .and_then(|n| n.utf8_text(source).ok())
-            .map(str::to_string),
-        // State<'_, T> → base 'State'
-        "generic_type" => ty
-            .child_by_field_name("type")
-            .and_then(|t| rust_type_base_name(t, source)),
-        // &State<...> / &AppHandle → 内側の型
-        "reference_type" => ty
-            .child_by_field_name("type")
-            .and_then(|t| rust_type_base_name(t, source)),
-        _ => None,
+pub(crate) fn rust_type_base_name(mut ty: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    // `&&…T` の入れ子は入力次第で深くなるため、再帰せずループで内側の型へ辿る。
+    loop {
+        match ty.kind() {
+            "type_identifier" => return ty.utf8_text(source).ok().map(str::to_string),
+            // tauri::AppHandle → name 子 'AppHandle'
+            "scoped_type_identifier" => {
+                return ty
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(str::to_string);
+            }
+            // State<'_, T> → base 'State'
+            // &State<...> / &AppHandle → 内側の型
+            "generic_type" | "reference_type" => ty = ty.child_by_field_name("type")?,
+            _ => return None,
+        }
     }
 }
 
@@ -1194,6 +1223,179 @@ mod tests {
             let mut recursive = Vec::new();
             recursive_body_spans(value, source.as_bytes(), &mut recursive);
             assert_eq!(iterative, recursive, "{source}");
+        }
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn binding_path_text_recursive(
+        node: tree_sitter::Node<'_>,
+        target: tree_sitter::Node<'_>,
+        source: &[u8],
+    ) -> Option<String> {
+        let text = |n: tree_sitter::Node<'_>| n.utf8_text(source).ok().map(str::to_string);
+        let contains = |outer: tree_sitter::Node<'_>| {
+            outer.start_byte() <= target.start_byte() && target.end_byte() <= outer.end_byte()
+        };
+        if node.id() == target.id() {
+            return text(node);
+        }
+        let mut cursor = node.walk();
+        match node.kind() {
+            "object_pattern" => {
+                let child = node
+                    .named_children(&mut cursor)
+                    .find(|child| contains(*child))?;
+                match child.kind() {
+                    "shorthand_property_identifier_pattern" => {
+                        Some(format!("{{ {} }}", text(child)?))
+                    }
+                    "pair_pattern" => {
+                        let key = text(child.child_by_field_name("key")?)?;
+                        let inner = binding_path_text_recursive(
+                            child.child_by_field_name("value")?,
+                            target,
+                            source,
+                        )?;
+                        Some(format!("{{ {key}: {inner} }}"))
+                    }
+                    _ => None,
+                }
+            }
+            "array_pattern" => {
+                let mut index = 0usize;
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "," {
+                        index += 1;
+                    } else if child.is_named() && contains(child) {
+                        let inner = binding_path_text_recursive(child, target, source)?;
+                        return Some(format!("[{}{inner}]", ", ".repeat(index)));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// ループ版が、浅い分割代入のすべての (パターン, 対象) の組で再帰版と同じ文字列を返す。
+    #[test]
+    fn binding_path_text_matches_recursive_version() {
+        let src = "const { a, b: { c, d: [e, , f] }, g: [h, { i }] } = obj;\n\
+                   const [j, , [k, { l: m }], , n] = list;\nconst { o: p = 1, [q]: r, ...s } = x;\n";
+        let tree =
+            parser::parse_source(src.as_bytes(), crate::language::LangId::Typescript).unwrap();
+        let mut patterns = Vec::new();
+        let mut nodes = Vec::new();
+        let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+            tree.root_node(),
+            crate::engine::tree_walk::Children::All,
+            |node, _| {
+                if matches!(node.kind(), "object_pattern" | "array_pattern") {
+                    patterns.push(node);
+                }
+                nodes.push(node);
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+            },
+        );
+        let mut paths = 0;
+        for pattern in &patterns {
+            for target in &nodes {
+                let expected = binding_path_text_recursive(*pattern, *target, src.as_bytes());
+                assert_eq!(
+                    binding_path_text(*pattern, *target, src.as_bytes()),
+                    expected,
+                    "{} -> {}",
+                    pattern.to_sexp(),
+                    target.to_sexp()
+                );
+                paths += usize::from(expected.is_some());
+            }
+        }
+        assert!(paths > 20, "経路を作れる組も比べる: {paths}");
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn find_first_descendant_of_kinds_recursive<'a>(
+        node: tree_sitter::Node<'a>,
+        kinds: &[&str],
+    ) -> Option<tree_sitter::Node<'a>> {
+        if kinds.contains(&node.kind()) {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if let Some(found) = find_first_descendant_of_kinds_recursive(child, kinds) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn rust_type_base_name_recursive(ty: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+        match ty.kind() {
+            "type_identifier" => ty.utf8_text(source).ok().map(str::to_string),
+            "scoped_type_identifier" => ty
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(str::to_string),
+            "generic_type" | "reference_type" => ty
+                .child_by_field_name("type")
+                .and_then(|t| rust_type_base_name_recursive(t, source)),
+            _ => None,
+        }
+    }
+
+    /// 反復版の木の探索と型名の取り出しが、浅い入力のすべての部分木で再帰版と一致する。
+    #[test]
+    fn descendant_search_and_rust_type_base_name_match_recursive_version() {
+        let ts = "export const { a } = obj, b = 1;\nlet c;\nexport function f() { var d = () => { const e = 1; }; }\n";
+        let rust = "#[tauri::command]\nfn cmd(a: &&State<'_, T>, b: tauri::AppHandle, c: Vec<&mut X>, d: &[u8], e: (A, B), f: &mut Option<Y>) {}\n\
+                    pub const K: &'static str = \"\";\nstatic S: u8 = 0;\n";
+        for (src, lang, kind_sets) in [
+            (
+                ts,
+                crate::language::LangId::Typescript,
+                vec![
+                    vec!["lexical_declaration", "variable_declaration"],
+                    vec!["variable_declarator"],
+                    vec!["arrow_function", "statement_block"],
+                    vec!["missing"],
+                ],
+            ),
+            (
+                rust,
+                crate::language::LangId::Rust,
+                vec![
+                    vec!["const_item", "static_item"],
+                    vec!["parameter"],
+                    vec!["missing"],
+                ],
+            ),
+        ] {
+            let tree = parser::parse_source(src.as_bytes(), lang).unwrap();
+            let mut base_names = 0;
+            let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+                tree.root_node(),
+                crate::engine::tree_walk::Children::All,
+                |node, _| {
+                    for kinds in &kind_sets {
+                        assert_eq!(
+                            find_first_descendant_of_kinds(node, kinds).map(|n| n.id()),
+                            find_first_descendant_of_kinds_recursive(node, kinds).map(|n| n.id()),
+                            "{kinds:?}: {}",
+                            node.to_sexp()
+                        );
+                    }
+                    let expected = rust_type_base_name_recursive(node, src.as_bytes());
+                    assert_eq!(rust_type_base_name(node, src.as_bytes()), expected);
+                    base_names += usize::from(expected.is_some());
+                    std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+                },
+            );
+            if lang == crate::language::LangId::Rust {
+                assert!(base_names >= 6, "型名を取り出せる場合も比べる");
+            }
         }
     }
 }

@@ -543,17 +543,21 @@ pub(crate) fn walk_python_class_for_fields(
     class_name: &str,
     out: &mut std::collections::HashSet<String>,
 ) {
-    if node.kind() == "class_definition"
-        && let Some(name_node) = node.child_by_field_name("name")
-        && name_node.utf8_text(source).ok() == Some(class_name)
-        && let Some(body) = node.child_by_field_name("body")
-    {
-        collect_python_dataclass_fields(body, source, out);
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_python_class_for_fields(child, source, class_name, out);
-    }
+    // ファイル全体を辿るので、再帰せず木の深さに依存しない前順の走査で辿る。
+    let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+        node,
+        crate::engine::tree_walk::Children::All,
+        |node, _| {
+            if node.kind() == "class_definition"
+                && let Some(name_node) = node.child_by_field_name("name")
+                && name_node.utf8_text(source).ok() == Some(class_name)
+                && let Some(body) = node.child_by_field_name("body")
+            {
+                collect_python_dataclass_fields(body, source, out);
+            }
+            std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+        },
+    );
 }
 
 /// Python のクラス body 直下にある `name: type` 形式の宣言の左辺 identifier を集める。
@@ -642,4 +646,61 @@ pub(crate) fn detect_python_property_to_field(
     let old_tree = parser::parse_source(&old_source, crate::language::LangId::Python).ok()?;
     python_member_is_property(old_tree.root_node(), &old_source, qualname)
         .then(|| new_path.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn walk_python_class_for_fields_recursive(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        class_name: &str,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        if node.kind() == "class_definition"
+            && let Some(name_node) = node.child_by_field_name("name")
+            && name_node.utf8_text(source).ok() == Some(class_name)
+            && let Some(body) = node.child_by_field_name("body")
+        {
+            collect_python_dataclass_fields(body, source, out);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk_python_class_for_fields_recursive(child, source, class_name, out);
+        }
+    }
+
+    /// 反復版が、浅い入力で再帰版と同じフィールドを集める (入れ子のクラスも含む)。
+    #[test]
+    fn walk_python_class_for_fields_matches_recursive_version() {
+        let src = "class User:\n    name: str\n    age: int = 0\n    def f(self): pass\n\
+                   class Other:\n    x: int\n\
+                   def g():\n    class User:\n        inner: str\n\
+                   if True:\n    class User:\n        branch: bytes\n        class User:\n            deep: int\n";
+        let tree = parser::parse_source(src.as_bytes(), crate::language::LangId::Python).unwrap();
+        for class_name in ["User", "Other", "Missing"] {
+            let mut iterative = std::collections::HashSet::new();
+            let mut recursive = std::collections::HashSet::new();
+            walk_python_class_for_fields(
+                tree.root_node(),
+                src.as_bytes(),
+                class_name,
+                &mut iterative,
+            );
+            walk_python_class_for_fields_recursive(
+                tree.root_node(),
+                src.as_bytes(),
+                class_name,
+                &mut recursive,
+            );
+            assert_eq!(iterative, recursive, "{class_name}");
+        }
+        let mut user = std::collections::HashSet::new();
+        walk_python_class_for_fields(tree.root_node(), src.as_bytes(), "User", &mut user);
+        let mut user: Vec<_> = user.into_iter().collect();
+        user.sort();
+        assert_eq!(user, ["age", "branch", "deep", "inner", "name"]);
+    }
 }

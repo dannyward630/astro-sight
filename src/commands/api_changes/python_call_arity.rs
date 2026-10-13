@@ -204,17 +204,25 @@ fn has_other_root_binding(
         .any(|id| *id != except.id())
 }
 
-fn is_identifier_attribute_chain(node: Node<'_>) -> bool {
-    match node.kind() {
-        "identifier" => true,
-        "attribute" => {
-            node.child_by_field_name("attribute")
-                .is_some_and(|member| member.kind() == "identifier")
-                && node
-                    .child_by_field_name("object")
-                    .is_some_and(is_identifier_attribute_chain)
+fn is_identifier_attribute_chain(mut node: Node<'_>) -> bool {
+    // 属性の連鎖 (`a.b.c…`) は入力次第で長くなるため、再帰せずループで受け手側へ辿る。
+    loop {
+        match node.kind() {
+            "identifier" => return true,
+            "attribute" => {
+                if !node
+                    .child_by_field_name("attribute")
+                    .is_some_and(|member| member.kind() == "identifier")
+                {
+                    return false;
+                }
+                match node.child_by_field_name("object") {
+                    Some(object) => node = object,
+                    None => return false,
+                }
+            }
+            _ => return false,
         }
-        _ => false,
     }
 }
 
@@ -1514,5 +1522,49 @@ mod tests {
                 "{label}: {source}"
             );
         }
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn is_identifier_attribute_chain_recursive(node: Node<'_>) -> bool {
+        match node.kind() {
+            "identifier" => true,
+            "attribute" => {
+                node.child_by_field_name("attribute")
+                    .is_some_and(|member| member.kind() == "identifier")
+                    && node
+                        .child_by_field_name("object")
+                        .is_some_and(is_identifier_attribute_chain_recursive)
+            }
+            _ => false,
+        }
+    }
+
+    /// ループ版が、浅い入力のすべての部分木で再帰版と同じ判定を返す。
+    #[test]
+    fn is_identifier_attribute_chain_matches_recursive_version() {
+        let source = "a.b.c(1)\nf()(x).y.z\nd[0].e\n(g).h\npkg.mod.Class().method\nx = q.r\n";
+        let tree =
+            crate::engine::parser::parse_source(source.as_bytes(), crate::language::LangId::Python)
+                .unwrap();
+        let mut checked = 0;
+        let mut accepted = 0;
+        let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+            tree.root_node(),
+            crate::engine::tree_walk::Children::All,
+            |node, _| {
+                let expected = is_identifier_attribute_chain_recursive(node);
+                assert_eq!(
+                    is_identifier_attribute_chain(node),
+                    expected,
+                    "{}",
+                    node.to_sexp()
+                );
+                checked += 1;
+                accepted += usize::from(expected && node.kind() == "attribute");
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+            },
+        );
+        assert!(checked > 30);
+        assert!(accepted >= 3, "属性の連鎖を受理する場合も比べる");
     }
 }

@@ -314,31 +314,37 @@ fn independent_const(declarator: Node<'_>) -> bool {
         .is_some_and(independent_value)
 }
 
-fn independent_value(value: Node<'_>) -> bool {
-    match value.kind() {
-        "arrow_function"
-        | "function_expression"
-        | "function"
-        | "generator_function"
-        | "class"
-        | "number"
-        | "string"
-        | "true"
-        | "false"
-        | "null"
-        | "undefined"
-        | "regex" => true,
-        "template_string" => {
-            let mut cursor = value.walk();
-            !value
-                .named_children(&mut cursor)
-                .any(|child| child.kind() == "template_substitution")
+fn independent_value(mut value: Node<'_>) -> bool {
+    // 括弧・`as` などの入れ子は入力次第で深くなるため、再帰せずループで内側へ辿る。
+    loop {
+        match value.kind() {
+            "arrow_function"
+            | "function_expression"
+            | "function"
+            | "generator_function"
+            | "class"
+            | "number"
+            | "string"
+            | "true"
+            | "false"
+            | "null"
+            | "undefined"
+            | "regex" => return true,
+            "template_string" => {
+                let mut cursor = value.walk();
+                return !value
+                    .named_children(&mut cursor)
+                    .any(|child| child.kind() == "template_substitution");
+            }
+            "parenthesized_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "non_null_expression" => match value.named_child(0) {
+                Some(inner) => value = inner,
+                None => return false,
+            },
+            _ => return false,
         }
-        "parenthesized_expression"
-        | "as_expression"
-        | "satisfies_expression"
-        | "non_null_expression" => value.named_child(0).is_some_and(independent_value),
-        _ => false,
     }
 }
 
@@ -741,5 +747,62 @@ mod tests {
             got.iter().all(|(_, _, site)| site == "import:false"),
             "{got:?}"
         );
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn independent_value_recursive(value: Node<'_>) -> bool {
+        match value.kind() {
+            "arrow_function"
+            | "function_expression"
+            | "function"
+            | "generator_function"
+            | "class"
+            | "number"
+            | "string"
+            | "true"
+            | "false"
+            | "null"
+            | "undefined"
+            | "regex" => true,
+            "template_string" => {
+                let mut cursor = value.walk();
+                !value
+                    .named_children(&mut cursor)
+                    .any(|child| child.kind() == "template_substitution")
+            }
+            "parenthesized_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "non_null_expression" => value
+                .named_child(0)
+                .is_some_and(independent_value_recursive),
+            _ => false,
+        }
+    }
+
+    /// ループ版が、浅い入力の宣言のすべての部分木で再帰版と同じ判定を返す。
+    #[test]
+    fn independent_value_matches_recursive_version() {
+        let source = "const a = ((() => 1) as Fn)!;\nconst b = ((make()) satisfies T);\n\
+                      const c = (`x${y}`);\nconst d = ((`plain`));\nconst e = (((class {})));\n\
+                      const f = ((null)!);\nconst g = (obj.x as unknown as T);\nconst h = (/re/);\n";
+        let tree =
+            crate::engine::parser::parse_source(source.as_bytes(), LangId::Typescript).unwrap();
+        let mut checked = 0;
+        let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+            tree.root_node(),
+            crate::engine::tree_walk::Children::All,
+            |node, _| {
+                assert_eq!(
+                    independent_value(node),
+                    independent_value_recursive(node),
+                    "{}",
+                    node.to_sexp()
+                );
+                checked += 1;
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+            },
+        );
+        assert!(checked > 50);
     }
 }

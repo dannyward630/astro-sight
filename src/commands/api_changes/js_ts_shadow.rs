@@ -223,8 +223,26 @@ fn find_binding_in_subtree<'tree>(
     in_nested_block: bool,
     namespace: Namespace,
 ) -> Option<ScopeBinding<'tree>> {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
+    // ブロック・式の入れ子は入力次第でいくらでも深くなるため、再帰せず明示スタックで辿る。
+    // 要素は (調べる子, ネストした block の中か)。子は逆順に積み、左の子の部分木を調べ
+    // 終えてから右の子へ進む (再帰版と同じく、最初に見つかった束縛を返す)。
+    fn push_named_children<'tree>(
+        stack: &mut Vec<(Node<'tree>, bool)>,
+        node: Node<'tree>,
+        in_nested_block: bool,
+    ) {
+        let mut cursor = node.walk();
+        let start = stack.len();
+        stack.extend(
+            node.named_children(&mut cursor)
+                .map(|child| (child, in_nested_block)),
+        );
+        stack[start..].reverse();
+    }
+
+    let mut stack = Vec::new();
+    push_named_children(&mut stack, node, in_nested_block);
+    while let Some((child, in_nested_block)) = stack.pop() {
         match child.kind() {
             "function_declaration" | "generator_function_declaration" => {
                 if !in_nested_block
@@ -263,20 +281,13 @@ fn find_binding_in_subtree<'tree>(
             }
             // let / const は block scope: ネスト block 内の宣言は現 scope の binding でない。
             "lexical_declaration" => {
-                if !in_nested_block
-                    && let Some(found) =
-                        find_binding_in_subtree(child, source, name, false, namespace)
-                {
-                    return Some(found);
+                if !in_nested_block {
+                    push_named_children(&mut stack, child, false);
                 }
             }
             // var は関数 scope に hoist されるため、ネスト block 内でも拾う。
             "variable_declaration" => {
-                if let Some(found) =
-                    find_binding_in_subtree(child, source, name, in_nested_block, namespace)
-                {
-                    return Some(found);
-                }
+                push_named_children(&mut stack, child, in_nested_block);
             }
             "variable_declarator" => {
                 if namespace == Namespace::Value
@@ -292,10 +303,8 @@ fn find_binding_in_subtree<'tree>(
                 // 初期化子内はさらに探索 (ネスト scope は下で打ち切られる)。
                 if let Some(value) = child.child_by_field_name("value")
                     && !is_scope_node(value.kind())
-                    && let Some(found) =
-                        find_binding_in_subtree(value, source, name, in_nested_block, namespace)
                 {
-                    return Some(found);
+                    push_named_children(&mut stack, value, in_nested_block);
                 }
             }
             "import_statement" => {
@@ -332,10 +341,7 @@ fn find_binding_in_subtree<'tree>(
                 // nested block 扱いに切り替え、以降は var 由来の binding だけを拾う。
                 let nested =
                     in_nested_block || matches!(child.kind(), "statement_block" | "switch_body");
-                if let Some(found) = find_binding_in_subtree(child, source, name, nested, namespace)
-                {
-                    return Some(found);
-                }
+                push_named_children(&mut stack, child, nested);
             }
         }
     }
@@ -404,31 +410,43 @@ pub(crate) fn visit_import_bindings(
     source: &[u8],
     mut visit: impl FnMut(&str) -> bool,
 ) -> bool {
-    fn walk(node: Node<'_>, source: &[u8], visit: &mut impl FnMut(&str) -> bool) -> bool {
-        match node.kind() {
-            "import_specifier" => {
-                // alias があれば alias がローカル名、なければ name がローカル名。
-                let local = node
-                    .child_by_field_name("alias")
-                    .or_else(|| node.child_by_field_name("name"));
-                local
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .is_some_and(&mut *visit)
-            }
-            "namespace_import" => {
-                let mut cursor = node.walk();
-                node.named_children(&mut cursor).any(|c| {
-                    c.kind() == "identifier" && c.utf8_text(source).ok().is_some_and(&mut *visit)
-                })
-            }
-            "identifier" => node.utf8_text(source).ok().is_some_and(&mut *visit),
-            "string" => false,
-            _ => {
-                let mut cursor = node.walk();
-                node.named_children(&mut cursor)
-                    .any(|c| walk(c, source, visit))
+    // import 節の構造自体は浅いが、構文エラーから回復した部分木は任意の深さになり得るため、
+    // 再帰せず明示スタックで前順に辿る (再帰版と同じ順で `visit` を呼ぶ)。
+    fn walk(root: Node<'_>, source: &[u8], visit: &mut impl FnMut(&str) -> bool) -> bool {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let found = match node.kind() {
+                "import_specifier" => {
+                    // alias があれば alias がローカル名、なければ name がローカル名。
+                    let local = node
+                        .child_by_field_name("alias")
+                        .or_else(|| node.child_by_field_name("name"));
+                    local
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .is_some_and(&mut *visit)
+                }
+                "namespace_import" => {
+                    let mut cursor = node.walk();
+                    node.named_children(&mut cursor).any(|c| {
+                        c.kind() == "identifier"
+                            && c.utf8_text(source).ok().is_some_and(&mut *visit)
+                    })
+                }
+                "identifier" => node.utf8_text(source).ok().is_some_and(&mut *visit),
+                "string" => false,
+                _ => {
+                    let mut cursor = node.walk();
+                    let start = stack.len();
+                    stack.extend(node.named_children(&mut cursor));
+                    stack[start..].reverse();
+                    false
+                }
+            };
+            if found {
+                return true;
             }
         }
+        false
     }
     import_stmt
         .child_by_field_name("import")
@@ -614,5 +632,333 @@ mod tests {
             resolve_at(src, "startRecording", 5, 4),
             LocalResolution::OtherOrAmbiguous
         );
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn find_binding_in_subtree_recursive<'tree>(
+        node: Node<'tree>,
+        source: &[u8],
+        name: &str,
+        in_nested_block: bool,
+        namespace: Namespace,
+    ) -> Option<ScopeBinding<'tree>> {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            match child.kind() {
+                "function_declaration" | "generator_function_declaration" => {
+                    if !in_nested_block
+                        && namespace == Namespace::Value
+                        && declares_name(child, source, name)
+                    {
+                        return Some(ScopeBinding::FunctionDeclaration);
+                    }
+                }
+                "class_declaration" | "abstract_class_declaration" => {
+                    if !in_nested_block && declares_name(child, source, name) {
+                        return Some(ScopeBinding::ClassDeclaration);
+                    }
+                }
+                "interface_declaration" | "type_alias_declaration" => {
+                    if !in_nested_block
+                        && namespace == Namespace::Type
+                        && declares_name(child, source, name)
+                    {
+                        return Some(ScopeBinding::TypeDeclaration);
+                    }
+                }
+                "enum_declaration" => {
+                    if !in_nested_block && declares_name(child, source, name) {
+                        return Some(ScopeBinding::TypeDeclaration);
+                    }
+                }
+                "ambient_declaration" | "internal_module" | "module" => {
+                    if !in_nested_block && subtree_declares_name(child, source, name) {
+                        return Some(ScopeBinding::Other);
+                    }
+                }
+                "lexical_declaration" => {
+                    if !in_nested_block
+                        && let Some(found) =
+                            find_binding_in_subtree_recursive(child, source, name, false, namespace)
+                    {
+                        return Some(found);
+                    }
+                }
+                "variable_declaration" => {
+                    if let Some(found) = find_binding_in_subtree_recursive(
+                        child,
+                        source,
+                        name,
+                        in_nested_block,
+                        namespace,
+                    ) {
+                        return Some(found);
+                    }
+                }
+                "variable_declarator" => {
+                    if namespace == Namespace::Value
+                        && let Some(pat) = child.child_by_field_name("name")
+                        && pattern_binds_name(pat, source, name)
+                    {
+                        return Some(if pat.kind() == "identifier" {
+                            ScopeBinding::Variable(child)
+                        } else {
+                            ScopeBinding::Other
+                        });
+                    }
+                    if let Some(value) = child.child_by_field_name("value")
+                        && !is_scope_node(value.kind())
+                        && let Some(found) = find_binding_in_subtree_recursive(
+                            value,
+                            source,
+                            name,
+                            in_nested_block,
+                            namespace,
+                        )
+                    {
+                        return Some(found);
+                    }
+                }
+                "import_statement" => {
+                    if !in_nested_block && import_binds_name(child, source, name) {
+                        return Some(ScopeBinding::Import(child));
+                    }
+                }
+                _ => {
+                    if matches!(
+                        child.kind(),
+                        "function_expression"
+                            | "arrow_function"
+                            | "generator_function"
+                            | "method_definition"
+                            | "class_body"
+                    ) {
+                        continue;
+                    }
+                    if namespace == Namespace::Value
+                        && child.kind() == "for_in_statement"
+                        && child
+                            .child_by_field_name("kind")
+                            .is_some_and(|k| k.kind() == "var")
+                        && let Some(left) = child.child_by_field_name("left")
+                        && pattern_binds_name(left, source, name)
+                    {
+                        return Some(ScopeBinding::Other);
+                    }
+                    let nested = in_nested_block
+                        || matches!(child.kind(), "statement_block" | "switch_body");
+                    if let Some(found) =
+                        find_binding_in_subtree_recursive(child, source, name, nested, namespace)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn binding_key(binding: Option<ScopeBinding<'_>>) -> Option<(&'static str, Option<usize>)> {
+        binding.map(|binding| match binding {
+            ScopeBinding::FunctionDeclaration => ("function", None),
+            ScopeBinding::ClassDeclaration => ("class", None),
+            ScopeBinding::TypeDeclaration => ("type", None),
+            ScopeBinding::Variable(node) => ("variable", Some(node.id())),
+            ScopeBinding::Import(node) => ("import", Some(node.id())),
+            ScopeBinding::Other => ("other", None),
+        })
+    }
+
+    /// 明示スタック版が、浅い入力のすべての部分木・名前・名前空間・block の内外で、
+    /// 再帰版と同じ束縛 (同じ宣言ノード) を返す。同名の宣言が複数あるので、
+    /// 最初に見つかったものを返す順序まで比べることになる。
+    #[test]
+    fn find_binding_in_subtree_matches_recursive_version() {
+        let src = r#"import def, { a as alias, b } from "./m";
+import * as ns from "./ns";
+import type { T } from "./t";
+function f(p) { var hoisted = 1; if (p) { var b = 2; function inner() {} } }
+function* gen() {}
+class C { m() { const a = 1; } }
+abstract class Abs {}
+interface I { x: number }
+type T2 = string;
+enum E { A }
+declare const d: number;
+declare function decl(): void;
+namespace N { export const a = 1; }
+const { a: renamed, ...rest } = obj, [first, , third] = list;
+let x = cond ? obj.b : (() => { var t = 1; })();
+const w = { k: (function named() {})(), v: class {} };
+var y = 1;
+for (var a of items) { let b = a; }
+for (const b in items) {}
+switch (y) { case 1: var b = 2; let a = 3; }
+{ var a = 1; const f = 2; }
+if (y) { function f() {} } else { var C = 1; }
+try { var b = 1; } catch (a) { var x = 2; }
+"#;
+        let tree = parser::parse_source(src.as_bytes(), LangId::Typescript).unwrap();
+        let names = [
+            "a", "b", "f", "C", "Abs", "E", "I", "T", "T2", "x", "y", "ns", "def", "alias",
+            "renamed", "rest", "first", "third", "hoisted", "inner", "gen", "d", "decl", "N", "t",
+            "named", "k", "w", "missing",
+        ];
+        let mut checked = 0usize;
+        let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+            tree.root_node(),
+            crate::engine::tree_walk::Children::All,
+            |node, _| {
+                for name in names {
+                    for namespace in [Namespace::Value, Namespace::Type] {
+                        for nested in [false, true] {
+                            assert_eq!(
+                                binding_key(find_binding_in_subtree(
+                                    node,
+                                    src.as_bytes(),
+                                    name,
+                                    nested,
+                                    namespace
+                                )),
+                                binding_key(find_binding_in_subtree_recursive(
+                                    node,
+                                    src.as_bytes(),
+                                    name,
+                                    nested,
+                                    namespace
+                                )),
+                                "{name} {namespace:?} nested={nested}: {}",
+                                node.to_sexp()
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+            },
+        );
+        assert!(checked > 1000);
+        // 少なくとも一部は束縛を見つける (空振りの比較になっていない)。
+        let root = tree.root_node();
+        for (name, namespace, expected) in [
+            ("f", Namespace::Value, "function"),
+            ("C", Namespace::Value, "class"),
+            ("I", Namespace::Type, "type"),
+            ("alias", Namespace::Value, "import"),
+            ("renamed", Namespace::Value, "other"),
+            ("y", Namespace::Value, "variable"),
+        ] {
+            assert_eq!(
+                binding_key(find_binding_in_subtree(
+                    root,
+                    src.as_bytes(),
+                    name,
+                    false,
+                    namespace
+                ))
+                .map(|(kind, _)| kind),
+                Some(expected),
+                "{name}"
+            );
+        }
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn visit_import_bindings_recursive(
+        import_stmt: Node<'_>,
+        source: &[u8],
+        mut visit: impl FnMut(&str) -> bool,
+    ) -> bool {
+        fn walk(node: Node<'_>, source: &[u8], visit: &mut impl FnMut(&str) -> bool) -> bool {
+            match node.kind() {
+                "import_specifier" => {
+                    let local = node
+                        .child_by_field_name("alias")
+                        .or_else(|| node.child_by_field_name("name"));
+                    local
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .is_some_and(&mut *visit)
+                }
+                "namespace_import" => {
+                    let mut cursor = node.walk();
+                    node.named_children(&mut cursor).any(|c| {
+                        c.kind() == "identifier"
+                            && c.utf8_text(source).ok().is_some_and(&mut *visit)
+                    })
+                }
+                "identifier" => node.utf8_text(source).ok().is_some_and(&mut *visit),
+                "string" => false,
+                _ => {
+                    let mut cursor = node.walk();
+                    node.named_children(&mut cursor)
+                        .any(|c| walk(c, source, visit))
+                }
+            }
+        }
+        import_stmt
+            .child_by_field_name("import")
+            .map(|clause| walk(clause, source, &mut visit))
+            .unwrap_or_else(|| {
+                let mut cursor = import_stmt.walk();
+                import_stmt
+                    .named_children(&mut cursor)
+                    .filter(|c| c.kind() == "import_clause")
+                    .any(|c| walk(c, source, &mut visit))
+            })
+    }
+
+    /// 明示スタック版が、浅い入力の import 文で再帰版と同じ順に束縛を列挙し、
+    /// 同じ位置で走査を打ち切る。
+    #[test]
+    fn visit_import_bindings_matches_recursive_version() {
+        let src = r#"import def from "./a";
+import def2, { x, y as z, "s" as q } from "./b";
+import * as ns from "./c";
+import def3, * as ns2 from "./d";
+import type { T, U as V } from "./e";
+import "./side-effect";
+import { broken, from "./f";
+"#;
+        let tree = parser::parse_source(src.as_bytes(), LangId::Typescript).unwrap();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let statements: Vec<_> = root
+            .named_children(&mut cursor)
+            .filter(|n| n.kind() == "import_statement")
+            .collect();
+        assert!(statements.len() >= 6);
+        for statement in statements {
+            let mut all = Vec::new();
+            let mut all_recursive = Vec::new();
+            assert_eq!(
+                visit_import_bindings(statement, src.as_bytes(), |name| {
+                    all.push(name.to_string());
+                    false
+                }),
+                visit_import_bindings_recursive(statement, src.as_bytes(), |name| {
+                    all_recursive.push(name.to_string());
+                    false
+                })
+            );
+            assert_eq!(all, all_recursive, "{}", statement.to_sexp());
+            // k 件目で true を返したときに、同じ位置で打ち切る。
+            for stop in 0..all.len() {
+                let mut seen = Vec::new();
+                let mut seen_recursive = Vec::new();
+                assert!(visit_import_bindings(statement, src.as_bytes(), |name| {
+                    seen.push(name.to_string());
+                    seen.len() == stop + 1
+                }));
+                assert!(visit_import_bindings_recursive(
+                    statement,
+                    src.as_bytes(),
+                    |name| {
+                        seen_recursive.push(name.to_string());
+                        seen_recursive.len() == stop + 1
+                    }
+                ));
+                assert_eq!(seen, seen_recursive);
+            }
+        }
     }
 }

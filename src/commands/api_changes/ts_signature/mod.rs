@@ -340,19 +340,24 @@ pub(crate) fn node_field_name_eq(node: tree_sitter::Node, name: &str, source: &[
 }
 
 /// `node` の subtree を深さ優先で走査し最初の formal_parameters ノードを返す。
+/// 引数より前に深い式があれば木の深さぶん潜るため、再帰せず前順の走査で辿る。
 pub(crate) fn first_descendant_formal_parameters(
     node: tree_sitter::Node,
 ) -> Option<tree_sitter::Node> {
-    if node.kind() == "formal_parameters" {
-        return Some(node);
+    match crate::engine::tree_walk::walk_preorder(
+        node,
+        crate::engine::tree_walk::Children::Named,
+        |node, _| {
+            if node.kind() == "formal_parameters" {
+                std::ops::ControlFlow::Break(node)
+            } else {
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+            }
+        },
+    ) {
+        std::ops::ControlFlow::Break(found) => Some(found),
+        std::ops::ControlFlow::Continue(()) => None,
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = first_descendant_formal_parameters(child) {
-            return Some(found);
-        }
-    }
-    None
 }
 
 /// formal_parameters の第1引数の型注釈テキスト (whitespace 正規化済み) を返す。
@@ -1391,12 +1396,10 @@ fn ast_has_any_member_access_ref(
     source: &[u8],
     keys: &HashSet<&str>,
 ) -> bool {
-    if member_access_ref_key(node, source).is_some_and(|key| keys.contains(key)) {
-        return true;
-    }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|child| ast_has_any_member_access_ref(child, source, keys))
+    // ファイル全体を辿るので、再帰せず木の深さに依存しない前順の走査で辿る。
+    crate::engine::tree_walk::any_node(node, crate::engine::tree_walk::Children::Named, |node| {
+        member_access_ref_key(node, source).is_some_and(|key| keys.contains(key))
+    })
 }
 
 #[cfg(test)]
@@ -1784,5 +1787,84 @@ mod tests {
     fn literal_union_deep_parentheses_stop_at_depth_limit() {
         let nested = format!("type Category = {}\"x\"{};", "(".repeat(64), ")".repeat(64));
         assert!(literal_values(&nested, "Category").is_none());
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn first_descendant_formal_parameters_recursive(
+        node: tree_sitter::Node,
+    ) -> Option<tree_sitter::Node> {
+        if node.kind() == "formal_parameters" {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if let Some(found) = first_descendant_formal_parameters_recursive(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn ast_has_any_member_access_ref_recursive(
+        node: tree_sitter::Node,
+        source: &[u8],
+        keys: &HashSet<&str>,
+    ) -> bool {
+        if member_access_ref_key(node, source).is_some_and(|key| keys.contains(key)) {
+            return true;
+        }
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .any(|child| ast_has_any_member_access_ref_recursive(child, source, keys))
+    }
+
+    /// 反復版が、浅い入力のすべての部分木で再帰版と同じ formal_parameters と
+    /// メンバー参照の有無を返す。
+    #[test]
+    fn descendant_helpers_match_recursive_version() {
+        let src = "export const f = wrap([1, 2], (a: number, b = cfg.alpha) => a);\n\
+                   export function g(x: T) { return config[`beta`] + config['gamma'] + obj.delta; }\n\
+                   const h = { m(y) { return y.epsilon; } };\nclass K { n(z) {} }\n";
+        let tree = parser::parse_source(src.as_bytes(), LangId::Typescript).unwrap();
+        let key_sets: [&[&str]; 4] = [
+            &["alpha"],
+            &["beta", "gamma"],
+            &["delta", "epsilon", "missing"],
+            &["missing"],
+        ];
+        let mut params = 0;
+        let mut refs = 0;
+        let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+            tree.root_node(),
+            crate::engine::tree_walk::Children::All,
+            |node, _| {
+                let expected = first_descendant_formal_parameters_recursive(node).map(|n| n.id());
+                assert_eq!(
+                    first_descendant_formal_parameters(node).map(|n| n.id()),
+                    expected,
+                    "{}",
+                    node.to_sexp()
+                );
+                params += usize::from(expected.is_some());
+                for keys in key_sets {
+                    let keys: HashSet<&str> = keys.iter().copied().collect();
+                    let expected =
+                        ast_has_any_member_access_ref_recursive(node, src.as_bytes(), &keys);
+                    assert_eq!(
+                        ast_has_any_member_access_ref(node, src.as_bytes(), &keys),
+                        expected,
+                        "{keys:?}: {}",
+                        node.to_sexp()
+                    );
+                    refs += usize::from(expected);
+                }
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+            },
+        );
+        assert!(
+            params > 5 && refs > 5,
+            "見つかる場合も比べる: {params} {refs}"
+        );
     }
 }

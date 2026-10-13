@@ -335,46 +335,52 @@ pub(crate) fn rust_source_has_symbol_in_inline_mod(source: &[u8], symbol_name: &
     walk_for_inline_mod_containing(tree.root_node(), source, bare, false)
 }
 
-/// 再帰 walk: `inside_inline_mod=true` のスコープに symbol 定義があれば true。
-/// `mod_item` の body (declaration_list) に入ったら `inside_inline_mod=true` で再帰する。
+/// `inside_inline_mod=true` のスコープに symbol 定義があれば true。
+/// `mod_item` の body (declaration_list) に入ったら `inside_inline_mod=true` で潜る。
+///
+/// ファイル全体を辿るので、再帰せず明示スタックで前順に辿る (要素は (ノード, inline mod の
+/// 中か))。最初に見つかった定義で true を返す。
 pub(crate) fn walk_for_inline_mod_containing(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     symbol_name: &str,
     inside_inline_mod: bool,
 ) -> bool {
-    let kind = node.kind();
-    // 対象シンボル定義かを判定 (name field を持つ各種 item)
-    if inside_inline_mod
-        && matches!(
-            kind,
-            "function_item"
-                | "struct_item"
-                | "enum_item"
-                | "type_item"
-                | "const_item"
-                | "static_item"
-                | "trait_item"
-                | "mod_item"
-                | "union_item"
-        )
-        && let Some(name_node) = node.child_by_field_name("name")
-        && name_node.utf8_text(source).map(str::trim) == Ok(symbol_name)
-    {
-        return true;
-    }
-    // 子 node を再帰 walk。`mod_item` の declaration_list (body) に入ったら
-    // inside_inline_mod=true で潜る。`mod foo;` (宣言のみ) は body が無いので追加判定なし。
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        let next_inside = if kind == "mod_item" && child.kind() == "declaration_list" {
-            true
-        } else {
-            inside_inline_mod
-        };
-        if walk_for_inline_mod_containing(child, source, symbol_name, next_inside) {
+    let mut stack = vec![(node, inside_inline_mod)];
+    while let Some((node, inside_inline_mod)) = stack.pop() {
+        let kind = node.kind();
+        // 対象シンボル定義かを判定 (name field を持つ各種 item)
+        if inside_inline_mod
+            && matches!(
+                kind,
+                "function_item"
+                    | "struct_item"
+                    | "enum_item"
+                    | "type_item"
+                    | "const_item"
+                    | "static_item"
+                    | "trait_item"
+                    | "mod_item"
+                    | "union_item"
+            )
+            && let Some(name_node) = node.child_by_field_name("name")
+            && name_node.utf8_text(source).map(str::trim) == Ok(symbol_name)
+        {
             return true;
         }
+        // 子 node を walk。`mod_item` の declaration_list (body) に入ったら
+        // inside_inline_mod=true で潜る。`mod foo;` (宣言のみ) は body が無いので追加判定なし。
+        let mut cursor = node.walk();
+        let start = stack.len();
+        stack.extend(node.named_children(&mut cursor).map(|child| {
+            let next_inside = if kind == "mod_item" && child.kind() == "declaration_list" {
+                true
+            } else {
+                inside_inline_mod
+            };
+            (child, next_inside)
+        }));
+        stack[start..].reverse();
     }
     false
 }

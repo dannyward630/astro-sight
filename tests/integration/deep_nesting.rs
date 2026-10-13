@@ -613,3 +613,221 @@ fn api_signature_handles_deep_parenthesized_const() {
             .collect::<String>()
     );
 }
+
+/// `review --git` を実行し、正常終了したことを確かめて API 差分の分類 → 名前の一覧を返す。
+fn review_api_buckets(label: &str, repo: &TestRepo) -> serde_json::Map<String, serde_json::Value> {
+    let mut command = cargo_bin();
+    command.args(["review", "--git", "--dir"]).arg(repo.root());
+    let stdout = assert_finished(label, &run_bounded(command, None));
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("review JSON");
+    json["api_changes"]
+        .as_object()
+        .expect("api_changes")
+        .iter()
+        .filter_map(|(bucket, items)| {
+            let names: Vec<serde_json::Value> = items
+                .as_array()?
+                .iter()
+                .filter_map(|item| item.get("name").cloned())
+                .collect();
+            (!names.is_empty()).then(|| (bucket.clone(), serde_json::Value::Array(names)))
+        })
+        .collect()
+}
+
+fn in_bucket(
+    buckets: &serde_json::Map<String, serde_json::Value>,
+    bucket: &str,
+    name: &str,
+) -> bool {
+    buckets
+        .get(bucket)
+        .and_then(|names| names.as_array())
+        .is_some_and(|names| names.iter().any(|n| n == name))
+}
+
+/// API 差分で削除した Python 関数の残存参照の帰属 (参照ファイルの別名と属性の受け手の
+/// 収集) が、参照ファイルの深い式で落ちない。深い式の**後ろ**の受け手まで調べる:
+/// 無関係なモジュールの `re.search` だけなら removed_dead、削除モジュールを受け手にした
+/// `core.search` が残っていれば blocking な removed (対照)。
+#[test]
+fn api_removed_attribution_handles_deep_python_reference_file() {
+    for (tail, bucket) in [
+        (
+            "import re\ndef run(s):\n    return re.search('a', s)\n",
+            "removed_dead",
+        ),
+        (
+            "from pkg import core\ndef run(s):\n    return core.search(s)\n",
+            "removed",
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("pkg");
+        repo.write("pkg/__init__.py", "");
+        repo.write("pkg/core.py", "def search(q):\n    return q\n");
+        repo.write(
+            "app.py",
+            format!("DEEP = {}\n{tail}", nested("(", "1", ")", 50_000)),
+        );
+        repo.commit_all("init");
+        repo.remove_file("pkg/core.py");
+        let buckets = review_api_buckets(bucket, &repo);
+        assert!(
+            in_bucket(&buckets, bucket, "search"),
+            "{bucket}: {buckets:?}"
+        );
+    }
+}
+
+/// export した object から未参照のメンバーを消したときの参照確認 (参照ファイル全体の
+/// メンバー参照の走査) が、深い配列で落ちない。参照ファイルにキー名の文字列しか無ければ
+/// 互換な変更、深い配列の後ろで `config.beta` を読んでいれば blocking な api.mod (対照)。
+#[test]
+fn api_object_member_check_handles_deep_reference_file() {
+    for (tail, bucket) in [
+        ("\"beta\"", "compatible_modified"),
+        ("config.beta", "modified"),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write(
+            "config.ts",
+            "export const config = { alpha: 1, beta: 2 };\n",
+        );
+        repo.write(
+            "use.ts",
+            format!(
+                "import {{ config }} from './config';\nconst D = {};\nexport const a = [D, config.alpha, {tail}];\n",
+                nested("[", "1", "]", 50_000)
+            ),
+        );
+        repo.commit_all("init");
+        repo.write("config.ts", "export const config = { alpha: 1 };\n");
+        let buckets = review_api_buckets(bucket, &repo);
+        assert!(
+            in_bucket(&buckets, bucket, "config"),
+            "{bucket}: {buckets:?}"
+        );
+    }
+}
+
+/// Rust の公開面の判定 (`pub use` の収集と module の走査) が、crate root の深い式で落ちない。
+/// 深い式の後ろの `pub use api::found;` で再公開した関数の削除は blocking な removed、
+/// 再公開していなければ private module の中の削除なので API 差分に出さない (対照)。
+#[test]
+fn api_rust_reexport_graph_handles_deep_module_file() {
+    for (uses, removed) in [
+        ("pub use api::found;\npub use api::kept;\n", true),
+        ("pub use api::kept;\n", false),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write(
+            "src/lib.rs",
+            format!(
+                "mod api;\npub const DEEP: u32 = {};\n{uses}",
+                nested("(", "1", ")", 50_000)
+            ),
+        );
+        repo.write("src/api.rs", "pub fn found() {}\npub fn kept() {}\n");
+        repo.commit_all("init");
+        repo.write("src/api.rs", "pub fn kept() {}\n");
+        let buckets = review_api_buckets("rust", &repo);
+        assert_eq!(
+            in_bucket(&buckets, "removed", "found"),
+            removed,
+            "{buckets:?}"
+        );
+
+        let mut command = cargo_bin();
+        command
+            .args(["review", "--git", "--hook", "--dir"])
+            .arg(repo.root());
+        let output = run_bounded(command, None);
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(removed)),
+            "review --hook はシグナルで落ちずに判定を返す: {:?}",
+            output.status
+        );
+    }
+}
+
+/// 同一 diff で追随済みかの判定で、別ファイルの同名ローカル関数を見分ける処理 (字句スコープの
+/// 束縛の探索) が、深い初期化子で落ちない。深い初期化子の後ろの `function startRecording` に
+/// 束縛される呼び出しは対象外なので追随済み、`const` の束縛なら証明できず blocking (対照)。
+#[test]
+fn api_closure_shadow_resolution_handles_deep_initializer() {
+    for (local, bucket) in [
+        (
+            "function startRecording() { return D; }",
+            "modified_closed_in_diff",
+        ),
+        ("const startRecording = () => D;", "modified"),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write(
+            "lib.ts",
+            "export function startRecording(a: number) { return a; }\n",
+        );
+        repo.write(
+            "other.ts",
+            format!(
+                "const D = {};\n{local}\nexport function other() {{ return startRecording(); }}\n",
+                nested("(", "1", ")", 50_000)
+            ),
+        );
+        repo.write(
+            "caller.ts",
+            "import { startRecording } from './lib';\nexport function run() {\n  return startRecording(1);\n}\n",
+        );
+        repo.commit_all("init");
+        repo.write(
+            "lib.ts",
+            "export function startRecording(a: number, b: number) { return a + b; }\n",
+        );
+        repo.write(
+            "caller.ts",
+            "import { startRecording } from './lib';\nexport function run() {\n  return startRecording(1, 2);\n}\n",
+        );
+        let buckets = review_api_buckets(bucket, &repo);
+        assert!(
+            in_bucket(&buckets, bucket, "startRecording"),
+            "{bucket}: {buckets:?}"
+        );
+    }
+}
+
+/// bash の残存参照の帰属 (`source` するファイルのリテラル引数の収集) が、深いサブシェルで
+/// 落ちない。深いサブシェルの後ろで削除元を `source` していれば同名の自前定義があっても
+/// blocking な removed、`source` していなければ自前定義への参照なので removed_dead (対照)。
+#[test]
+fn api_bash_source_candidates_handle_deep_subshells() {
+    for (tail, bucket) in [("source ./lib.sh\n", "removed"), ("", "removed_dead")] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write("lib.sh", "helper() { echo hi; }\nother() { :; }\n");
+        repo.write(
+            "run.sh",
+            format!(
+                "#!/bin/bash\nhelper() {{ echo local; }}\nX=$({})\n{tail}helper\n",
+                nested("( ", "echo", " )", 50_000)
+            ),
+        );
+        repo.commit_all("init");
+        repo.write("lib.sh", "other() { :; }\n");
+        let buckets = review_api_buckets(bucket, &repo);
+        assert!(
+            in_bucket(&buckets, bucket, "helper"),
+            "{bucket}: {buckets:?}"
+        );
+    }
+}

@@ -482,26 +482,24 @@ fn collect_python_import_aliases(
     source: &[u8],
 ) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
-    fn walk(
-        node: tree_sitter::Node,
-        source: &[u8],
-        out: &mut std::collections::HashMap<String, String>,
-    ) {
-        if node.kind() == "aliased_import"
-            && let Some(name) = node.child_by_field_name("name")
-            && let Some(alias) = node.child_by_field_name("alias")
-            && let Ok(alias_text) = alias.utf8_text(source)
-            && let Ok(name_text) = name.utf8_text(source)
-        {
-            let module = name_text.rsplit('.').next().unwrap_or(name_text);
-            out.insert(alias_text.to_string(), module.to_string());
-        }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            walk(child, source, out);
-        }
-    }
-    walk(node, source, &mut out);
+    // ファイル全体を辿るので、再帰せず木の深さに依存しない前順の走査で辿る
+    // (同じ別名が複数あれば後の import が勝つ順序も再帰版と同じ)。
+    let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+        node,
+        crate::engine::tree_walk::Children::Named,
+        |node, _| {
+            if node.kind() == "aliased_import"
+                && let Some(name) = node.child_by_field_name("name")
+                && let Some(alias) = node.child_by_field_name("alias")
+                && let Ok(alias_text) = alias.utf8_text(source)
+                && let Ok(name_text) = name.utf8_text(source)
+            {
+                let module = name_text.rsplit('.').next().unwrap_or(name_text);
+                out.insert(alias_text.to_string(), module.to_string());
+            }
+            std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+        },
+    );
     out
 }
 
@@ -521,29 +519,37 @@ fn collect_python_attribute_receivers(
     import_only: &mut HashMap<String, bool>,
     out: &mut HashSet<String>,
 ) -> bool {
-    if matches!(node.kind(), "string" | "comment") {
-        return true;
-    }
-    if node.kind() == "identifier" && node.utf8_text(source).ok() == Some(symbol) {
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    use std::ops::ControlFlow;
+
+    // ファイル全体を辿るので、再帰せず木の深さに依存しない前順の走査で辿る。
+    // 証明できない出現を見つけた時点で打ち切る (再帰版の `all` と同じ)。
+    let walk = walk_preorder(node, Children::Named, |node, _| {
+        if matches!(node.kind(), "string" | "comment") {
+            return ControlFlow::Continue(Walk::Skip);
+        }
+        if node.kind() != "identifier" || node.utf8_text(source).ok() != Some(symbol) {
+            return ControlFlow::Continue(Walk::Descend);
+        }
         let Some(parent) = node.parent() else {
-            return false;
+            return ControlFlow::Break(());
         };
         // `OBJ.symbol` の attribute 位置のみ属性アクセスとして扱う。
         // `symbol.attr` の object 位置は bare identifier 参照。
         if parent.kind() != "attribute"
             || parent.child_by_field_name("attribute").map(|n| n.id()) != Some(node.id())
         {
-            return false;
+            return ControlFlow::Break(());
         }
         let Some(object) = parent.child_by_field_name("object") else {
-            return false;
+            return ControlFlow::Break(());
         };
         // 添字・呼び出し結果など識別子の連鎖でないレシーバは、モジュールを入れた値かもしれない。
         let Some(base) = python_receiver_base_identifier(object) else {
-            return false;
+            return ControlFlow::Break(());
         };
         let Ok(base_name) = base.utf8_text(source) else {
-            return false;
+            return ControlFlow::Break(());
         };
         let root = {
             let mut root = node;
@@ -556,31 +562,31 @@ fn collect_python_attribute_receivers(
             .entry(base_name.to_string())
             .or_insert_with(|| python_name_bound_only_by_import(root, source, base_name));
         if !bound_only_by_import {
-            return false;
+            return ControlFlow::Break(());
         }
         let Some(name) = python_receiver_effective_name(object, source, aliases) else {
-            return false;
+            return ControlFlow::Break(());
         };
         out.insert(name);
-        return true;
-    }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).all(|child| {
-        collect_python_attribute_receivers(child, source, symbol, aliases, import_only, out)
-    })
+        ControlFlow::Continue(Walk::Skip)
+    });
+    walk.is_continue()
 }
 
 /// レシーバの識別子の連鎖 (`re` / `pkg.core`) の先頭の識別子。連鎖でなければ None。
-fn python_receiver_base_identifier(object: tree_sitter::Node) -> Option<tree_sitter::Node> {
-    match object.kind() {
-        "identifier" => Some(object),
-        "attribute" => {
-            object
-                .child_by_field_name("attribute")
-                .filter(|member| member.kind() == "identifier")?;
-            python_receiver_base_identifier(object.child_by_field_name("object")?)
+fn python_receiver_base_identifier(mut object: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    // 属性の連鎖は入力次第で長くなるため、再帰せずループで受け手側へ辿る。
+    loop {
+        match object.kind() {
+            "identifier" => return Some(object),
+            "attribute" => {
+                object
+                    .child_by_field_name("attribute")
+                    .filter(|member| member.kind() == "identifier")?;
+                object = object.child_by_field_name("object")?;
+            }
+            _ => return None,
         }
-        _ => None,
     }
 }
 
@@ -750,21 +756,25 @@ fn collect_bash_literal_sources(
     ref_path: &str,
     out: &mut HashSet<String>,
 ) {
-    if node.kind() == "command" {
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        if let Some(name) = children.first().filter(|c| c.kind() == "command_name")
-            && matches!(name.utf8_text(source).ok(), Some("source") | Some("."))
-            && let Some(arg) = children.get(1)
-            && let Some(literal) = bash_literal_word(*arg, source)
-        {
-            add_bash_source_candidates(ref_path, &literal, out);
-        }
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_bash_literal_sources(child, source, ref_path, out);
-    }
+    // ファイル全体を辿るので、再帰せず木の深さに依存しない前順の走査で辿る。
+    let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+        node,
+        crate::engine::tree_walk::Children::All,
+        |node, _| {
+            if node.kind() == "command" {
+                let mut cursor = node.walk();
+                let children: Vec<_> = node.named_children(&mut cursor).collect();
+                if let Some(name) = children.first().filter(|c| c.kind() == "command_name")
+                    && matches!(name.utf8_text(source).ok(), Some("source") | Some("."))
+                    && let Some(arg) = children.get(1)
+                    && let Some(literal) = bash_literal_word(*arg, source)
+                {
+                    add_bash_source_candidates(ref_path, &literal, out);
+                }
+            }
+            std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+        },
+    );
 }
 
 /// bash の引数ノードが expansion を含まないリテラルであればテキストを返す。
@@ -1285,5 +1295,231 @@ mod tests {
                 .unwrap_or_else(|| panic!("証明に使えるはず: {source}"));
             assert!(receivers.contains(receiver), "{source}: {receivers:?}");
         }
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn collect_python_import_aliases_recursive(
+        node: tree_sitter::Node,
+        source: &[u8],
+    ) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        fn walk(
+            node: tree_sitter::Node,
+            source: &[u8],
+            out: &mut std::collections::HashMap<String, String>,
+        ) {
+            if node.kind() == "aliased_import"
+                && let Some(name) = node.child_by_field_name("name")
+                && let Some(alias) = node.child_by_field_name("alias")
+                && let Ok(alias_text) = alias.utf8_text(source)
+                && let Ok(name_text) = name.utf8_text(source)
+            {
+                let module = name_text.rsplit('.').next().unwrap_or(name_text);
+                out.insert(alias_text.to_string(), module.to_string());
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                walk(child, source, out);
+            }
+        }
+        walk(node, source, &mut out);
+        out
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn python_receiver_base_identifier_recursive(
+        object: tree_sitter::Node,
+    ) -> Option<tree_sitter::Node> {
+        match object.kind() {
+            "identifier" => Some(object),
+            "attribute" => {
+                object
+                    .child_by_field_name("attribute")
+                    .filter(|member| member.kind() == "identifier")?;
+                python_receiver_base_identifier_recursive(object.child_by_field_name("object")?)
+            }
+            _ => None,
+        }
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn collect_python_attribute_receivers_recursive(
+        node: tree_sitter::Node,
+        source: &[u8],
+        symbol: &str,
+        aliases: &std::collections::HashMap<String, String>,
+        import_only: &mut HashMap<String, bool>,
+        out: &mut HashSet<String>,
+    ) -> bool {
+        if matches!(node.kind(), "string" | "comment") {
+            return true;
+        }
+        if node.kind() == "identifier" && node.utf8_text(source).ok() == Some(symbol) {
+            let Some(parent) = node.parent() else {
+                return false;
+            };
+            if parent.kind() != "attribute"
+                || parent.child_by_field_name("attribute").map(|n| n.id()) != Some(node.id())
+            {
+                return false;
+            }
+            let Some(object) = parent.child_by_field_name("object") else {
+                return false;
+            };
+            let Some(base) = python_receiver_base_identifier_recursive(object) else {
+                return false;
+            };
+            let Ok(base_name) = base.utf8_text(source) else {
+                return false;
+            };
+            let root = {
+                let mut root = node;
+                while let Some(parent) = root.parent() {
+                    root = parent;
+                }
+                root
+            };
+            let bound_only_by_import = *import_only
+                .entry(base_name.to_string())
+                .or_insert_with(|| python_name_bound_only_by_import(root, source, base_name));
+            if !bound_only_by_import {
+                return false;
+            }
+            let Some(name) = python_receiver_effective_name(object, source, aliases) else {
+                return false;
+            };
+            out.insert(name);
+            return true;
+        }
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).all(|child| {
+            collect_python_attribute_receivers_recursive(
+                child,
+                source,
+                symbol,
+                aliases,
+                import_only,
+                out,
+            )
+        })
+    }
+
+    /// 反復版の Python の別名・レシーバの収集が、浅い入力で再帰版と同じ結果 (戻り値・
+    /// 集めたレシーバ・import だけの束縛の判定キャッシュ) を返す。
+    #[test]
+    fn python_attribute_helpers_match_recursive_version() {
+        let sources = [
+            "import pkg.core as c\nimport re\nfrom pkg import core as c2\nimport other as c\n\
+             re.search(x)\nc.search(y)\npkg.core.search(z)\nc2.search(1)\ns = 'search' # search\n",
+            "from m import search\nsearch()\n",
+            "import re\nx = re\nre.search(1)\n",
+            "import re\nBACKENDS['a'].search(q)\n",
+            "import re\nf().search(1)\nre.search.attr\n",
+            "def f():\n    import re as r\n    return r.search(1)\nclass K:\n    def g(self):\n        return self.search\n",
+            "import a.b.c as d\nd.search(1)\na.b.c.search(2)\n(a).search(3)\n",
+        ];
+        let mut accepted = 0;
+        for src in sources {
+            let tree = parser::parse_source(src.as_bytes(), LangId::Python).unwrap();
+            let root = tree.root_node();
+            let aliases = collect_python_import_aliases(root, src.as_bytes());
+            assert_eq!(
+                aliases,
+                collect_python_import_aliases_recursive(root, src.as_bytes()),
+                "{src}"
+            );
+            for symbol in ["search", "attr", "re", "core", "missing"] {
+                let mut import_only = HashMap::new();
+                let mut out = HashSet::new();
+                let mut import_only_recursive = HashMap::new();
+                let mut out_recursive = HashSet::new();
+                let result = collect_python_attribute_receivers(
+                    root,
+                    src.as_bytes(),
+                    symbol,
+                    &aliases,
+                    &mut import_only,
+                    &mut out,
+                );
+                assert_eq!(
+                    result,
+                    collect_python_attribute_receivers_recursive(
+                        root,
+                        src.as_bytes(),
+                        symbol,
+                        &aliases,
+                        &mut import_only_recursive,
+                        &mut out_recursive,
+                    ),
+                    "{symbol}: {src}"
+                );
+                assert_eq!(out, out_recursive, "{symbol}: {src}");
+                assert_eq!(import_only, import_only_recursive, "{symbol}: {src}");
+                accepted += usize::from(result && !out.is_empty());
+            }
+            let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+                root,
+                crate::engine::tree_walk::Children::All,
+                |node, _| {
+                    assert_eq!(
+                        python_receiver_base_identifier(node).map(|n| n.id()),
+                        python_receiver_base_identifier_recursive(node).map(|n| n.id()),
+                        "{}",
+                        node.to_sexp()
+                    );
+                    std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+                },
+            );
+        }
+        assert!(accepted >= 2, "属性アクセスだけと証明できる場合も比べる");
+    }
+
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    fn collect_bash_literal_sources_recursive(
+        node: tree_sitter::Node,
+        source: &[u8],
+        ref_path: &str,
+        out: &mut HashSet<String>,
+    ) {
+        if node.kind() == "command" {
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            if let Some(name) = children.first().filter(|c| c.kind() == "command_name")
+                && matches!(name.utf8_text(source).ok(), Some("source") | Some("."))
+                && let Some(arg) = children.get(1)
+                && let Some(literal) = bash_literal_word(*arg, source)
+            {
+                add_bash_source_candidates(ref_path, &literal, out);
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_bash_literal_sources_recursive(child, source, ref_path, out);
+        }
+    }
+
+    /// 反復版が、浅い入力で再帰版と同じ `source` の候補を集める。
+    #[test]
+    fn collect_bash_literal_sources_matches_recursive_version() {
+        let src = "source ./lib.sh\n. \"lib2.sh\"\nsource 'lib3.sh'\n\
+                   if true; then source lib4.sh; fi\nf() { . ../lib5.sh; }\n\
+                   source $VAR/lib6.sh\necho source x\n( source sub/lib7.sh )\n";
+        let tree = parser::parse_source(src.as_bytes(), LangId::Bash).unwrap();
+        let mut iterative = HashSet::new();
+        let mut recursive = HashSet::new();
+        collect_bash_literal_sources(
+            tree.root_node(),
+            src.as_bytes(),
+            "scripts/run.sh",
+            &mut iterative,
+        );
+        collect_bash_literal_sources_recursive(
+            tree.root_node(),
+            src.as_bytes(),
+            "scripts/run.sh",
+            &mut recursive,
+        );
+        assert_eq!(iterative, recursive);
+        assert!(iterative.len() >= 6, "{iterative:?}");
     }
 }
