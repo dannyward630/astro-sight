@@ -103,6 +103,91 @@ fn mcp_tools_call_symbols() {
     );
 }
 
+/// MCP の `lint` ツールは、テキストのパターンと tree-sitter のクエリの規則で一致を返す。
+/// 不正な severity はその要求だけをエラーにし、同じ接続の後続の要求は処理を続ける。
+/// 11 ツールのうち `lint` だけ MCP 経由の呼び出しを確かめるテストが無かった。
+#[test]
+fn mcp_tools_call_lint_reports_matches_and_rejects_invalid_severity() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "src/main.rs",
+        "fn helper() -> Option<u32> { Some(1) }\nfn main() { let v = helper().unwrap(); println!(\"{v}\"); }\n",
+    );
+    let lint_call = |id: u64, severity: &str| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "lint",
+                "arguments": {
+                    "path": "src/main.rs",
+                    "rules": [
+                        {
+                            "id": "no-unwrap",
+                            "language": "rust",
+                            "severity": severity,
+                            "message": "unwrap を使わない",
+                            "pattern": "unwrap"
+                        },
+                        {
+                            "id": "find-functions",
+                            "language": "rust",
+                            "severity": "info",
+                            "message": "関数",
+                            "query": "(function_item name: (identifier) @fn_name)"
+                        }
+                    ]
+                }
+            }
+        })
+        .to_string()
+    };
+    let valid = lint_call(2, "warning");
+    let invalid = lint_call(3, "fatal");
+    let after_error = lint_call(4, "error");
+    let stdout = mcp_send_after_init_with(
+        &[],
+        Some(repo.root()),
+        &[valid.as_str(), invalid.as_str(), after_error.as_str()],
+    );
+    let response = |id: u64| -> serde_json::Value {
+        let line = stdout
+            .lines()
+            .find(|line| line.contains(&format!("\"id\":{id}")))
+            .unwrap_or_else(|| panic!("id={id} の応答が必要: {stdout}"));
+        serde_json::from_str(line).expect("valid JSON-RPC")
+    };
+    let rule_ids = |json: &serde_json::Value| -> Vec<String> {
+        let text = json["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("text フィールドが必要: {json}"));
+        let result: serde_json::Value = serde_json::from_str(text).expect("lint の結果は JSON");
+        assert_eq!(result["lang"], "rust", "{result}");
+        let mut ids: Vec<String> = result["matches"]
+            .as_array()
+            .expect("matches 配列が必要")
+            .iter()
+            .map(|m| m["rule_id"].as_str().expect("rule_id").to_string())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    };
+
+    assert_eq!(rule_ids(&response(2)), ["find-functions", "no-unwrap"]);
+    let rejected = response(3);
+    let message = rejected["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("不正な severity はエラー応答: {rejected}"));
+    assert!(
+        message.contains("Invalid severity 'fatal'") && message.contains("no-unwrap"),
+        "{message}"
+    );
+    assert_eq!(rule_ids(&response(4)), ["find-functions", "no-unwrap"]);
+}
+
 #[test]
 fn mcp_tools_call_refs_search() {
     let request = serde_json::json!({
