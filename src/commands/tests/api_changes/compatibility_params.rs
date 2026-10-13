@@ -90,6 +90,55 @@ fn is_const_value_only_change_ts_untyped_scalar_is_true() {
     ));
 }
 
+/// 型注釈のない scalar は値から公開型が推論されるため、種類が変わる変更 (number → string 等) は
+/// 値だけの変更ではない。静的 container の葉 (`{ timeout: 30 }` → `{ timeout: "30s" }`) が
+/// blocking なのと揃え、トップレベルでも種類が同じときだけ const_value に降格する。
+#[test]
+fn is_const_value_only_change_ts_untyped_scalar_kind_change_stays_api_mod() {
+    for lang in [
+        crate::language::LangId::Javascript,
+        crate::language::LangId::Typescript,
+        crate::language::LangId::Tsx,
+    ] {
+        for (old, new) in [
+            ("30", "\"30s\""),
+            ("\"30\"", "30"),
+            ("true", "'yes'"),
+            ("null", "0"),
+            ("1", "1n"),
+            ("undefined", "null"),
+        ] {
+            assert!(
+                !is_const_value_only_change(
+                    &format!("export const TIMEOUT = {old};"),
+                    &format!("export const TIMEOUT = {new};"),
+                    "variable",
+                    lang,
+                ),
+                "{lang:?}: {old} -> {new}"
+            );
+        }
+        // 対照: 種類が同じなら従来どおり値だけの変更として降格する。
+        for (old, new) in [
+            ("30", "45"),
+            ("\"a\"", "'b'"),
+            ("true", "false"),
+            ("1n", "2n"),
+            ("null", "null"),
+        ] {
+            assert!(
+                is_const_value_only_change(
+                    &format!("export const TIMEOUT = {old};"),
+                    &format!("export const TIMEOUT = {new};"),
+                    "variable",
+                    lang,
+                ),
+                "{lang:?}: {old} -> {new}"
+            );
+        }
+    }
+}
+
 #[test]
 fn is_const_value_only_change_ts_untyped_function_stays_api_mod() {
     // 型注釈なし + 関数 initializer は shape 推定が危険なため api.mod に残す。

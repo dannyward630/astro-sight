@@ -7,7 +7,7 @@ use crate::engine::parser;
 use crate::service::AppService;
 
 use super::super::git_input::{git_show_blob, validate_git_revision};
-use super::{PreparedDiffFile, bare_name, ctx_usage_is_jsx_or_safe};
+use super::{PreparedDiffFile, bare_name};
 
 /// Old-side references used only to distinguish a rename from an already unused removal.
 /// All changed sources are parsed once, and references inside declarations removed by the
@@ -197,7 +197,18 @@ pub(crate) fn has_cross_file_refs(index: &ApiRefIndex, file_path: &str, name: &s
 /// `name` シンボルが値として利用 (`X(...)` / `new X` / `typeof X` / `X.foo` / `X[...]`)
 /// されている参照があるかを判定する。JSX タグ利用・import/re-export・定義のみなら false
 /// (= 降格可)。解析失敗・判定不能な参照があれば true (= blocking 維持、false negative 回避)。
-pub(crate) fn has_blocking_value_usage(index: &ApiRefIndex, name: &str) -> bool {
+///
+/// 判定は参照ファイルを parse した参照位置のノードの役割で行う。行テキスト (`ctx`) で判定すると、
+/// import 文と同じ行に書いた値利用 (`import { X } from "./x"; X();`) を import 行として捨て、
+/// 256 バイトで切り詰めた行では後半の直接呼び出し (`<X />…{X()}`) を見落としていた。
+/// 別名で import / 再 export された名前 (`import { X as Y }`) の利用は名前索引に現れないので、
+/// 1 件でもあれば値利用の可能性ありとする。
+pub(crate) fn has_blocking_value_usage(
+    index: &ApiRefIndex,
+    dir: &str,
+    name: &str,
+    caches: &mut ApiClosureCaches,
+) -> bool {
     use crate::models::reference::RefKind;
     let bare = bare_name(name);
     let Some(refs) = index.refs_for(bare) else {
@@ -207,22 +218,278 @@ pub(crate) fn has_blocking_value_usage(index: &ApiRefIndex, name: &str) -> bool 
         if r.kind == Some(RefKind::Definition) {
             continue;
         }
-        let Some(ctx) = r.context.as_deref() else {
+        let Some(parsed) = parsed_ref_file(dir, &r.path, caches) else {
             return true;
         };
-        let trimmed = ctx.trim_start();
-        // import / re-export specifier は値利用ではない
-        if ref_is_import_line(r)
-            || trimmed.starts_with("export {")
-            || trimmed.starts_with("export type")
-        {
-            continue;
-        }
-        if !ctx_usage_is_jsx_or_safe(ctx, bare) {
+        let Some(node) = ref_name_node(parsed, bare, r.line, r.column) else {
+            return true;
+        };
+        if !js_reference_is_non_value(node, &parsed.source, bare) {
             return true;
         }
     }
     false
+}
+
+/// JS/TS の参照位置が値利用でないか (import 指定子、別名なしの export 指定子、JSX の要素名、
+/// 宣言名)。それ以外 (呼び出し・メンバー・`typeof`・`new`・値としての受け渡し) は false。
+fn js_reference_is_non_value(node: tree_sitter::Node<'_>, source: &[u8], bare: &str) -> bool {
+    match import_role_at(node, source, bare) {
+        RefImportRole::Aliased => return false,
+        RefImportRole::Plain => return true,
+        RefImportRole::Outside => {}
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() == "export_specifier"
+        && parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id())
+    {
+        // 別名付きの再 export は `import_role_at` が Aliased にしている。
+        return true;
+    }
+    if jsx_name_opening_tag(node, source).is_some() {
+        return true;
+    }
+    matches!(
+        parent.kind(),
+        "function_declaration"
+            | "generator_function_declaration"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "function_expression"
+            | "function"
+            | "generator_function"
+            | "class"
+            | "variable_declarator"
+    ) && parent
+        .child_by_field_name("name")
+        .is_some_and(|name| name.id() == node.id())
+}
+
+/// 参照の位置が import / use 文の中か、その中で別名を付けているか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefImportRole {
+    /// import / use 文と別名付き再 export 指定子の外。
+    Outside,
+    /// import / use 文の中で、同じ名前で束縛する (`import { run }` / `from m import run`)。
+    Plain,
+    /// 別名で束縛・公開する (`run as r` / `export { run as execute }`)。別名の利用は名前索引に
+    /// 現れないので、名前で集めた参照は全利用者を表さない。
+    Aliased,
+}
+
+/// import / use 文のノード種別 (`engine::imports` の import 行集合と同じ範囲)。
+const IMPORT_STATEMENT_KINDS: &[&str] = &[
+    "use_declaration",
+    "import_statement",
+    "import_from_statement",
+    "future_import_statement",
+    "import_declaration",
+    "namespace_use_declaration",
+    "using_directive",
+    "import_header",
+    "preproc_include",
+];
+
+/// `node` (参照の名前) が `ancestor` の部分木に入るか。
+fn node_within(node: tree_sitter::Node<'_>, ancestor: tree_sitter::Node<'_>) -> bool {
+    ancestor.start_byte() <= node.start_byte() && node.end_byte() <= ancestor.end_byte()
+}
+
+/// 参照の名前ノードから祖先を辿り、import / use 文と別名の有無を判定する。
+fn import_role_at(node: tree_sitter::Node<'_>, source: &[u8], bare: &str) -> RefImportRole {
+    let alias_differs = |alias: tree_sitter::Node<'_>| alias.utf8_text(source).ok() != Some(bare);
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            // JS/TS: `import { run as r }` / `export { run as r }`、Python: `run as r`
+            "import_specifier" | "export_specifier" | "aliased_import" => {
+                if let Some(alias) = parent.child_by_field_name("alias")
+                    && alias_differs(alias)
+                    && parent
+                        .child_by_field_name("name")
+                        .is_some_and(|name| node_within(node, name))
+                {
+                    return RefImportRole::Aliased;
+                }
+            }
+            // Rust: `use m::run as r;`
+            "use_as_clause" => {
+                if let Some(alias) = parent.child_by_field_name("alias")
+                    && alias_differs(alias)
+                    && parent
+                        .child_by_field_name("path")
+                        .is_some_and(|path| node_within(node, path))
+                {
+                    return RefImportRole::Aliased;
+                }
+            }
+            // PHP: `use function A\run as r;`
+            "namespace_use_clause" => {
+                if let Some(alias) = parent.child_by_field_name("alias")
+                    && alias_differs(alias)
+                    && !node_within(node, alias)
+                {
+                    return RefImportRole::Aliased;
+                }
+            }
+            // Kotlin: `import a.run as r`
+            "import_header" => {
+                let mut cursor = parent.walk();
+                let aliased = parent.named_children(&mut cursor).any(|child| {
+                    child.kind() == "import_alias"
+                        && !node_within(node, child)
+                        && child.named_child(0).is_none_or(&alias_differs)
+                });
+                return if aliased {
+                    RefImportRole::Aliased
+                } else {
+                    RefImportRole::Plain
+                };
+            }
+            kind if IMPORT_STATEMENT_KINDS.contains(&kind) => return RefImportRole::Plain,
+            _ => {}
+        }
+        current = parent;
+    }
+    RefImportRole::Outside
+}
+
+/// 参照位置 (0 始まりの行・byte 列) から、テキストが名前と一致する最小のノードを返す。
+/// 位置と名前が食い違う (ファイルが変わった・解析できない) 場合は None。
+fn ref_name_node<'t>(
+    parsed: &'t ParsedRefFile,
+    bare: &str,
+    line: usize,
+    column: usize,
+) -> Option<tree_sitter::Node<'t>> {
+    let point = tree_sitter::Point { row: line, column };
+    let mut node = parsed
+        .tree
+        .root_node()
+        .descendant_for_point_range(point, point)?;
+    let case_insensitive = parsed.lang_id == crate::language::LangId::Php;
+    loop {
+        if node.start_position() == point
+            && node.utf8_text(&parsed.source).ok().is_some_and(|text| {
+                text == bare || (case_insensitive && text.eq_ignore_ascii_case(bare))
+            })
+        {
+            return Some(node);
+        }
+        let parent = node.parent()?;
+        if parent.start_position() != point {
+            return None;
+        }
+        node = parent;
+    }
+}
+
+/// 参照ファイルを parse して参照位置の import 上の役割を返す。parse・位置の特定に失敗したら None
+/// (呼び出し側は除外も証明もせず、blocking 側に倒す)。
+pub(crate) fn ref_import_role(
+    dir: &str,
+    r: &crate::models::reference::SymbolReference,
+    bare: &str,
+    caches: &mut ApiClosureCaches,
+) -> Option<RefImportRole> {
+    let parsed = parsed_ref_file(dir, &r.path, caches)?;
+    let node = ref_name_node(parsed, bare, r.line, r.column)?;
+    Some(import_role_at(node, &parsed.source, bare))
+}
+
+/// JS / TS を埋め込む、refs が解析できないソース。ここにある利用は名前索引に現れない。
+const EMBEDDED_JS_SOURCE_EXTENSIONS: &[&str] = &["vue", "svelte", "astro", "mdx"];
+/// 埋め込みソース 1 ファイルの読み込み上限。超えるファイルは「どの名前も使い得る」とみなす。
+const EMBEDDED_JS_SOURCE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// リポジトリ内の JS / TS を埋め込む解析できないソースの内容。`None` の要素は読めなかった
+/// (上限超過・UTF-8 でない) ファイルで、どの名前も使い得るとみなす。
+pub(crate) struct EmbeddedJsSources {
+    unknown: bool,
+    texts: Vec<Option<String>>,
+}
+
+impl EmbeddedJsSources {
+    fn load(dir: &str) -> Self {
+        let root = std::path::Path::new(dir);
+        match crate::engine::refs::collect_files_scan(
+            root,
+            None,
+            crate::engine::refs::FileScanOptions::default(),
+        ) {
+            Ok(collection) => Self::from_collection(&collection),
+            Err(_) => Self {
+                unknown: true,
+                texts: Vec::new(),
+            },
+        }
+    }
+
+    /// 走査済みのファイル集合から、JS / TS を埋め込む解析できないソースを読む。
+    pub(crate) fn from_collection(collection: &crate::engine::refs::FileCollection) -> Self {
+        let texts = collection
+            .unanalyzable_source_paths()
+            .iter()
+            .filter(|path| {
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        EMBEDDED_JS_SOURCE_EXTENSIONS
+                            .iter()
+                            .any(|known| ext.eq_ignore_ascii_case(known))
+                    })
+            })
+            .map(|path| {
+                crate::engine::bounded_read::read_utf8_file_limited(
+                    path,
+                    EMBEDDED_JS_SOURCE_MAX_BYTES,
+                )
+            })
+            .collect();
+        Self {
+            unknown: false,
+            texts,
+        }
+    }
+
+    /// どれかの埋め込みソースに、いずれかの名前が識別子として現れ得るか。
+    pub(crate) fn may_mention(&self, names: &[&str]) -> bool {
+        self.unknown
+            || self.texts.iter().any(|text| {
+                text.as_ref()
+                    .is_none_or(|text| names.iter().any(|name| contains_js_word(text, name)))
+            })
+    }
+}
+
+/// `text` に `name` が JS の識別子の単語として現れるか (前後が識別子の文字でない出現)。
+pub(crate) fn contains_js_word(text: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    text.match_indices(name).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + name.len()..].chars().next();
+        before.is_none_or(|c| !is_ident(c)) && after.is_none_or(|c| !is_ident(c))
+    })
+}
+
+/// 解析できない埋め込みソース (`.vue` 等) に `names` のどれかが現れ得るか。1 回の検出で
+/// リポジトリの走査と読み込みは 1 回だけ行う。
+pub(crate) fn embedded_js_sources_may_mention(
+    dir: &str,
+    names: &[&str],
+    caches: &mut ApiClosureCaches,
+) -> bool {
+    caches
+        .embedded_js_sources
+        .get_or_insert_with(|| std::rc::Rc::new(EmbeddedJsSources::load(dir)))
+        .may_mention(names)
 }
 
 /// 無変更の呼び出し式を閉じる追加証拠。TS は共有 const の必須プロパティ追加、
@@ -242,6 +509,9 @@ pub(crate) struct ModifiedClosureInput<'a> {
     pub(crate) target_new_path: &'a str,
     pub(crate) diff_files: &'a [crate::models::impact::DiffFile],
     pub(crate) arg_evidence: ClosureArgEvidence<'a>,
+    /// 対象が宣言名と違う公開名 (default export / 別名 export) で公開されている (JS/TS)。
+    /// その利用者は宣言名の参照に現れないので、見えた呼び出しが全部更新済みでも閉じない。
+    pub(crate) public_name_differs: bool,
 }
 
 /// modified シンボルの全 cross-file 参照が同一 diff 内の変更 hunk で追随済みかを判定する。
@@ -274,6 +544,7 @@ pub(crate) fn is_modified_closed_in_diff(
         target_new_path,
         diff_files,
         arg_evidence,
+        public_name_differs,
     } = input;
     let bare = bare_name(name);
     let target_lang =
@@ -281,9 +552,33 @@ pub(crate) fn is_modified_closed_in_diff(
     let python_method = target_lang == Some(crate::language::LangId::Python)
         && kind == "function"
         && name.contains('.');
+    if public_name_differs {
+        return false;
+    }
     let Some(refs) = index.refs_for(bare) else {
         return false;
     };
+    // 別名で import / use / 再 export された名前 (`run as r`) の呼び出しは名前索引に現れず、
+    // 見えた呼び出しが全部更新済みでも未更新の利用者が残り得る。言語を問わず閉じない。
+    if refs.iter().any(|r| {
+        r.kind != Some(crate::models::reference::RefKind::Definition)
+            && ref_import_role(dir, r, bare, caches) == Some(RefImportRole::Aliased)
+    }) {
+        return false;
+    }
+    // `.vue` などの解析できない埋め込みソースにある利用は refs に現れない。名前が現れ得る
+    // ソースがあれば、見えた呼び出しだけで追随済みとは言えない。
+    if matches!(
+        target_lang,
+        Some(
+            crate::language::LangId::Javascript
+                | crate::language::LangId::Typescript
+                | crate::language::LangId::Tsx
+        )
+    ) && embedded_js_sources_may_mention(dir, &[bare], caches)
+    {
+        return false;
+    }
     if matches!(arg_evidence, ClosureArgEvidence::PythonProtocolParams(_))
         && !super::python_protocol_arg::imports_are_unaliased(dir, refs, bare, caches)
     {
@@ -547,23 +842,41 @@ pub(super) fn parsed_ref_file<'a>(
     caches
         .parsed_refs
         .entry(ref_path.to_string())
-        .or_insert_with(|| {
-            let abs = if std::path::Path::new(ref_path).is_absolute() {
-                std::path::PathBuf::from(ref_path)
-            } else {
-                std::path::Path::new(dir).join(ref_path)
-            };
-            let abs_utf8 = camino::Utf8PathBuf::from_path_buf(abs).ok()?;
-            let lang = crate::language::LangId::from_path(camino::Utf8Path::new(ref_path)).ok()?;
-            let source = crate::engine::parser::read_file(&abs_utf8).ok()?;
-            let tree = crate::engine::parser::parse_source(&source, lang).ok()?;
-            Some(ParsedRefFile {
-                source,
-                tree,
-                lang_id: lang,
-            })
-        })
-        .as_ref()
+        .or_insert_with(|| parse_ref_file(dir, ref_path).map(std::rc::Rc::new))
+        .as_deref()
+}
+
+/// `parsed_ref_file` と同じキャッシュから、共有の parse 結果を返す。参照を返す版と違い
+/// `caches` の借用を残さないので、1 つのファイルの解析木を見ながら別のファイルの解析や
+/// 判定結果のキャッシュ (`&mut caches`) を使える。
+pub(super) fn parsed_ref_file_shared(
+    dir: &str,
+    ref_path: &str,
+    caches: &mut ApiClosureCaches,
+) -> Option<std::rc::Rc<ParsedRefFile>> {
+    caches
+        .parsed_refs
+        .entry(ref_path.to_string())
+        .or_insert_with(|| parse_ref_file(dir, ref_path).map(std::rc::Rc::new))
+        .clone()
+}
+
+fn parse_ref_file(dir: &str, ref_path: &str) -> Option<ParsedRefFile> {
+    let abs = if std::path::Path::new(ref_path).is_absolute() {
+        std::path::PathBuf::from(ref_path)
+    } else {
+        std::path::Path::new(dir).join(ref_path)
+    };
+    // 言語は refs と同じく拡張子 → shebang の順で決める (拡張子なしのスクリプトも参照元になる)。
+    let lang = crate::engine::refs::detect_source_lang(&abs)?;
+    let abs_utf8 = camino::Utf8PathBuf::from_path_buf(abs).ok()?;
+    let source = crate::engine::parser::read_file(&abs_utf8).ok()?;
+    let tree = crate::engine::parser::parse_source(&source, lang).ok()?;
+    Some(ParsedRefFile {
+        source,
+        tree,
+        lang_id: lang,
+    })
 }
 
 /// JS/TS/TSX の参照が call の callee (直接または `obj.name(...)` の member 経由) を成す
@@ -752,11 +1065,13 @@ fn ref_is_pass_through_reexport(
     pass_through_reexport_at(&parsed.tree, &parsed.source, bare, r.line, r.column)
 }
 
-/// 定義・import/use 行・素通し再 export を除いた「実際の呼び出し参照」だけを抜き出す。
+/// 定義・import/use 文の中の参照・素通し再 export を除いた「実際の呼び出し参照」だけを抜き出す。
 ///
-/// 行頭テキスト判定 (`ref_is_import_line`) は複数行 grouped use ブロックの継続行
-/// (`    a, b, cmd_cochange, ...` のように `use ` で始まらない行) を拾えないため、AST ベースの
-/// import 行集合でも除外する (api.mod 誤検出 2026-05-31)。
+/// import / use 文の中かどうかは参照位置のノードの祖先で判定する (複数行 grouped use ブロックの
+/// 継続行も含む。api.mod 誤検出 2026-05-31)。行単位で判定すると、import 文と同じ行に書いた
+/// 呼び出し (`import { foo } from "./a"; foo(1);` / Python の `from m import run; run(1)`) や、
+/// 行頭が `use ` で始まる Python の代入 (`use = run(1)`) まで捨て、未更新の呼び出しを見落とす。
+/// parse・位置の特定に失敗した参照は除外しない (blocking 側)。
 fn collect_call_refs<'a>(
     refs: &'a [crate::models::reference::SymbolReference],
     dir: &str,
@@ -765,13 +1080,12 @@ fn collect_call_refs<'a>(
 ) -> Vec<&'a crate::models::reference::SymbolReference> {
     use crate::models::reference::RefKind;
     refs.iter()
-        .filter(|r| r.kind != Some(RefKind::Definition) && !ref_is_import_line(r))
+        .filter(|r| r.kind != Some(RefKind::Definition))
         .filter(|r| {
-            let import_lines = caches
-                .import_lines
-                .entry(r.path.clone())
-                .or_insert_with(|| import_statement_lines_for_ref(dir, &r.path));
-            !import_lines.contains(&r.line) && !ref_is_pass_through_reexport(dir, r, bare, caches)
+            !matches!(
+                ref_import_role(dir, r, bare, caches),
+                Some(RefImportRole::Plain | RefImportRole::Aliased)
+            ) && !ref_is_pass_through_reexport(dir, r, bare, caches)
         })
         .collect()
 }
@@ -870,7 +1184,17 @@ pub(crate) struct ApiClosureCaches {
     /// shadow binding 解決用の (ref path → parse 結果) キャッシュ。`None` = read/parse
     /// 失敗 (毎回再試行しない)。同名定義が複数ある modified シンボルが多数あっても、
     /// 参照ファイル単位で 1 回だけ parse する。
-    parsed_refs: std::collections::HashMap<String, Option<ParsedRefFile>>,
+    parsed_refs: std::collections::HashMap<String, Option<std::rc::Rc<ParsedRefFile>>>,
+    /// Python のクラス・束縛の解決結果。参照ごとに定義ファイルや呼び出し側の解析木全体を
+    /// 走査し直さないよう、(ファイル, 名前) 単位で 1 回だけ計算する。
+    pub(super) python_classes: super::python_call_arity::PythonClassCache,
+    /// JS / TS を埋め込む解析できないソース (`.vue` 等) の内容。1 回の検出で 1 回だけ読む。
+    embedded_js_sources: Option<std::rc::Rc<EmbeddedJsSources>>,
+    /// (旧パス, 新パス) → 宣言名と違う公開名で公開されている JS/TS の宣言名。
+    pub(super) js_published_names: std::collections::HashMap<
+        (String, String),
+        std::rc::Rc<super::js_public_name::PublishedNames>,
+    >,
     /// Python の変更後関数契約。参照ごとの定義ファイル再走査を避ける。
     pub(super) python_call_contracts:
         std::collections::HashMap<(String, String), Option<super::python_call_arity::CallContract>>,
@@ -1312,6 +1636,197 @@ mod tests {
                 ));
             }
         }
+    }
+
+    /// `@` の位置にある名前の import 上の役割。
+    fn role_at(marked: &str, lang: LangId, bare: &str) -> Option<RefImportRole> {
+        let offset = marked.find('@').unwrap();
+        let source = marked.replace('@', "");
+        let prefix = &source[..offset];
+        let line = prefix.bytes().filter(|b| *b == b'\n').count();
+        let column = offset - prefix.rfind('\n').map_or(0, |i| i + 1);
+        let tree = parser::parse_source(source.as_bytes(), lang).unwrap();
+        let parsed = ParsedRefFile {
+            source: crate::engine::parser::SourceBuf::Vec(source.clone().into_bytes()),
+            tree,
+            lang_id: lang,
+        };
+        let node = ref_name_node(&parsed, bare, line, column)?;
+        Some(import_role_at(node, &parsed.source, bare))
+    }
+
+    /// import / use 文の中かどうかは参照位置のノードで決める。同じ行の別の文にある呼び出しや、
+    /// 行頭が `use ` の Python の代入を import 扱いしない。別名を付ける位置は Aliased。
+    #[test]
+    fn import_role_is_judged_by_reference_position() {
+        use RefImportRole::{Aliased, Outside, Plain};
+        for (marked, lang, bare, expected) in [
+            (
+                "import { @foo } from \"./a\"; foo(1);",
+                LangId::Typescript,
+                "foo",
+                Plain,
+            ),
+            (
+                "import { foo } from \"./a\"; @foo(1);",
+                LangId::Typescript,
+                "foo",
+                Outside,
+            ),
+            (
+                "import { @foo as f } from \"./a\";",
+                LangId::Typescript,
+                "foo",
+                Aliased,
+            ),
+            (
+                "import { x as @foo } from \"./a\";",
+                LangId::Typescript,
+                "foo",
+                Plain,
+            ),
+            (
+                "export { @foo as execute } from \"./a\";",
+                LangId::Typescript,
+                "foo",
+                Aliased,
+            ),
+            (
+                "export { @foo as default };",
+                LangId::Javascript,
+                "foo",
+                Aliased,
+            ),
+            ("export { @foo };", LangId::Typescript, "foo", Outside),
+            (
+                "from pkg.a import @run; VALUE = run(1)\n",
+                LangId::Python,
+                "run",
+                Plain,
+            ),
+            (
+                "from pkg.a import run; VALUE = @run(1)\n",
+                LangId::Python,
+                "run",
+                Outside,
+            ),
+            ("use = @run(1)\n", LangId::Python, "run", Outside),
+            (
+                "from pkg.a import @run as r\n",
+                LangId::Python,
+                "run",
+                Aliased,
+            ),
+            ("use crate::m::@run;\n", LangId::Rust, "run", Plain),
+            ("use crate::m::@run as r;\n", LangId::Rust, "run", Aliased),
+            (
+                "use crate::m::{@run as r, other};\n",
+                LangId::Rust,
+                "run",
+                Aliased,
+            ),
+            ("import a.b.@run as r\n", LangId::Kotlin, "run", Aliased),
+            ("import a.b.@run\n", LangId::Kotlin, "run", Plain),
+            (
+                "<?php\nuse function A\\B\\@run as r;\n",
+                LangId::Php,
+                "run",
+                Aliased,
+            ),
+            (
+                "<?php\nuse function A\\B\\@run;\n",
+                LangId::Php,
+                "run",
+                Plain,
+            ),
+        ] {
+            assert_eq!(
+                role_at(marked, lang, bare),
+                Some(expected),
+                "{lang:?}: {marked}"
+            );
+        }
+        // 位置と名前が食い違えば判定しない (呼び出し側は除外しない)
+        assert_eq!(
+            role_at("@import { foo } from \"./a\";", LangId::Typescript, "foo"),
+            None
+        );
+    }
+
+    /// `@` の位置の参照が値利用でないか (JSX の要素名・import 指定子・export 指定子・宣言名)。
+    fn non_value_at(marked: &str) -> bool {
+        let offset = marked.find('@').unwrap();
+        let source = marked.replace('@', "");
+        let prefix = &source[..offset];
+        let line = prefix.bytes().filter(|b| *b == b'\n').count();
+        let column = offset - prefix.rfind('\n').map_or(0, |i| i + 1);
+        let tree = parser::parse_source(source.as_bytes(), LangId::Tsx).unwrap();
+        let parsed = ParsedRefFile {
+            source: crate::engine::parser::SourceBuf::Vec(source.clone().into_bytes()),
+            tree,
+            lang_id: LangId::Tsx,
+        };
+        let node = ref_name_node(&parsed, "ScheduleItem", line, column).expect("node");
+        js_reference_is_non_value(node, &parsed.source, "ScheduleItem")
+    }
+
+    /// 値利用かどうかは参照位置のノードで判定する。行テキストで判定すると、同じ行の別の出現を
+    /// 混ぜ、256 バイトで切り詰めた行の後半を見落とす。
+    #[test]
+    fn js_value_usage_is_judged_by_reference_position() {
+        let long = "t".repeat(300);
+        for (marked, non_value) in [
+            ("const v = <@ScheduleItem foo={1} />;", true),
+            ("const v = <ScheduleItem>x</@ScheduleItem>;", true),
+            (
+                "import { @ScheduleItem } from \"./s\"; ScheduleItem();",
+                true,
+            ),
+            (
+                "import { ScheduleItem } from \"./s\"; @ScheduleItem();",
+                false,
+            ),
+            ("import { @ScheduleItem as S } from \"./s\";", false),
+            ("export { @ScheduleItem } from \"./s\";", true),
+            ("export { @ScheduleItem as S };", false),
+            (
+                "export const @ScheduleItem = memo(function ScheduleItem() { return null; });",
+                true,
+            ),
+            (
+                "export const ScheduleItem = memo(function @ScheduleItem() { return null; });",
+                true,
+            ),
+            ("const x = @ScheduleItem({});", false),
+            ("type P = typeof @ScheduleItem;", false),
+            ("@ScheduleItem.displayName = 'x';", false),
+            ("const Alias = @ScheduleItem;", false),
+            ("export default @ScheduleItem;", false),
+            (
+                &format!(
+                    "const v = <section><@ScheduleItem /><p title=\"{long}\"></p>{{ScheduleItem()}}</section>;"
+                ),
+                true,
+            ),
+            (
+                &format!(
+                    "const v = <section><ScheduleItem /><p title=\"{long}\"></p>{{@ScheduleItem()}}</section>;"
+                ),
+                false,
+            ),
+        ] {
+            assert_eq!(non_value_at(marked), non_value, "{marked}");
+        }
+    }
+
+    #[test]
+    fn contains_js_word_respects_identifier_boundaries() {
+        assert!(contains_js_word("const x = format(1);", "format"));
+        assert!(contains_js_word("config.b + 1", "b"));
+        assert!(!contains_js_word("const x = formatted(1);", "format"));
+        assert!(!contains_js_word("const $format = 1;", "format"));
+        assert!(!contains_js_word("const bb = 1; ab;", "b"));
+        assert!(!contains_js_word("anything", ""));
     }
 
     fn call_range_at(src: &str, bare: &str, line: usize, column: usize) -> Option<(usize, usize)> {

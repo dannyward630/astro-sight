@@ -271,6 +271,75 @@ fn detect_api_changes_rust_to_swift_rewrite_with_no_ffi_is_informational() {
     }
 }
 
+/// wasm-bindgen / napi-rs / neon は生成した JS モジュールから Rust の関数を同じ識別子で公開し、
+/// C ABI の関数も wasm の `instance.exports.<名前>` として同じ名前で呼べる。旧ツリーにその痕跡が
+/// あれば、JS からの同名参照を「言語をまたいで束縛できない別物」とみなさず blocking に残す。
+/// 痕跡が無い crate なら、JS の無関係な同名関数は従来どおり別物として降格する (対照)。
+#[test]
+fn detect_api_changes_rust_removal_called_from_js_keeps_blocking_with_binding_evidence() {
+    let plain_toml = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n";
+    let wasm_toml = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n[dependencies]\nwasm-bindgen = \"0.2\"\n";
+    let napi_toml = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"cdylib\"]\n[dependencies]\nnapi-derive = \"2\"\n";
+    for (label, toml, old_lib, new_lib, js, expect_blocking) in [
+        (
+            "wasm-bindgen",
+            wasm_toml,
+            "use wasm_bindgen::prelude::*;\n#[wasm_bindgen]\npub fn greet(name: &str) -> String { format!(\"hi {name}\") }\n#[wasm_bindgen]\npub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+            "use wasm_bindgen::prelude::*;\n#[wasm_bindgen]\npub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+            "import init, { greet, add } from \"../pkg/demo.js\";\nawait init();\nexport const text = greet(\"world\") + add(1, 2);\n",
+            true,
+        ),
+        (
+            "wasm C ABI export",
+            plain_toml,
+            "#[no_mangle]\npub extern \"C\" fn greet() -> i32 { 1 }\n#[no_mangle]\npub extern \"C\" fn add() -> i32 { 2 }\n",
+            "#[no_mangle]\npub extern \"C\" fn add() -> i32 { 2 }\n",
+            "export function run(instance) { return instance.exports.greet(); }\n",
+            true,
+        ),
+        (
+            "napi-rs",
+            napi_toml,
+            "use napi_derive::napi;\n#[napi]\npub fn greet() -> u32 { 1 }\n#[napi]\npub fn add() -> u32 { 2 }\n",
+            "use napi_derive::napi;\n#[napi]\npub fn add() -> u32 { 2 }\n",
+            "const { greet } = require(\"../index.node\");\nmodule.exports = () => greet();\n",
+            true,
+        ),
+        (
+            "no binding evidence",
+            plain_toml,
+            "pub fn greet() -> u32 { 1 }\npub fn add() -> u32 { 2 }\n",
+            "pub fn add() -> u32 { 2 }\n",
+            "function greet() { return 1; }\nexport const value = greet();\n",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("Cargo.toml", toml),
+                ("src/lib.rs", old_lib),
+                ("web/main.js", js),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/lib.rs"), new_lib).expect("write lib.rs");
+        let api = detect_api_changes_from_worktree(repo);
+        let blocking = api.removed.iter().any(|s| s.name == "greet");
+        let informational = api.removed_dead.iter().any(|s| s.name == "greet");
+        assert_eq!(
+            (blocking, informational),
+            (expect_blocking, !expect_blocking),
+            "{label}: removed={:?} removed_dead={:?}",
+            api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+            api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+}
+
 /// 拡張子の折り畳みや別名の include で FFI を見落とす場合は降格しない。
 #[test]
 fn detect_api_changes_rust_swift_uncertain_ffi_sources_stay_blocking() {
@@ -1215,6 +1284,64 @@ fn detect_api_changes_atomic_python_module_deletion_keeps_blocking_on_residual_p
         removed.iter().any(|n| n == "search"),
         "削除モジュールからの import + bare 呼び出しが残る場合は blocking を維持すべき。removed={removed:?} removed_dead={removed_dead:?}"
     );
+}
+
+/// Python のモジュールを辞書や変数に入れて呼ぶ (`BACKENDS[name].search(q)` /
+/// `backend.search(q)`) 利用は、レシーバの名前から削除モジュールかどうかを決められないので、
+/// 削除した `search` を removed_dead に降格しない。import した名前で直接呼ぶ利用は従来どおり
+/// blocking、stdlib の属性アクセスだけなら従来どおり降格する (対照)。
+#[test]
+fn detect_api_changes_python_module_held_in_container_or_variable_stays_removed() {
+    for (router, expect_blocking) in [
+        (
+            "from pkg import core, fast\nBACKENDS = {\"core\": core, \"fast\": fast}\n\ndef run(name, q):\n    return BACKENDS[name].search(q)\n",
+            true,
+        ),
+        (
+            "from pkg import core\nbackend = core\n\ndef run(q):\n    return backend.search(q)\n",
+            true,
+        ),
+        (
+            "from pkg import core\n\ndef run(q):\n    return core.search(q)\n",
+            true,
+        ),
+        (
+            "import re\n\ndef run(q):\n    return re.search(\"x\", q)\n",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("pkg/__init__.py", ""),
+                (
+                    "pkg/core.py",
+                    "def search(q):\n    return [q]\n\ndef index(items):\n    return items\n",
+                ),
+                ("pkg/fast.py", "def other(q):\n    return q\n"),
+                ("pkg/router.py", router),
+            ],
+            "base",
+        );
+        fs::write(
+            repo.join("pkg/core.py"),
+            "def index(items):\n    return items\n",
+        )
+        .expect("write");
+        let api = detect_api_changes_from_worktree(repo);
+        let blocking = api.removed.iter().any(|s| s.name == "search");
+        let informational = api.removed_dead.iter().any(|s| s.name == "search");
+        assert_eq!(
+            (blocking, informational),
+            (expect_blocking, !expect_blocking),
+            "{router}\nremoved={:?} removed_dead={:?}",
+            api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+            api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
 }
 
 /// `pkg/util.py` の `helper` と、それを再エクスポートする `pkg/__init__.py` の
@@ -2506,6 +2633,52 @@ main() {\n    echo done\n}\nmain\n";
         !removed.contains(&"boundary_is_old_enough"),
         "未 export な bash 関数を caller ごと同一 diff で削除した場合は api.rm に出してはならない。got: {removed:?}"
     );
+}
+
+/// 削除した bash ファイルの関数を、拡張子なしの bash スクリプト (`bin/deploy`、shebang で
+/// bash と判定される) が `source` して呼んでいれば api.rm に残す。参照ファイルの言語を拡張子
+/// だけで判定していたため「bash からは未参照」とみなされ、何も報告されなかった。
+/// 拡張子なしでも shebang が別言語のファイルの同名参照は、従来どおり bash の参照に数えない (対照)。
+#[test]
+fn detect_api_changes_deleted_bash_function_used_by_extensionless_script_stays_removed() {
+    for (script, content, expect_removed) in [
+        (
+            "bin/deploy",
+            "#!/usr/bin/env bash\nsource \"$(dirname \"$0\")/../lib/common.sh\"\ngreet world\n",
+            true,
+        ),
+        (
+            "bin/deploy.sh",
+            "#!/usr/bin/env bash\nsource \"$(dirname \"$0\")/../lib/common.sh\"\ngreet world\n",
+            true,
+        ),
+        (
+            "bin/tool",
+            "#!/usr/bin/env python3\ndef greet(name):\n    print(name)\n\ngreet('world')\n",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("lib/common.sh", "greet() {\n  echo \"hello $1\"\n}\n"),
+                (script, content),
+            ],
+            "initial",
+        );
+        git_in(repo, &["rm", "-q", "lib/common.sh"]);
+        let api = detect_api_changes_from_worktree(repo);
+        let removed: Vec<&str> = api.removed.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            removed.contains(&"greet"),
+            expect_removed,
+            "{script}: removed={removed:?} removed_dead={:?}",
+            api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
 }
 
 /// Bash で `export -f <name>` されている関数の削除は api.rm に残す。

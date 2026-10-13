@@ -7,6 +7,7 @@ mod general;
 mod other_languages;
 mod parse_errors;
 mod python;
+mod reference_positions;
 mod removal;
 mod rename_move;
 mod rust_crate_kind;

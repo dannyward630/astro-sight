@@ -69,6 +69,7 @@ pub(crate) fn detect_async_jsx_component_compatible_mod(
     index: &ApiRefIndex,
     site: &CompatibleModSite<'_>,
     sources: &mut SignatureSourceCache<'_>,
+    caches: &mut ApiClosureCaches,
 ) -> Option<CompatibleApiModification> {
     if site.kind != "function" || site.name.contains('.') {
         return None;
@@ -87,7 +88,7 @@ pub(crate) fn detect_async_jsx_component_compatible_mod(
         }
         Some(())
     })?;
-    if has_blocking_value_usage(index, site.name) {
+    if has_blocking_value_usage(index, site.dir, site.name, caches) {
         return None;
     }
     Some(site.compatible("async_jsx_component"))
@@ -108,6 +109,7 @@ pub(crate) fn detect_optional_props_jsx_component_compatible_mod(
     index: &ApiRefIndex,
     site: &CompatibleModSite<'_>,
     sources: &mut SignatureSourceCache<'_>,
+    caches: &mut ApiClosureCaches,
 ) -> Option<CompatibleApiModification> {
     if site.kind != "function" || site.name.contains('.') {
         return None;
@@ -125,7 +127,7 @@ pub(crate) fn detect_optional_props_jsx_component_compatible_mod(
         is_optionally_omittable_single_destructured_param(params, module_root(new_fn), new_source)
             .then_some(())
     })?;
-    if has_blocking_value_usage(index, site.name) {
+    if has_blocking_value_usage(index, site.dir, site.name, caches) {
         return None;
     }
     Some(site.compatible("optional_props_jsx_component"))

@@ -108,7 +108,7 @@ pub(super) fn python_independent_positions(root: Node<'_>, source: &[u8], name: 
 }
 
 /// tree-sitter に Load フラグは無いため、読み取りと確定できる親だけを許す。
-fn python_is_load(node: Node<'_>) -> bool {
+pub(super) fn python_is_load(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };

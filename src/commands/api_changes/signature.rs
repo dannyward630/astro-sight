@@ -454,56 +454,77 @@ fn value_binding_signature(
 /// 任意の呼び出しの引数 (`create((set) => ({ .. }))` / `compute(() => 1)`) は辿らない。
 /// コールバックの中身がストアの形や値そのものを決める (= 契約) ことがあるため。
 /// 本体だけの変更は分類側で、互換性未検証の callback_body_changes として報告する。
+///
+/// 括弧の入れ子やオブジェクトの入れ子の深さだけ辿るので、再帰ではなく明示的なスタックで
+/// 処理する (括弧 5 万段の `export const DEEP = ((…1…));` で main スレッドのスタックが溢れ、
+/// dead-code / review が exit 134 で落ちていた)。範囲の並びは、子を左から順に辿る再帰版と同じ。
 fn js_function_value_body_spans(
     value: tree_sitter::Node<'_>,
     source: &[u8],
     out: &mut Vec<(usize, usize)>,
 ) {
-    match value.kind() {
-        "parenthesized_expression"
-        | "as_expression"
-        | "satisfies_expression"
-        | "non_null_expression" => {
-            if let Some(inner) = value.named_child(0) {
-                js_function_value_body_spans(inner, source, out);
+    /// まだ処理していない値と、出力順を保つために積んでおく本体範囲。
+    enum Work<'tree> {
+        Value(tree_sitter::Node<'tree>),
+        Span(usize, usize),
+    }
+    let mut stack = vec![Work::Value(value)];
+    while let Some(work) = stack.pop() {
+        let value = match work {
+            Work::Span(start, end) => {
+                out.push((start, end));
+                continue;
             }
-        }
-        "arrow_function" | "function_expression" | "generator_function" => {
-            if let Some(body) = value.child_by_field_name("body") {
-                out.push((body.start_byte(), body.end_byte()));
-            }
-        }
-        "call_expression" => {
-            if value
-                .child_by_field_name("function")
-                .is_some_and(|callee| is_react_component_hoc(callee, source))
-                && let Some(args) = value.child_by_field_name("arguments")
-            {
-                let mut cursor = args.walk();
-                for arg in args.named_children(&mut cursor) {
-                    js_function_value_body_spans(arg, source, out);
+            Work::Value(value) => value,
+        };
+        match value.kind() {
+            "parenthesized_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "non_null_expression" => {
+                if let Some(inner) = value.named_child(0) {
+                    stack.push(Work::Value(inner));
                 }
             }
-        }
-        "object" => {
-            let mut cursor = value.walk();
-            for member in value.named_children(&mut cursor) {
-                match member.kind() {
-                    "method_definition" => {
-                        if let Some(body) = member.child_by_field_name("body") {
-                            out.push((body.start_byte(), body.end_byte()));
-                        }
-                    }
-                    "pair" => {
-                        if let Some(member_value) = member.child_by_field_name("value") {
-                            js_function_value_body_spans(member_value, source, out);
-                        }
-                    }
-                    _ => {}
+            "arrow_function" | "function_expression" | "generator_function" => {
+                if let Some(body) = value.child_by_field_name("body") {
+                    out.push((body.start_byte(), body.end_byte()));
                 }
             }
+            "call_expression" => {
+                if value
+                    .child_by_field_name("function")
+                    .is_some_and(|callee| is_react_component_hoc(callee, source))
+                    && let Some(args) = value.child_by_field_name("arguments")
+                {
+                    let mut cursor = args.walk();
+                    let args: Vec<_> = args.named_children(&mut cursor).collect();
+                    // 左の引数から処理されるよう、逆順に積む。
+                    stack.extend(args.into_iter().rev().map(Work::Value));
+                }
+            }
+            "object" => {
+                let mut cursor = value.walk();
+                let mut members = Vec::new();
+                for member in value.named_children(&mut cursor) {
+                    match member.kind() {
+                        "method_definition" => {
+                            if let Some(body) = member.child_by_field_name("body") {
+                                members.push(Work::Span(body.start_byte(), body.end_byte()));
+                            }
+                        }
+                        "pair" => {
+                            if let Some(member_value) = member.child_by_field_name("value") {
+                                members.push(Work::Value(member_value));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                stack.extend(members.into_iter().rev());
+            }
+            _ => {}
         }
-        _ => {}
     }
 }
 
@@ -655,6 +676,9 @@ pub(crate) struct BindingShape {
     /// initializer が scalar literal (数値 / 文字列 / 真偽値 / null 等) なら true。
     /// 関数 / object / array / call 等の複雑な式は false。
     initializer_is_scalar: bool,
+    /// TS/JS の scalar literal の種類 (Rust では None)。型注釈がないと推論される公開型は
+    /// 値の種類で決まるため、種類が変わる変更 (`30` → `"30s"`) を値だけの変更と区別する。
+    js_scalar_kind: Option<super::static_const::ScalarKind>,
 }
 
 /// `node` を起点に、指定 kind のいずれかに最初に一致する子孫ノードを深さ優先で探す。
@@ -741,6 +765,7 @@ pub(crate) fn extract_rust_binding_shape(
         is_const_binding: !is_mut,
         has_type_annotation,
         initializer_is_scalar,
+        js_scalar_kind: None,
     })
 }
 
@@ -789,6 +814,8 @@ pub(crate) fn extract_js_binding_shape(
         .map(|value| value.start_byte())
         .unwrap_or_else(|| declarator.end_byte());
     let initializer_is_scalar = value.map(js_value_is_scalar).unwrap_or(false);
+    let js_scalar_kind =
+        value.and_then(|value| super::static_const::js_scalar_literal_kind(value, source));
     Some(BindingShape {
         shape: BindingShapeText::Tokens(signature_tokens_in_range(
             statement,
@@ -799,6 +826,7 @@ pub(crate) fn extract_js_binding_shape(
         is_const_binding,
         has_type_annotation,
         initializer_is_scalar,
+        js_scalar_kind,
     })
 }
 
@@ -864,6 +892,9 @@ pub(crate) fn is_const_value_only_change(
     }
     // TS/JS で型注釈がない場合、関数 / object / array / call initializer は shape 推定が
     // 危険なため scalar literal 同士のときだけ demote する (codex 指摘)。
+    // 型注釈がないと公開型は値から推論されるため、scalar の種類 (number / string / ...) が
+    // 変わる変更は値だけの変更ではない (`30` → `"30s"` で `TIMEOUT * 1000` が TS2362)。
+    // 静的 container の葉 (`static_const`) と同じく種類まで一致したときだけ demote する。
     if matches!(
         lang_id,
         crate::language::LangId::Typescript
@@ -871,7 +902,10 @@ pub(crate) fn is_const_value_only_change(
             | crate::language::LangId::Javascript
     ) {
         let both_typed = old.has_type_annotation && new.has_type_annotation;
-        let both_scalar = old.initializer_is_scalar && new.initializer_is_scalar;
+        let both_scalar = old.initializer_is_scalar
+            && new.initializer_is_scalar
+            && old.js_scalar_kind.is_some()
+            && old.js_scalar_kind == new.js_scalar_kind;
         if !both_typed && !both_scalar {
             return false;
         }
@@ -1075,4 +1109,91 @@ pub(crate) fn collect_parameter_object_pattern_ranges(
 /// 改行・タブ・連続スペース・末尾の `{` 直前空白を一括で潰す。
 pub(crate) fn normalize_signature_whitespace(bytes: &[u8]) -> String {
     crate::engine::normalize_whitespace(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 反復化する前の再帰版。結果 (範囲と並び) が変わっていないことを確かめる参照実装。
+    fn recursive_body_spans(
+        value: tree_sitter::Node<'_>,
+        source: &[u8],
+        out: &mut Vec<(usize, usize)>,
+    ) {
+        match value.kind() {
+            "parenthesized_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "non_null_expression" => {
+                if let Some(inner) = value.named_child(0) {
+                    recursive_body_spans(inner, source, out);
+                }
+            }
+            "arrow_function" | "function_expression" | "generator_function" => {
+                if let Some(body) = value.child_by_field_name("body") {
+                    out.push((body.start_byte(), body.end_byte()));
+                }
+            }
+            "call_expression" => {
+                if value
+                    .child_by_field_name("function")
+                    .is_some_and(|callee| is_react_component_hoc(callee, source))
+                    && let Some(args) = value.child_by_field_name("arguments")
+                {
+                    let mut cursor = args.walk();
+                    for arg in args.named_children(&mut cursor) {
+                        recursive_body_spans(arg, source, out);
+                    }
+                }
+            }
+            "object" => {
+                let mut cursor = value.walk();
+                for member in value.named_children(&mut cursor) {
+                    match member.kind() {
+                        "method_definition" => {
+                            if let Some(body) = member.child_by_field_name("body") {
+                                out.push((body.start_byte(), body.end_byte()));
+                            }
+                        }
+                        "pair" => {
+                            if let Some(member_value) = member.child_by_field_name("value") {
+                                recursive_body_spans(member_value, source, out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 明示スタックの反復版は、再帰版と同じ範囲を同じ並びで返す。
+    #[test]
+    fn function_value_body_spans_match_recursive_version() {
+        for source in [
+            "export const A = () => { return 1; };",
+            "export const B = ((async () => { return 2; }) as Fn)!;",
+            "export const C = memo(forwardRef(function C(p, r) { return p; }), compare);",
+            "export const D = React.memo((p) => <div>{p.x}</div>);",
+            "export const E = { a() { return 1; }, b: () => 2, c: { d: function () { return 3; }, e() {} }, f: 1, g: create(() => 4) };",
+            "export const F = compute(() => 1);",
+            "export const G = ((({ m() {}, n: (() => { return 5; }) })) satisfies T);",
+            "export const H = [() => 1];",
+            "export const I = 1;",
+        ] {
+            let lang = crate::language::LangId::Tsx;
+            let tree = parser::parse_source(source.as_bytes(), lang).unwrap();
+            let declarator =
+                find_first_descendant_of_kinds(tree.root_node(), &["variable_declarator"])
+                    .expect("declarator");
+            let value = declarator.child_by_field_name("value").expect("value");
+            let mut iterative = Vec::new();
+            js_function_value_body_spans(value, source.as_bytes(), &mut iterative);
+            let mut recursive = Vec::new();
+            recursive_body_spans(value, source.as_bytes(), &mut recursive);
+            assert_eq!(iterative, recursive, "{source}");
+        }
+    }
 }

@@ -92,6 +92,8 @@ pub(crate) fn partition_removed_dead_candidates(
         .collect();
     // (path, symbol) -> ファイル解析結果 (外部 import 事実 + 参照帰属の素材)
     let mut facts_cache: HashMap<(String, String), RefAttributionFacts> = HashMap::new();
+    // import 先のモジュールが公開名をどう export しているかの判定 (候補ファイルごとに 1 回)。
+    let mut export_cache = super::js_ref_sites::JsExportOriginCache::default();
 
     // Pass 1: bare_name ごとの残存定義ファイル集合。参照帰属の照合先になる。
     let mut definition_paths: HashMap<String, HashSet<String>> = HashMap::new();
@@ -120,6 +122,7 @@ pub(crate) fn partition_removed_dead_candidates(
                     &r.symbol,
                     &external_pkgs,
                     member_names.contains(&r.symbol),
+                    &mut export_cache,
                 )
             });
             let attr = attribution_for_ref(facts, &x.path, &residual_defs, (x.line, x.column));
@@ -131,14 +134,11 @@ pub(crate) fn partition_removed_dead_candidates(
                     .push(attr);
                 continue;
             }
-            // 外部 import specifier の import 元名そのものの参照 (import 行) は別モジュールの
-            // export 名なので数えない (`import { Config as X } from "pkg"` の `Config`)。
-            if facts.external_source_name_lines.contains(&x.line) {
-                continue;
-            }
-            // 外部 import の local binding を持つファイルなら、その使用箇所も外部由来として
-            // 数えない (`import { Config } from "pkg"` の local Config 利用)。
-            if facts.external_local_bound {
+            // 外部パッケージの import の中の出現 (`import { Config as X } from "pkg"` の
+            // `Config`) と、その束縛の利用 (`import { Config } from "pkg"` の後の `Config`) は
+            // 別モジュールのシンボルなので数えない。判定は出現の位置ごとに行う。ファイル単位で
+            // 除外すると、同じファイルの `util.format` (削除元の名前空間のメンバー) まで数えない。
+            if facts.is_external_reference((x.line, x.column)) {
                 continue;
             }
             attributions.push(attr);
@@ -146,15 +146,38 @@ pub(crate) fn partition_removed_dead_candidates(
         counts.insert(r.symbol.clone(), (def_count, attributions));
     }
 
-    let empty_defs: HashSet<String> = HashSet::new();
     let empty_attrs: (usize, Vec<RefAttribution>) = (0, Vec::new());
     let ffi_evidence = super::removed_ffi::RustForeignBindingEvidence::new(dir, base_blobs);
+    // 削除前のファイルで宣言名と違う公開名 (default export / 別名 export) だった JS/TS の宣言名。
+    let mut published_names: HashMap<String, Option<super::js_public_name::PublishedNames>> =
+        HashMap::new();
     let mut removed_kept = Vec::new();
     let mut removed_dead = Vec::new();
     for c in candidates {
         let bare = bare_name(&c.name).to_string();
+        // `export default function formatPrice` / `export { formatPrice as price }` の利用者は
+        // `import fmt from` / `import { price } from` と公開名で書くので、宣言名の参照集合は
+        // 利用者を表さない。参照 0 件・全参照の帰属証明のどちらも「利用者がいない」根拠に
+        // ならないので、removed (blocking) に残す。
+        if !c.name.contains('.')
+            && published_names
+                .entry(c.file.clone())
+                .or_insert_with(|| {
+                    let lang = super::removed_attribution::path_lang(&c.file)
+                        .filter(|lang| super::removed_attribution::is_js_ts_family(*lang))?;
+                    let source = base_blobs.read(&c.file);
+                    Some(match source {
+                        Some(source) => super::js_public_name::published_names(&[&source], lang),
+                        None => super::js_public_name::PublishedNames::uncertain(),
+                    })
+                })
+                .as_ref()
+                .is_some_and(|names| names.may_differ(&bare))
+        {
+            removed_kept.push(c);
+            continue;
+        }
         let (def_count, attributions) = counts.get(&bare).unwrap_or(&empty_attrs);
-        let residual_defs = definition_paths.get(&bare).unwrap_or(&empty_defs);
         // 全参照が「削除ファイル c.file ではなく残存シンボル由来」と証明できた候補は、
         // 削除シンボルへの残存参照ゼロとして removed_dead (informational) に降格する。
         // 同名定義が複数残る場合 (従来は無条件 kept) も、帰属証明があれば bare name
@@ -166,22 +189,26 @@ pub(crate) fn partition_removed_dead_candidates(
             name: &c.name,
             kind: &c.kind,
         };
+        // Rust の削除を Swift / JS / TS が同名で参照している場合だけ、旧ツリーの FFI・
+        // バインディング生成の痕跡を調べる (言語表だけでは束縛の可否が決まらない)。
         let needs_foreign_evidence = c.file.ends_with(".rs")
             && attributions
                 .iter()
                 .chain(definition_attributions.get(&bare).into_iter().flatten())
-                .any(|a| a.ref_lang == Some(crate::language::LangId::Swift));
-        let foreign_bindable = !needs_foreign_evidence || ffi_evidence.may_bind(&c.file);
+                .any(|a| {
+                    a.ref_lang
+                        .is_some_and(super::removed_ffi::ForeignBindability::is_evidence_consumer)
+                });
+        let foreign_bindable = if needs_foreign_evidence {
+            ffi_evidence.may_bind(&c.file)
+        } else {
+            super::removed_ffi::ForeignBindability::ANY
+        };
         // 新しい位置別証明では、未知の class / method / overload 等の残存定義も
         // 無視しない。既存 JS / Bash のファイル単位証明にはこの条件を広げない。
         let definitions_proven = definition_attributions.get(&bare).is_none_or(|defs| {
             defs.iter().all(|a| {
-                proves_independent_definition_with_ffi(
-                    a,
-                    &candidate_ref,
-                    residual_defs,
-                    foreign_bindable,
-                )
+                proves_independent_definition_with_ffi(a, &candidate_ref, foreign_bindable)
             })
         });
         let uses_scope_proof = attributions.iter().any(|a| {
@@ -192,16 +219,16 @@ pub(crate) fn partition_removed_dead_candidates(
         });
         if !attributions.is_empty()
             && (!uses_scope_proof || definitions_proven)
-            && attributions.iter().all(|a| {
-                proves_survivor_origin_with_ffi(a, &candidate_ref, residual_defs, foreign_bindable)
-            })
+            && attributions
+                .iter()
+                .all(|a| proves_survivor_origin_with_ffi(a, &candidate_ref, foreign_bindable))
         {
             removed_dead.push(c);
             continue;
         }
         // 同名定義が複数残っている → 保守的に removed に残す
         let definitions_foreign = needs_foreign_evidence
-            && !foreign_bindable
+            && !foreign_bindable.swift
             && definition_attributions.get(&bare).is_some_and(|defs| {
                 defs.len() == *def_count
                     && !defs.is_empty()
@@ -380,67 +407,6 @@ pub(crate) fn import_specifier_package_name(spec: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// 外部パッケージ import 文 `import_stmt` を解析し、`symbol` の local binding 有無を
-/// `local_bound` に、import 元名が `symbol` の出現行を `source_name_lines` に記録する。
-pub(crate) fn collect_external_import_bindings(
-    import_stmt: tree_sitter::Node,
-    source: &[u8],
-    symbol: &str,
-    local_bound: &mut bool,
-    source_name_lines: &mut std::collections::HashSet<usize>,
-) {
-    let mut cursor = import_stmt.walk();
-    let Some(clause) = import_stmt
-        .named_children(&mut cursor)
-        .find(|c| c.kind() == "import_clause")
-    else {
-        return;
-    };
-    let mut clause_cursor = clause.walk();
-    for child in clause.named_children(&mut clause_cursor) {
-        match child.kind() {
-            // default import: `import Config from "..."`
-            "identifier" => {
-                if child.utf8_text(source).ok() == Some(symbol) {
-                    *local_bound = true;
-                }
-            }
-            // namespace import: `import * as Config from "..."`
-            "namespace_import" => {
-                let mut ns = child.walk();
-                if child
-                    .named_children(&mut ns)
-                    .any(|n| n.kind() == "identifier" && n.utf8_text(source).ok() == Some(symbol))
-                {
-                    *local_bound = true;
-                }
-            }
-            // named imports: `import { Foo, Bar as Baz } from "..."`
-            "named_imports" => {
-                let mut ni = child.walk();
-                for spec in child.named_children(&mut ni) {
-                    if spec.kind() != "import_specifier" {
-                        continue;
-                    }
-                    let name_node = spec.child_by_field_name("name");
-                    // import 元名が symbol → その出現行を記録 (別モジュールの export 名)
-                    if let Some(name) = name_node
-                        && name.utf8_text(source).ok() == Some(symbol)
-                    {
-                        source_name_lines.insert(name.start_position().row);
-                    }
-                    // local binding (alias があれば alias、無ければ name) が symbol → 利用も外部
-                    let local = spec.child_by_field_name("alias").or(name_node);
-                    if local.and_then(|n| n.utf8_text(source).ok()) == Some(symbol) {
-                        *local_bound = true;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 /// 削除された bash 関数 `name` が、変更後ツリーの bash 系ファイル内のどこからも
 /// 参照されていないかを判定する。CLI スクリプトを別言語に書き換えたときに、
 /// 新言語側の同名定義/参照を「別物」として扱うため bash ファイル限定で判定する。
@@ -449,11 +415,39 @@ pub(crate) fn collect_external_import_bindings(
 /// 関数名は Phase 0 で検索対象に入れる)。旧実装は関数ごとに `find_references` で全リポジトリを
 /// 走査しており、削除関数 600 個で Stop hook の 120 秒制限に迫っていた。
 /// 未収集 / 検索失敗の name は保守的に false を返してレビュー対象として残す。
-pub(crate) fn is_removed_bash_symbol_unreferenced(index: &ApiRefIndex, name: &str) -> bool {
+///
+/// 参照ファイルが bash かは refs と同じく拡張子 → shebang の順で判定する。拡張子だけで
+/// 判定すると `bin/deploy` のような拡張子なしの bash スクリプトからの呼び出しを「bash 以外の
+/// 同名参照」と誤認し、使われている関数の削除を何も報告しなくなる。読めない・判定できない
+/// 拡張子なしファイルは bash の参照とみなす (保守側)。
+pub(crate) fn is_removed_bash_symbol_unreferenced(
+    index: &ApiRefIndex,
+    dir: &str,
+    name: &str,
+) -> bool {
     let Some(refs) = index.refs_for(name) else {
         return false;
     };
-    refs.iter().all(|r| !is_bash_script_path(r.path.as_str()))
+    refs.iter()
+        .all(|r| !is_bash_reference_file(dir, r.path.as_str()))
+}
+
+/// 参照ファイルが bash 系か。拡張子で決まらない場合は shebang まで見る。
+fn is_bash_reference_file(dir: &str, path: &str) -> bool {
+    if is_bash_script_path(path) {
+        return true;
+    }
+    let relative = std::path::Path::new(path);
+    if relative.extension().is_some() {
+        return false;
+    }
+    let full = if relative.is_absolute() {
+        relative.to_path_buf()
+    } else {
+        std::path::Path::new(dir).join(relative)
+    };
+    crate::engine::refs::detect_source_lang(&full)
+        .is_none_or(|lang| lang == crate::language::LangId::Bash)
 }
 
 /// 拡張子から bash 系シェルスクリプトファイル（.sh / .bash / .zsh）かを判定する。

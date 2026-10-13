@@ -7,6 +7,7 @@ pub(crate) fn detect_react_wrapper_compatible_mod(
     index: &ApiRefIndex,
     site: &CompatibleModSite<'_>,
     sources: &mut SignatureSourceCache<'_>,
+    caches: &mut ApiClosureCaches,
 ) -> Option<CompatibleApiModification> {
     let lang = site.lang_in(TS_JS_LANGS)?;
     if !new_sig_has_react_wrapper(site.new_sig) {
@@ -21,7 +22,7 @@ pub(crate) fn detect_react_wrapper_compatible_mod(
     if old_props != new_props {
         return None;
     }
-    if has_blocking_value_usage(index, site.name) {
+    if has_blocking_value_usage(index, site.dir, site.name, caches) {
         return None;
     }
     Some(site.compatible("react_component_wrapper"))

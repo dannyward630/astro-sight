@@ -1,4 +1,4 @@
-//! 削除した Rust 宣言が Swift から束縛可能だったか、旧ツリー全体の FFI 痕跡を調べる。
+//! 削除した Rust 宣言が Swift / JS から束縛可能だったか、旧ツリー全体の FFI 痕跡を調べる。
 //! 推定できない場合は可能性ありとして api.rm を維持する。
 
 use std::cell::OnceCell;
@@ -8,10 +8,46 @@ use crate::engine::parser;
 use crate::git_support::validate_git_revision;
 use crate::language::LangId;
 
+/// 削除した Rust 宣言を、別エコシステムの言語が同じ識別子で束縛し得るか (参照側の言語ごと)。
+/// どちらも「旧ツリーに痕跡が無いと確認できた」ときだけ false になる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ForeignBindability {
+    /// Swift (C ABI / uniffi / swift-bridge など)。
+    pub(crate) swift: bool,
+    /// JS / TS。wasm-bindgen / napi-rs / neon は生成した JS モジュールから同じ識別子で公開し、
+    /// C ABI の関数も wasm の `instance.exports.<名前>` として同じ名前で呼べる。
+    pub(crate) js: bool,
+}
+
+impl ForeignBindability {
+    /// 証拠を調べていない / 調べられない場合。どの言語からも束縛され得るとみなす。
+    pub(crate) const ANY: Self = Self {
+        swift: true,
+        js: true,
+    };
+
+    /// 参照側の言語から束縛され得るか。痕跡で判定しない言語は true (従来の言語表に任せる)。
+    pub(crate) fn allows(self, reference: LangId) -> bool {
+        match reference {
+            LangId::Swift => self.swift,
+            LangId::Javascript | LangId::Typescript | LangId::Tsx => self.js,
+            _ => true,
+        }
+    }
+
+    /// 旧ツリーの痕跡で束縛可否を決める参照側の言語か。
+    pub(crate) fn is_evidence_consumer(reference: LangId) -> bool {
+        matches!(
+            reference,
+            LangId::Swift | LangId::Javascript | LangId::Typescript | LangId::Tsx
+        )
+    }
+}
+
 pub(super) struct RustForeignBindingEvidence<'a> {
     dir: &'a str,
     blobs: &'a GitBlobBatch,
-    may_bind: OnceCell<bool>,
+    may_bind: OnceCell<ForeignBindability>,
 }
 
 impl<'a> RustForeignBindingEvidence<'a> {
@@ -23,22 +59,31 @@ impl<'a> RustForeignBindingEvidence<'a> {
         }
     }
 
-    /// 旧ツリー全体に印が無いと確認できた場合だけ false。失敗もキャッシュする。
-    pub(super) fn may_bind(&self, old_path: &str) -> bool {
+    /// 旧ツリー全体に印が無いと確認できた言語だけ false。失敗もキャッシュする。
+    pub(super) fn may_bind(&self, old_path: &str) -> ForeignBindability {
         if !old_path.ends_with(".rs") {
-            return true;
+            return ForeignBindability::ANY;
         }
         // 明示 diff と base の組み合わせが食い違うと旧ツリーの FFI を見落とす。
         let Some(old_source) = self.blobs.read_limited(old_path, 2 * 1024 * 1024) else {
-            return true;
+            return ForeignBindability::ANY;
         };
         if is_lfs_pointer(&old_source) {
-            return true;
+            return ForeignBindability::ANY;
         }
-        *self.may_bind.get_or_init(|| self.scan_old_tree())
+        *self.may_bind.get_or_init(|| {
+            let mut js = false;
+            if self.scan_old_tree(&mut js) {
+                ForeignBindability::ANY
+            } else {
+                ForeignBindability { swift: false, js }
+            }
+        })
     }
 
-    fn scan_old_tree(&self) -> bool {
+    /// どの言語からも束縛され得る痕跡 (C ABI・ブリッジ・判定不能) があれば true。JS 向けの
+    /// バインディング生成 (wasm-bindgen 等) の痕跡だけがある場合は false を返し `js` を立てる。
+    fn scan_old_tree(&self, js: &mut bool) -> bool {
         if validate_git_revision(self.blobs.rev(), "base").is_err() {
             return true;
         }
@@ -171,6 +216,9 @@ impl<'a> RustForeignBindingEvidence<'a> {
             {
                 return true;
             }
+            if has_js_binding_marker(&content) {
+                *js = true;
+            }
         }
         false
     }
@@ -208,6 +256,25 @@ fn has_foreign_marker(content: &[u8]) -> bool {
         "interoptopus",
         "flapigen",
         "rust_swig",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker))
+}
+
+/// JS から Rust の関数を同じ識別子で呼べるようにするバインディング生成の痕跡
+/// (Cargo.toml の依存名、属性、クレートパス)。部分一致で広めに拾う (拾いすぎは blocking 側)。
+fn has_js_binding_marker(content: &[u8]) -> bool {
+    let Ok(source) = std::str::from_utf8(content) else {
+        return true;
+    };
+    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    [
+        "wasm_bindgen",
+        "wasm-bindgen",
+        "napi",
+        "neon",
+        "deno_bindgen",
+        "deno-bindgen",
     ]
     .iter()
     .any(|marker| compact.contains(marker))
@@ -316,6 +383,9 @@ mod tests {
         );
         let path = repo.to_str().expect("utf-8 path");
         let blobs = GitBlobBatch::new(path, "HEAD");
-        assert!(RustForeignBindingEvidence::new(path, &blobs).may_bind("src/lib.rs"));
+        assert_eq!(
+            RustForeignBindingEvidence::new(path, &blobs).may_bind("src/lib.rs"),
+            super::ForeignBindability::ANY
+        );
     }
 }

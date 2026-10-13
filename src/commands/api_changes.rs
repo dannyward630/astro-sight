@@ -598,6 +598,8 @@ pub(crate) mod exported;
 mod forwarded_values;
 mod js_const;
 mod js_member_origin;
+mod js_public_name;
+mod js_ref_sites;
 mod js_ts_call_arity;
 mod js_ts_shadow;
 pub(crate) mod prepare;

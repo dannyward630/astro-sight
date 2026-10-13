@@ -1566,6 +1566,47 @@ fn member_access_ref_detects_object_destructuring() {
     );
 }
 
+/// 置換を含まない template literal の添字 (`` config[`beta`] ``) は `config["beta"]` と同じ
+/// 静的なキーアクセスなので member 参照として数える。見落とすと利用中のキーの削除が
+/// unused_object_members (非 blocking) に降格する。置換を含むものは `config[key]` と同じく
+/// 動的なアクセスで、従来どおり数えない。
+#[test]
+fn member_access_ref_detects_static_template_literal_subscript() {
+    for lang in [
+        crate::language::LangId::Javascript,
+        crate::language::LangId::Typescript,
+        crate::language::LangId::Tsx,
+    ] {
+        assert!(
+            source_has_member_access_ref(b"const x = config[`beta`];", lang, "beta")
+                .expect("parse"),
+            "{lang:?}: 置換のない template literal の添字は member 参照"
+        );
+        assert!(
+            source_has_any_member_access_ref(
+                b"const x = Number(config[`beta`]);",
+                lang,
+                &HashSet::from(["beta"]),
+            )
+            .expect("parse"),
+            "{lang:?}: batch 経路でも数える"
+        );
+        // 対照: 文字列の添字は従来どおり、別キーと置換付きは数えない
+        assert!(
+            source_has_member_access_ref(b"const x = config[\"beta\"];", lang, "beta")
+                .expect("parse")
+        );
+        assert!(
+            !source_has_member_access_ref(b"const x = config[`alpha`];", lang, "beta")
+                .expect("parse")
+        );
+        assert!(
+            !source_has_member_access_ref(b"const x = config[`${beta}`];", lang, "beta")
+                .expect("parse")
+        );
+    }
+}
+
 /// 複数の削除キーを 1 回の AST walk で照合しても、単一キー版と同じ member 位置だけを
 /// 参照として扱う。候補名が通常の変数位置にあるだけでは一致させない。
 #[test]

@@ -721,8 +721,18 @@ fn collect_modified_symbols(
             // 落とすと契約変更の 3 値判定に到達できず、「キーが必須化する破壊的変更」が
             // api.mod にすら出なくなる。判定が `NotApplicable` なら
             // `classify_signature_change` 側で従来どおり捨てる。
+            // default export / 別名 export (`export { f as g }`) の利用者は宣言名で現れないので、
+            // 宣言名の cross-file 参照 0 件は「同一ファイル内でしか使われていない」証明にならない。
             let internally_closed = is_internally_connected(in_file_callees, name)
-                && !has_cross_file_refs(ref_index, &df.new_path, name);
+                && !has_cross_file_refs(ref_index, &df.new_path, name)
+                && !super::js_public_name::published_names_for_diff_file(
+                    dir,
+                    base_blobs,
+                    &df.old_path,
+                    &df.new_path,
+                    state.closure_caches,
+                )
+                .is_some_and(|names| !name.contains('.') && names.may_differ(name));
             if internally_closed
                 && !may_be_python_typed_dict_total_change(kind, old_sig, new_sig, lang_id_for_file)
             {
@@ -810,6 +820,7 @@ pub(crate) fn classify_signature_change(
         base,
         diff_files,
         ref_index,
+        base_blobs,
         ..
     } = inputs;
     let SignatureChangeSite {
@@ -821,6 +832,18 @@ pub(crate) fn classify_signature_change(
         internally_closed,
     } = site;
     let name = change.name.clone();
+    // 宣言名と違う公開名 (default export / 別名 export) の利用者は宣言名の参照に現れない。
+    // 参照の集合から互換・追随済みを証明する判定 (JSX だけの利用、省略可能引数の削除、
+    // 同一 diff での追随) はどれも使えない。
+    let public_name_differs = !name.contains('.')
+        && super::js_public_name::published_names_for_diff_file(
+            dir,
+            base_blobs,
+            &df.old_path,
+            &df.new_path,
+            state.closure_caches,
+        )
+        .is_some_and(|names| names.may_differ(&name));
     // 以降の互換判定器はすべて同じ現場情報を見る。old/new ソースは最初に必要になった
     // 判定器で 1 度だけ取得して使い回す (旧実装は判定器ごとに git show を起動していた)。
     let site = CompatibleModSite {
@@ -915,7 +938,10 @@ pub(crate) fn classify_signature_change(
         }
     }
     // React component を memo / forwardRef 等の HOC でラップしただけは compatible_modified
-    if let Some(compat) = detect_react_wrapper_compatible_mod(ref_index, &site, sources) {
+    if !public_name_differs
+        && let Some(compat) =
+            detect_react_wrapper_compatible_mod(ref_index, &site, sources, state.closure_caches)
+    {
         state.buckets.compatible_modified.push(compat);
         return;
     }
@@ -934,12 +960,14 @@ pub(crate) fn classify_signature_change(
         state.buckets.compatible_modified.push(compat);
         return;
     }
-    if let Some(compat) = detect_trailing_optional_params_removed_compatible_mod(
-        ref_index,
-        &site,
-        sources,
-        &mut state.closure_caches.optional_removal,
-    ) {
+    if !public_name_differs
+        && let Some(compat) = detect_trailing_optional_params_removed_compatible_mod(
+            ref_index,
+            &site,
+            sources,
+            &mut state.closure_caches.optional_removal,
+        )
+    {
         state.buckets.compatible_modified.push(compat);
         return;
     }
@@ -958,15 +986,27 @@ pub(crate) fn classify_signature_change(
     }
     // React Server Component の async 化 (async キーワード追加のみ + 全参照が JSX タグ利用)
     // は呼び出し側の書き換えが不要なため compatible_modified として扱う。
-    if let Some(compat) = detect_async_jsx_component_compatible_mod(ref_index, &site, sources) {
+    if !public_name_differs
+        && let Some(compat) = detect_async_jsx_component_compatible_mod(
+            ref_index,
+            &site,
+            sources,
+            state.closure_caches,
+        )
+    {
         state.buckets.compatible_modified.push(compat);
         return;
     }
     // 引数なし関数コンポーネントへ default 値の無い全 optional の destructured props を
     // 足しただけで、参照がすべて JSX タグ利用なら `<X />` はそのまま通るため
     // compatible_modified とする (default 値 / `?` 付きは trailing_optional_params が扱う)。
-    if let Some(compat) =
-        detect_optional_props_jsx_component_compatible_mod(ref_index, &site, sources)
+    if !public_name_differs
+        && let Some(compat) = detect_optional_props_jsx_component_compatible_mod(
+            ref_index,
+            &site,
+            sources,
+            state.closure_caches,
+        )
     {
         state.buckets.compatible_modified.push(compat);
         return;
@@ -1007,6 +1047,7 @@ pub(crate) fn classify_signature_change(
             target_new_path: &df.new_path,
             diff_files,
             arg_evidence,
+            public_name_differs,
         },
         state.closure_caches,
     ) {
@@ -1177,7 +1218,7 @@ pub(crate) fn process_deleted_file(
             && !bash_exported
                 .get_or_insert_with(|| bash_exported_functions_in_git(dir, base, &df.old_path))
                 .contains(name)
-            && is_removed_bash_symbol_unreferenced(ref_index, name)
+            && is_removed_bash_symbol_unreferenced(ref_index, dir, name)
         {
             continue;
         }

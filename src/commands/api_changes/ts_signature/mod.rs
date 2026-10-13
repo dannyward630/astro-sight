@@ -9,7 +9,7 @@ use crate::engine::parser;
 use crate::models::review::CompatibleApiModification;
 
 use super::source_pair::{CompatibleModSite, SignatureSourceCache};
-use super::{ApiRefIndex, has_blocking_value_usage};
+use super::{ApiClosureCaches, ApiRefIndex, has_blocking_value_usage};
 
 mod callable;
 mod function_params;
@@ -369,57 +369,6 @@ pub(crate) fn first_param_type_text(params: tree_sitter::Node, source: &[u8]) ->
         }
         _ => None,
     }
-}
-
-/// 参照行 `ctx` 内の `name` 出現がすべて JSX タグ利用 (`<X` / `</X`) かを判定する。
-/// 値利用 (`X(` 呼び出し / `X.` / `X[` / `new X` / `typeof X`) や JSX でない裸の出現を
-/// 含むなら false (= blocking 側に倒す)。
-pub(crate) fn ctx_usage_is_jsx_or_safe(ctx: &str, name: &str) -> bool {
-    let bytes = ctx.as_bytes();
-    let nb = name.as_bytes();
-    if nb.is_empty() {
-        return false;
-    }
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
-    let mut i = 0;
-    let mut saw_occurrence = false;
-    while i + nb.len() <= bytes.len() {
-        if &bytes[i..i + nb.len()] == nb {
-            let before = if i == 0 { None } else { Some(bytes[i - 1]) };
-            let after = bytes.get(i + nb.len()).copied();
-            let before_boundary = before.is_none_or(|b| !is_ident(b));
-            let after_boundary = after.is_none_or(|b| !is_ident(b));
-            if before_boundary && after_boundary {
-                saw_occurrence = true;
-                let next_non_ws = ctx[i + nb.len()..].trim_start().as_bytes().first().copied();
-                let is_call = next_non_ws == Some(b'(');
-                let is_member = next_non_ws == Some(b'.') || next_non_ws == Some(b'[');
-                // 直前の識別子トークンを取る (空白だけでなく `(` `=` 等の非識別子文字でも
-                // 区切る)。`memo(function NAME` のように `(` 直後に関数キーワードが来るケースを
-                // 正しく拾うため split_whitespace ではなく識別子境界で分割する。
-                let last_ident = ctx[..i]
-                    .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
-                    .find(|s| !s.is_empty())
-                    .unwrap_or("");
-                let is_typeof = last_ident == "typeof";
-                let is_new = last_ident == "new";
-                // 宣言キーワード直後の出現は定義 (変数宣言名 / named function expression 名 /
-                // class 名) であり値利用でない。`export const X = memo(function X(...))` の
-                // `const X` と内側 `function X` の両方がこれに当たる。
-                let is_decl = matches!(last_ident, "const" | "let" | "var" | "function" | "class");
-                if !is_decl && (is_call || is_member || is_typeof || is_new) {
-                    return false;
-                }
-                let is_jsx = before == Some(b'<') || (i >= 2 && &bytes[i - 2..i] == b"</");
-                if !is_jsx && !is_decl {
-                    // JSX でも宣言でも値利用でもない裸の出現は判定不能 → 安全側 (blocking)
-                    return false;
-                }
-            }
-        }
-        i += 1;
-    }
-    saw_occurrence
 }
 
 /// TS/TSX/JS の exported object (`export const X = { ... }`) のプロパティ削除を互換変更
@@ -1336,11 +1285,22 @@ fn member_access_keys_have_ref(dir: &str, keys: &HashSet<&str>) -> bool {
         Ok(ac) => ac,
         Err(_) => return true,
     };
-    let files = match crate::engine::refs::collect_files(std::path::Path::new(dir), None) {
-        Ok(files) => files,
+    let collection = match crate::engine::refs::collect_files_scan(
+        std::path::Path::new(dir),
+        None,
+        crate::engine::refs::FileScanOptions::default(),
+    ) {
+        Ok(collection) => collection,
         Err(_) => return true,
     };
-    files
+    // `.vue` などの解析できない埋め込みソースにある `config.b` は走査できない。削除キーが単語として
+    // 現れ得るソースがあれば、削除キーが使われていないとは言えない。
+    let key_list: Vec<&str> = keys.iter().copied().collect();
+    if super::EmbeddedJsSources::from_collection(&collection).may_mention(&key_list) {
+        return true;
+    }
+    collection
+        .files
         .into_par_iter()
         .any(|path| file_has_any_member_access_ref(path.as_path(), keys, &ac).unwrap_or(true))
 }
@@ -1449,9 +1409,14 @@ fn member_access_ref_key<'a>(node: tree_sitter::Node, source: &'a [u8]) -> Optio
         "member_expression" => node
             .child_by_field_name("property")
             .and_then(|property| property.utf8_text(source).ok()),
+        // 置換を含まない template literal (`` config[`b`] ``) も `config["b"]` と同じ静的な
+        // キーアクセス。置換を含むものは `config[key]` と同じく動的なので数えない。
         "subscript_expression" => node
             .child_by_field_name("index")
-            .filter(|index| index.kind() == "string")
+            .filter(|index| {
+                index.kind() == "string"
+                    || (index.kind() == "template_string" && !template_has_substitution(*index))
+            })
             .and_then(|index| static_js_string_text(index, source)),
         // destructuring (`const { beta } = config;`) も member の実利用。
         // shorthand (`{ beta }` / `{ beta = 1 }` の左辺) は
@@ -1467,6 +1432,13 @@ fn member_access_ref_key<'a>(node: tree_sitter::Node, source: &'a [u8]) -> Optio
         }
         _ => None,
     }
+}
+
+/// template literal が `${expr}` の置換を含むか。
+fn template_has_substitution(node: tree_sitter::Node) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == "template_substitution")
 }
 
 pub(crate) fn static_js_string_text<'a>(

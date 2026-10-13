@@ -58,15 +58,53 @@ pub(crate) fn resolve_reference_binding(
     }
 
     // lexical scope chain を内側から外側へ辿り、最初に同名 binding を持つ scope で判定する。
+    match resolve_scope_binding(node, source, name, Namespace::Value) {
+        Some(ScopeBinding::FunctionDeclaration) => LocalResolution::SameFileFunction,
+        _ => LocalResolution::OtherOrAmbiguous,
+    }
+}
+
+/// 名前の名前空間。TS の型の位置 (`type_identifier`) は型の宣言だけに束縛される。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Namespace {
+    Value,
+    Type,
+}
+
+/// 字句スコープで見つかった同名の束縛。
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ScopeBinding<'tree> {
+    /// `function f() {}` / `function* f() {}`
+    FunctionDeclaration,
+    /// `class C {}` / `abstract class C {}`
+    ClassDeclaration,
+    /// TS の `interface` / `type` と `enum`
+    TypeDeclaration,
+    /// `const` / `let` / `var` の単純な名前の束縛 (`variable_declarator`)
+    Variable(Node<'tree>),
+    /// import 文が導入する束縛 (`import_statement`)
+    Import(Node<'tree>),
+    /// 引数・catch・ループ変数・分割代入・名前付き関数式の自己参照名・型引数・
+    /// `declare` だけの宣言・TS の namespace など、値の由来を確かめられない束縛
+    Other,
+}
+
+/// `node` (参照の名前) から字句スコープを内側から外側へ辿り、最初に見つかった同名の束縛を返す。
+/// ファイル内に束縛が無ければ None (大域・未定義)。
+pub(crate) fn resolve_scope_binding<'tree>(
+    node: Node<'tree>,
+    source: &[u8],
+    name: &str,
+    namespace: Namespace,
+) -> Option<ScopeBinding<'tree>> {
     let mut cur = node;
     while let Some(scope) = enclosing_scope(cur) {
-        match find_binding_in_scope(scope, source, name) {
-            Some(BindingKind::FunctionDeclaration) => return LocalResolution::SameFileFunction,
-            Some(_) => return LocalResolution::OtherOrAmbiguous,
-            None => cur = scope,
+        if let Some(found) = find_binding_in_scope(scope, source, name, namespace) {
+            return Some(found);
         }
+        cur = scope;
     }
-    LocalResolution::OtherOrAmbiguous
+    None
 }
 
 /// scope を作るノードまで親方向へ辿る。
@@ -99,57 +137,74 @@ fn is_scope_node(kind: &str) -> bool {
     )
 }
 
-/// scope 内で見つかった同名 binding の種類。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BindingKind {
-    FunctionDeclaration,
-    Other,
-}
-
-/// `scope` 配下 (ネストした scope の内側は除く) に `name` の value binding があるかを探す。
+/// `scope` 配下 (ネストした scope の内側は除く) に `name` の binding があるかを探す。
 /// `var` の hoisting / block 内宣言を漏らさないため、ネスト scope の境界までは再帰で潜る
 /// (function 系の内側の宣言はその scope のものなので潜らない。ただし function 自身の名前は
 /// 現 scope の binding として拾う)。
-fn find_binding_in_scope(scope: Node<'_>, source: &[u8], name: &str) -> Option<BindingKind> {
-    // 関数系 scope は parameter も binding。
-    if let Some(params) = scope.child_by_field_name("parameters")
-        && pattern_binds_name(params, source, name)
-    {
-        return Some(BindingKind::Other);
-    }
-    // 単一 parameter の arrow (`x => ...`) は parameter フィールドが identifier。
-    if let Some(param) = scope.child_by_field_name("parameter")
-        && param.kind() == "identifier"
-        && param.utf8_text(source).ok() == Some(name)
-    {
-        return Some(BindingKind::Other);
-    }
-    // catch (e) の e。
-    if scope.kind() == "catch_clause"
-        && let Some(param) = scope.child_by_field_name("parameter")
-        && pattern_binds_name(param, source, name)
-    {
-        return Some(BindingKind::Other);
-    }
-    // 名前付き function expression の自己参照名は内部 scope の binding。
-    if matches!(scope.kind(), "function_expression" | "generator_function")
-        && let Some(n) = scope.child_by_field_name("name")
-        && n.utf8_text(source).ok() == Some(name)
-    {
-        return Some(BindingKind::Other);
-    }
-    // for-of / for-in の loop 変数 (`for (const x of xs)`) は left field の bare pattern
-    // (lexical_declaration に包まれない) のため body 探索では見えない。ここで拾わないと
-    // loop 変数への参照を外側の同名 function_declaration へ誤解決する (fail-open)。
-    if scope.kind() == "for_in_statement"
-        && let Some(left) = scope.child_by_field_name("left")
-        && pattern_binds_name(left, source, name)
-    {
-        return Some(BindingKind::Other);
+fn find_binding_in_scope<'tree>(
+    scope: Node<'tree>,
+    source: &[u8],
+    name: &str,
+    namespace: Namespace,
+) -> Option<ScopeBinding<'tree>> {
+    if namespace == Namespace::Type {
+        // 型の位置は型引数 (`function f<T>()` の T) に束縛される。
+        if let Some(params) = scope.child_by_field_name("type_parameters") {
+            let mut cursor = params.walk();
+            if params.named_children(&mut cursor).any(|param| {
+                param
+                    .child_by_field_name("name")
+                    .is_some_and(|n| n.utf8_text(source).ok() == Some(name))
+            }) {
+                return Some(ScopeBinding::Other);
+            }
+        }
+    } else {
+        // 関数系 scope は parameter も binding。
+        if let Some(params) = scope.child_by_field_name("parameters")
+            && pattern_binds_name(params, source, name)
+        {
+            return Some(ScopeBinding::Other);
+        }
+        // 単一 parameter の arrow (`x => ...`) は parameter フィールドが identifier。
+        if let Some(param) = scope.child_by_field_name("parameter")
+            && param.kind() == "identifier"
+            && param.utf8_text(source).ok() == Some(name)
+        {
+            return Some(ScopeBinding::Other);
+        }
+        // catch (e) の e。
+        if scope.kind() == "catch_clause"
+            && let Some(param) = scope.child_by_field_name("parameter")
+            && pattern_binds_name(param, source, name)
+        {
+            return Some(ScopeBinding::Other);
+        }
+        // 名前付き function expression の自己参照名は内部 scope の binding。
+        if matches!(scope.kind(), "function_expression" | "generator_function")
+            && let Some(n) = scope.child_by_field_name("name")
+            && n.utf8_text(source).ok() == Some(name)
+        {
+            return Some(ScopeBinding::Other);
+        }
+        // for-of / for-in の loop 変数 (`for (const x of xs)`) は left field の bare pattern
+        // (lexical_declaration に包まれない) のため body 探索では見えない。ここで拾わないと
+        // loop 変数への参照を外側の同名 function_declaration へ誤解決する (fail-open)。
+        if scope.kind() == "for_in_statement"
+            && let Some(left) = scope.child_by_field_name("left")
+            && pattern_binds_name(left, source, name)
+        {
+            return Some(ScopeBinding::Other);
+        }
     }
 
     let body = scope.child_by_field_name("body").unwrap_or(scope);
-    find_binding_in_subtree(body, source, name, false)
+    find_binding_in_subtree(body, source, name, false, namespace)
+}
+
+fn declares_name(node: Node<'_>, source: &[u8], name: &str) -> bool {
+    node.child_by_field_name("name")
+        .is_some_and(|n| n.utf8_text(source).ok() == Some(name))
 }
 
 /// `node` 配下の宣言 binding を探す。
@@ -161,66 +216,91 @@ fn find_binding_in_scope(scope: Node<'_>, source: &[u8], name: &str) -> Option<B
 /// これを分けないと `if (flag) { function startRecording() {} }` の block 内宣言を
 /// 外側の呼び出しの binding と誤認し、未更新 caller を誤って closed にする fail-open
 /// になる (codex レビュー指摘)。
-fn find_binding_in_subtree(
-    node: Node<'_>,
+fn find_binding_in_subtree<'tree>(
+    node: Node<'tree>,
     source: &[u8],
     name: &str,
     in_nested_block: bool,
-) -> Option<BindingKind> {
+    namespace: Namespace,
+) -> Option<ScopeBinding<'tree>> {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
             "function_declaration" | "generator_function_declaration" => {
                 if !in_nested_block
-                    && child
-                        .child_by_field_name("name")
-                        .is_some_and(|n| n.utf8_text(source).ok() == Some(name))
+                    && namespace == Namespace::Value
+                    && declares_name(child, source, name)
                 {
-                    return Some(BindingKind::FunctionDeclaration);
+                    return Some(ScopeBinding::FunctionDeclaration);
                 }
                 // 内側 (parameters / body) はネスト scope なので潜らない。
             }
-            "class_declaration" => {
+            "class_declaration" | "abstract_class_declaration" => {
+                if !in_nested_block && declares_name(child, source, name) {
+                    return Some(ScopeBinding::ClassDeclaration);
+                }
+            }
+            // TS の型宣言は型の名前空間だけに束縛する。enum は値と型の両方。
+            "interface_declaration" | "type_alias_declaration" => {
                 if !in_nested_block
-                    && child
-                        .child_by_field_name("name")
-                        .is_some_and(|n| n.utf8_text(source).ok() == Some(name))
+                    && namespace == Namespace::Type
+                    && declares_name(child, source, name)
                 {
-                    return Some(BindingKind::Other);
+                    return Some(ScopeBinding::TypeDeclaration);
+                }
+            }
+            "enum_declaration" => {
+                if !in_nested_block && declares_name(child, source, name) {
+                    return Some(ScopeBinding::TypeDeclaration);
+                }
+            }
+            // `declare function f()` / `declare const x` は実体が別の場所にある宣言。
+            // TS の namespace (`namespace N {}`) も中身を辿らず由来不明として扱う。
+            "ambient_declaration" | "internal_module" | "module" => {
+                if !in_nested_block && subtree_declares_name(child, source, name) {
+                    return Some(ScopeBinding::Other);
                 }
             }
             // let / const は block scope: ネスト block 内の宣言は現 scope の binding でない。
             "lexical_declaration" => {
                 if !in_nested_block
-                    && let Some(found) = find_binding_in_subtree(child, source, name, false)
+                    && let Some(found) =
+                        find_binding_in_subtree(child, source, name, false, namespace)
                 {
                     return Some(found);
                 }
             }
             // var は関数 scope に hoist されるため、ネスト block 内でも拾う。
             "variable_declaration" => {
-                if let Some(found) = find_binding_in_subtree(child, source, name, in_nested_block) {
+                if let Some(found) =
+                    find_binding_in_subtree(child, source, name, in_nested_block, namespace)
+                {
                     return Some(found);
                 }
             }
             "variable_declarator" => {
-                if let Some(pat) = child.child_by_field_name("name")
+                if namespace == Namespace::Value
+                    && let Some(pat) = child.child_by_field_name("name")
                     && pattern_binds_name(pat, source, name)
                 {
-                    return Some(BindingKind::Other);
+                    return Some(if pat.kind() == "identifier" {
+                        ScopeBinding::Variable(child)
+                    } else {
+                        ScopeBinding::Other
+                    });
                 }
                 // 初期化子内はさらに探索 (ネスト scope は下で打ち切られる)。
                 if let Some(value) = child.child_by_field_name("value")
                     && !is_scope_node(value.kind())
                     && let Some(found) =
-                        find_binding_in_subtree(value, source, name, in_nested_block)
+                        find_binding_in_subtree(value, source, name, in_nested_block, namespace)
                 {
                     return Some(found);
                 }
             }
             "import_statement" => {
                 if !in_nested_block && import_binds_name(child, source, name) {
-                    return Some(BindingKind::Other);
+                    return Some(ScopeBinding::Import(child));
                 }
             }
             _ => {
@@ -238,26 +318,58 @@ fn find_binding_in_subtree(
                 // `for (var x of xs)` の var ヘッダ binding は関数 scope へ hoist される。
                 // left は variable_declaration に包まれない bare pattern のため専用処理
                 // (let/const は for scope 限りなので拾わない)。
-                if child.kind() == "for_in_statement"
+                if namespace == Namespace::Value
+                    && child.kind() == "for_in_statement"
                     && child
                         .child_by_field_name("kind")
                         .is_some_and(|k| k.kind() == "var")
                     && let Some(left) = child.child_by_field_name("left")
                     && pattern_binds_name(left, source, name)
                 {
-                    return Some(BindingKind::Other);
+                    return Some(ScopeBinding::Other);
                 }
                 // statement_block / switch_body (および制御構造の中身) へ潜る際は
                 // nested block 扱いに切り替え、以降は var 由来の binding だけを拾う。
                 let nested =
                     in_nested_block || matches!(child.kind(), "statement_block" | "switch_body");
-                if let Some(found) = find_binding_in_subtree(child, source, name, nested) {
+                if let Some(found) = find_binding_in_subtree(child, source, name, nested, namespace)
+                {
                     return Some(found);
                 }
             }
         }
     }
     None
+}
+
+/// `declare` / TS の namespace 宣言が `name` を宣言するか (宣言名のどれかが一致すれば true)。
+fn subtree_declares_name(node: Node<'_>, source: &[u8], name: &str) -> bool {
+    if declares_name(node, source, name) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| match child.kind() {
+            "function_signature"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "enum_declaration"
+            | "interface_declaration"
+            | "type_alias_declaration"
+            | "internal_module"
+            | "module" => declares_name(child, source, name),
+            "lexical_declaration" | "variable_declaration" => {
+                let mut declarators = child.walk();
+                child
+                    .named_children(&mut declarators)
+                    .filter(|d| d.kind() == "variable_declarator")
+                    .any(|d| {
+                        d.child_by_field_name("name")
+                            .is_some_and(|pat| pattern_binds_name(pat, source, name))
+                    })
+            }
+            _ => false,
+        })
 }
 
 /// binding パターン (identifier / destructuring / rest / default) が `name` を束縛するか。

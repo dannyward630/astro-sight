@@ -27,8 +27,8 @@ const UNANALYZABLE_EXT_CAP: usize = 10;
 /// 「参照が無い」と「観測できなかった」を利用者が区別できるようにする。
 #[rustfmt::skip]
 const UNANALYZABLE_SOURCE_EXTENSIONS: &[&str] = &[
-    // JS/TS を埋め込むコンポーネント形式
-    "astro", "svelte", "vue",
+    // JS/TS を埋め込むコンポーネント形式 (MDX は Markdown に ESM の import と JSX を埋め込む)
+    "astro", "mdx", "svelte", "vue",
     // サーバサイドテンプレート (ホスト言語の識別子を参照する)
     "cshtml", "ejs", "erb", "haml", "hbs", "jsp", "jspx", "liquid", "mustache", "pug",
     "razor", "slim", "twig", "vbhtml",
@@ -172,6 +172,11 @@ impl FileCollection {
                 )
             })
             .collect()
+    }
+
+    /// 解析できないソースとして走査から外したファイル (全件)。
+    pub fn unanalyzable_source_paths(&self) -> &[std::path::PathBuf] {
+        &self.unanalyzable_sources
     }
 
     /// 解析できなかったソースを拡張子単位に畳んで打ち切り申告にする。

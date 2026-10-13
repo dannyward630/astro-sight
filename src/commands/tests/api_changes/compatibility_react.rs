@@ -104,6 +104,7 @@ fn detect_react_wrapper_multiline_destructured_props_is_compatible() {
             lang_id: Some(crate::language::LangId::Tsx),
         },
         &mut SignatureSourceCache::default(),
+        &mut crate::commands::api_changes::ApiClosureCaches::default(),
     );
     let compat = result.expect("複数行 destructured props でも memo ラップのみなら compatible");
     assert_eq!(compat.reason, "react_component_wrapper");
@@ -154,6 +155,7 @@ fn detect_react_wrapper_with_call_usage_stays_blocking() {
             lang_id: Some(crate::language::LangId::Tsx),
         },
         &mut SignatureSourceCache::default(),
+        &mut crate::commands::api_changes::ApiClosureCaches::default(),
     );
     assert!(
         result.is_none(),
@@ -204,6 +206,7 @@ fn detect_react_wrapper_changed_props_type_stays_blocking() {
             lang_id: Some(crate::language::LangId::Tsx),
         },
         &mut SignatureSourceCache::default(),
+        &mut crate::commands::api_changes::ApiClosureCaches::default(),
     );
     assert!(result.is_none(), "props 型が変われば blocking 維持");
 }
@@ -269,6 +272,7 @@ fn detect_react_wrapper_same_file_value_usage_stays_blocking() {
             lang_id: Some(crate::language::LangId::Tsx),
         },
         &mut SignatureSourceCache::default(),
+        &mut crate::commands::api_changes::ApiClosureCaches::default(),
     );
     assert!(
         result.is_none(),
@@ -320,6 +324,7 @@ fn detect_react_wrapper_old_already_wrapper_stays_blocking() {
             lang_id: Some(crate::language::LangId::Tsx),
         },
         &mut SignatureSourceCache::default(),
+        &mut crate::commands::api_changes::ApiClosureCaches::default(),
     );
     assert!(
         result.is_none(),
@@ -417,6 +422,59 @@ fn detect_object_members_removed_referenced_key_stays_blocking() {
         result.is_none(),
         "削除キー bgColor が member access で残存 → blocking 維持"
     );
+}
+
+/// 削除キーを置換のない template literal の添字 (`` google[`bgColor`] ``) で読んでいる場合も
+/// `google["bgColor"]` と同じく残存参照なので blocking を維持する。別キーを同じ書き方で
+/// 読んでいるだけなら従来どおり降格する (対照)。
+#[test]
+fn detect_object_members_removed_key_read_by_static_template_subscript_stays_blocking() {
+    for (access, expect_compatible) in [("`bgColor`", false), ("`label`", true)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "config.tsx",
+                    "export const providerConfig = {\n  google: { label: 'G', bgColor: 'green' },\n};\n",
+                ),
+                (
+                    "App.tsx",
+                    &format!(
+                        "import {{ providerConfig }} from './config';\nexport const x = providerConfig.google[{access}];\n"
+                    ),
+                ),
+            ],
+            "initial",
+        );
+        fs::write(
+            repo.join("config.tsx"),
+            "export const providerConfig = {\n  google: { label: 'G', bgClass: 'bg-green' },\n};\n",
+        )
+        .expect("write");
+        let result = detect_object_members_compatible_mod(
+            &CompatibleModSite {
+                dir: repo.to_str().expect("utf-8 path"),
+                base: "HEAD",
+                old_path: "config.tsx",
+                new_path: "config.tsx",
+                name: "providerConfig",
+                kind: "constant",
+                old_sig: "old",
+                new_sig: "new",
+                lang_id: Some(crate::language::LangId::Tsx),
+            },
+            &mut SignatureSourceCache::default(),
+        );
+        assert_eq!(
+            result.is_some(),
+            expect_compatible,
+            "{access}: {:?}",
+            result.map(|compat| compat.reason)
+        );
+    }
 }
 
 /// 複数キーを同時に削除したときも、いずれか 1 個の参照が残っていれば blocking を維持する。
@@ -939,35 +997,4 @@ fn new_sig_has_react_wrapper_detects_hocs() {
     // 単なる function 宣言や部分一致 (somememo) はラッパーでない
     assert!(!new_sig_has_react_wrapper("export function X(props: T)"));
     assert!(!new_sig_has_react_wrapper("export const X = somememo(fn)"));
-}
-
-#[test]
-fn ctx_usage_classification_jsx_vs_value() {
-    // JSX タグ利用は safe
-    assert!(ctx_usage_is_jsx_or_safe(
-        "return <ScheduleItem foo={1} />;",
-        "ScheduleItem"
-    ));
-    assert!(ctx_usage_is_jsx_or_safe(
-        "  </ScheduleItem>",
-        "ScheduleItem"
-    ));
-    // 値利用は blocking 側
-    assert!(!ctx_usage_is_jsx_or_safe(
-        "const x = ScheduleItem({});",
-        "ScheduleItem"
-    ));
-    assert!(!ctx_usage_is_jsx_or_safe(
-        "typeof ScheduleItem",
-        "ScheduleItem"
-    ));
-    assert!(!ctx_usage_is_jsx_or_safe(
-        "ScheduleItem.displayName = 'x';",
-        "ScheduleItem"
-    ));
-    // 裸の代入は判定不能なので blocking 側
-    assert!(!ctx_usage_is_jsx_or_safe(
-        "const Alias = ScheduleItem;",
-        "ScheduleItem"
-    ));
 }

@@ -550,3 +550,66 @@ fn mcp_keeps_serving_after_deep_inputs() {
         assert_ne!(json["result"]["isError"], true, "id={id}: {json}");
     }
 }
+
+/// API 差分と dead-code の値バインディングの signature 作成 (関数値の本体を省く処理) が、
+/// 括弧が深く入れ子になった初期化子 (`export const DEEP = ((…1…));`) で落ちない。
+/// 深い宣言の後ろの宣言 (`AFTER`) まで解析しきることも確かめる。
+#[test]
+fn api_signature_handles_deep_parenthesized_const() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write("ok.ts", "export function okay() { return 1; }\n");
+    repo.commit_all("init");
+    repo.write(
+        "deep.ts",
+        format!(
+            "export const DEEP = {};\nexport const AFTER = () => 1;\n",
+            nested("(", "1", ")", 50_000)
+        ),
+    );
+
+    let mut command = cargo_bin();
+    command.args(["dead-code", "--dir"]).arg(repo.root());
+    let stdout = assert_finished("dead-code", &run_bounded(command, None));
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("dead-code JSON");
+    let dead: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .expect("dead_symbols")
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        dead.contains(&"AFTER"),
+        "深い宣言の後ろの未使用 export も解析する: {dead:?}"
+    );
+
+    let mut command = cargo_bin();
+    command.args(["review", "--git", "--dir"]).arg(repo.root());
+    let stdout = assert_finished("review", &run_bounded(command, None));
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("review JSON");
+    let added: Vec<&str> = json["api_changes"]["added"]
+        .as_array()
+        .expect("api_changes.added")
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        added.contains(&"DEEP") && added.contains(&"AFTER"),
+        "深い初期化子の宣言と後ろの宣言を API 差分に出す: {added:?}"
+    );
+
+    let mut command = cargo_bin();
+    command
+        .args(["review", "--git", "--hook", "--dir"])
+        .arg(repo.root());
+    let output = run_bounded(command, None);
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "review --hook はシグナルで落ちずに判定を返す: {:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(400)
+            .collect::<String>()
+    );
+}

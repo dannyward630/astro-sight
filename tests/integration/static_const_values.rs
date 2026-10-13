@@ -338,3 +338,62 @@ fn static_const_values_unsafe_changes_keep_blocking_api_mod() {
         );
     }
 }
+
+/// 型注釈のないトップレベルの scalar const で値の種類が変わると、推論される公開型が変わる
+/// (`TIMEOUT * 1000` が TS2362)。静的 container の葉の同じ変更と同じく blocking な api.mod に残し、
+/// 種類が同じ値の変更だけを const_value (非 blocking) に降格する。
+#[test]
+fn static_const_values_top_level_scalar_kind_change_keeps_blocking_api_mod() {
+    for (extension, old, new, blocking) in [
+        ("ts", "30", "\"30s\"", true),
+        ("ts", "'on'", "true", true),
+        ("ts", "1", "1n", true),
+        ("js", "30", "\"30s\"", true),
+        ("tsx", "null", "0", true),
+        // 対照: 同じ種類の値の変更は従来どおり const_value
+        ("ts", "30", "45", false),
+        ("js", "'a'", "'b'", false),
+        ("tsx", "true", "false", false),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let file = format!("config.{extension}");
+        repo.write(&file, format!("export const TIMEOUT = {old};\n"));
+        repo.write(
+            format!("use.{extension}"),
+            "import { TIMEOUT } from './config';\nexport const ms = TIMEOUT;\n",
+        );
+        repo.commit_all("initial");
+        repo.write(&file, format!("export const TIMEOUT = {new};\n"));
+        let (output, json) = hook(&repo, false);
+        let in_bucket = |bucket: &str| {
+            json["api"][bucket]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|change| change["n"] == "TIMEOUT")
+        };
+        if blocking {
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{extension}: {old} -> {new}: {json}"
+            );
+            assert!(in_bucket("mod"), "{extension}: {old} -> {new}: {json}");
+            assert!(
+                !in_bucket("const_value"),
+                "{extension}: {old} -> {new}: {json}"
+            );
+        } else {
+            assert!(
+                output.status.success(),
+                "{extension}: {old} -> {new}: {json}"
+            );
+            assert!(
+                in_bucket("const_value"),
+                "{extension}: {old} -> {new}: {json}"
+            );
+            assert!(!in_bucket("mod"), "{extension}: {old} -> {new}: {json}");
+        }
+    }
+}

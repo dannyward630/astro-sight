@@ -13,12 +13,27 @@ const MAX_DEPTH: usize = 32;
 const MAX_NODES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum ScalarKind {
+pub(super) enum ScalarKind {
     Number,
     BigInt,
     String,
     Boolean,
     Null,
+    /// `undefined`。container の葉としては扱わず、トップレベルの scalar 比較だけで使う。
+    Undefined,
+}
+
+/// 型注釈のない JS/TS の scalar literal の種類。推論される公開型の種類が同じかを比べるために
+/// 使う (`30` → `"30s"` は number から string への変更)。scalar literal でなければ None。
+pub(super) fn js_scalar_literal_kind(node: Node<'_>, source: &[u8]) -> Option<ScalarKind> {
+    match node.kind() {
+        "number" => number_kind(node, source),
+        "string" => Some(ScalarKind::String),
+        "true" | "false" => Some(ScalarKind::Boolean),
+        "null" => Some(ScalarKind::Null),
+        "undefined" => Some(ScalarKind::Undefined),
+        _ => None,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -343,12 +358,15 @@ fn static_shape(node: Node<'_>, source: &[u8], lang: LangId, depth: usize) -> Op
 }
 
 fn number_shape(node: Node<'_>, source: &[u8]) -> Option<StaticShape> {
-    let kind = if node.utf8_text(source).ok()?.ends_with('n') {
+    Some(StaticShape::Scalar(number_kind(node, source)?))
+}
+
+fn number_kind(node: Node<'_>, source: &[u8]) -> Option<ScalarKind> {
+    Some(if node.utf8_text(source).ok()?.ends_with('n') {
         ScalarKind::BigInt
     } else {
         ScalarKind::Number
-    };
-    Some(StaticShape::Scalar(kind))
+    })
 }
 
 fn object_shape(node: Node<'_>, source: &[u8], lang: LangId, depth: usize) -> Option<StaticShape> {
