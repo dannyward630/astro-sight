@@ -84,6 +84,9 @@ impl RustMemberLiveness {
         };
         let names: HashSet<&str> = patterns.iter().copied().collect();
         let lib_modules = plain_lib_modules(canonical_dir);
+        // 候補ファイルが単位構造体の値を一意に持つかの判定 (読み込み + parse) は参照ごとに
+        // 変わらないので、候補ごとに 1 度だけ求める。
+        let mut unit_value_cache = UnitValueCache::new();
         let mut ambiguous = HashSet::new();
         let mut counts: HashMap<(String, String, String), (usize, usize)> = HashMap::new();
         for path in files {
@@ -175,6 +178,7 @@ impl RustMemberLiveness {
                         lib_modules.as_ref(),
                         &grouped,
                         name,
+                        &mut unit_value_cache,
                     ) {
                         Occurrence::Unrelated => {}
                         Occurrence::Unknown => {
@@ -736,6 +740,10 @@ enum Occurrence<'a> {
     Unknown,
 }
 
+/// `candidate_has_unambiguous_unit_value` の結果。キーは候補の (file, owner, bare)。
+type UnitValueCache = HashMap<(String, String, String), bool>;
+
+#[expect(clippy::too_many_arguments)]
 fn classify_occurrence<'a>(
     node: Node<'_>,
     source: &[u8],
@@ -744,6 +752,7 @@ fn classify_occurrence<'a>(
     lib_modules: Option<&HashSet<String>>,
     groups: &'a HashMap<String, Vec<Candidate>>,
     bare: &str,
+    unit_value_cache: &mut UnitValueCache,
 ) -> Occurrence<'a> {
     let Some(parent) = node.parent() else {
         return Occurrence::Unknown;
@@ -781,9 +790,16 @@ fn classify_occurrence<'a>(
         let Some(receiver) = parent.child_by_field_name("value") else {
             return Occurrence::Unknown;
         };
-        if let Some(candidate) =
-            resolve_receiver(receiver, source, path, root, lib_modules, groups, bare)
-        {
+        if let Some(candidate) = resolve_receiver(
+            receiver,
+            source,
+            path,
+            root,
+            lib_modules,
+            groups,
+            bare,
+            unit_value_cache,
+        ) {
             return Occurrence::Owner(candidate);
         }
         return Occurrence::Unknown;
@@ -805,6 +821,7 @@ fn classify_occurrence<'a>(
     Occurrence::Unrelated
 }
 
+#[expect(clippy::too_many_arguments)]
 fn resolve_receiver<'a>(
     receiver: Node<'_>,
     source: &[u8],
@@ -813,6 +830,7 @@ fn resolve_receiver<'a>(
     lib_modules: Option<&HashSet<String>>,
     groups: &'a HashMap<String, Vec<Candidate>>,
     bare: &str,
+    unit_value_cache: &mut UnitValueCache,
 ) -> Option<&'a Candidate> {
     if receiver.kind() != "identifier" {
         return None;
@@ -860,9 +878,10 @@ fn resolve_receiver<'a>(
         return None;
     }
     let candidate = matches[0];
-    if !candidate_has_unambiguous_unit_value(root, candidate) {
-        return None;
-    }
+    // 参照ファイルとパスだけで決まる安い判定を先に行う (判定はどれも副作用が無く、
+    // 順序を入れ替えても結果は同じ)。候補ファイルの読み込みと parse は最後に回し、
+    // 候補ごとに 1 度だけ行う。参照 1 件ごとに読み直すと、参照数 × 候補ファイルの
+    // 大きさになり、review の hook が 120 秒を超えていた。
     let module = candidate.file.strip_prefix("src/")?.strip_suffix(".rs")?;
     if module.contains('/') || path == root.join(&candidate.file) {
         return None;
@@ -881,13 +900,31 @@ fn resolve_receiver<'a>(
     if text.matches(owner).count() != 2 {
         return None;
     }
+    let unit_value = *unit_value_cache
+        .entry((
+            candidate.file.clone(),
+            candidate.owner.clone(),
+            candidate.bare.clone(),
+        ))
+        .or_insert_with(|| candidate_has_unambiguous_unit_value(root, candidate));
+    if !unit_value {
+        return None;
+    }
     if !receiver_import_is_direct(receiver, source, module, owner) {
         return None;
     }
     Some(candidate)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// テスト用: `candidate_has_unambiguous_unit_value` が候補ファイルを読んだ回数。
+    static UNIT_VALUE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn candidate_has_unambiguous_unit_value(root: &Path, candidate: &Candidate) -> bool {
+    #[cfg(test)]
+    UNIT_VALUE_CHECKS.with(|count| count.set(count.get() + 1));
     let Some(source) = read_input_file(&root.join(&candidate.file)) else {
         return false;
     };
@@ -992,7 +1029,89 @@ fn candidate_has_unambiguous_unit_value(root: &Path, candidate: &Candidate) -> b
 
 #[cfg(test)]
 mod tests {
-    use super::{RustMemberLiveness, has_dynamic_rust_macro};
+    use super::{RustMemberLiveness, UNIT_VALUE_CHECKS, has_dynamic_rust_macro};
+
+    /// `let x = Owner; x.method();` の受け手の解決は、候補ファイルを読んで単位構造体の値が
+    /// 一意かを確かめる。この判定は参照ごとに変わらないので候補ごとに 1 度だけ行い、参照
+    /// ファイルだけで決まる安い判定 (同名の束縛の数など) で却下できる参照では行わない。
+    /// 旧実装は参照 1 件ごとに候補ファイルを読み直して parse し、参照数 × 候補ファイルの
+    /// 大きさの時間がかかっていた (review の hook が 120 秒を超えた)。判定結果は変えない。
+    #[test]
+    fn receiver_resolution_reads_candidate_file_once() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().canonicalize().expect("canonical root");
+        std::fs::create_dir_all(dir.join("src")).expect("src");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(
+            dir.join("src/a.rs"),
+            "pub struct Owner;\nimpl Owner {\n    pub fn method_x(&self) -> u32 {\n        1\n    }\n}\n",
+        )
+        .expect("a");
+        // 受け手を解決できる参照を 5 ファイルに 1 件ずつ置く。
+        let callers = 5;
+        let mut lib = "pub mod a;\npub mod many;\n".to_string();
+        let mut files = vec![dir.join("src/lib.rs"), dir.join("src/a.rs")];
+        for index in 0..callers {
+            lib.push_str(&format!("pub mod c{index};\n"));
+            let path = dir.join(format!("src/c{index}.rs"));
+            std::fs::write(
+                &path,
+                "use crate::a::Owner;\n\npub fn run() {\n    let x = Owner;\n    x.method_x();\n}\n",
+            )
+            .expect("caller");
+            files.push(path);
+        }
+        // 同じ関数に束縛を並べたファイルは、同名の束縛が多いので候補ファイルを読む前に却下される。
+        let many = dir.join("src/many.rs");
+        std::fs::write(
+            &many,
+            "use crate::a::Owner;\n\npub fn run() {\n    let x = Owner;\n    x.method_x();\n    let x = Owner;\n    x.method_x();\n}\n",
+        )
+        .expect("many");
+        files.push(many);
+        std::fs::write(dir.join("src/lib.rs"), lib).expect("lib");
+        let candidates = [(
+            "Owner.method_x".to_string(),
+            "method".to_string(),
+            "src/a.rs".to_string(),
+            LangId::Rust,
+        )];
+
+        UNIT_VALUE_CHECKS.with(|count| count.set(0));
+        let liveness = RustMemberLiveness::build(&candidates, &dir, &files, |_| false);
+        assert_eq!(
+            UNIT_VALUE_CHECKS.with(std::cell::Cell::get),
+            1,
+            "候補ファイルは 1 度だけ読む"
+        );
+        // 判定結果は従来どおり: 却下された参照が残るので Ambiguous。
+        assert_eq!(
+            liveness.status_for("Owner", "method_x", "src/a.rs"),
+            Some(MemberStatus::Ambiguous)
+        );
+
+        // 対照: 却下される参照を除けば、解決できた参照から Live になる (読むのは 1 度)。
+        files.retain(|path| path != &dir.join("src/many.rs"));
+        std::fs::remove_file(dir.join("src/many.rs")).expect("remove many");
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            std::fs::read_to_string(dir.join("src/lib.rs"))
+                .expect("lib")
+                .replace("pub mod many;\n", ""),
+        )
+        .expect("lib");
+        UNIT_VALUE_CHECKS.with(|count| count.set(0));
+        let liveness = RustMemberLiveness::build(&candidates, &dir, &files, |_| false);
+        assert_eq!(UNIT_VALUE_CHECKS.with(std::cell::Cell::get), 1);
+        assert_eq!(
+            liveness.status_for("Owner", "method_x", "src/a.rs"),
+            Some(MemberStatus::Live)
+        );
+    }
     use crate::commands::dead_code_member_liveness::MemberStatus;
     use crate::engine::parser;
     use crate::language::LangId;
