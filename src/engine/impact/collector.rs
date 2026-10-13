@@ -811,53 +811,129 @@ fn rust_explicit_method_owner<'a>(
     }
 }
 
+/// 参照 1 件 × 変更元 1 件 (候補) の判定結果。
+enum CandidateDecision {
+    /// 別の所有元・スコープの外・テストの中などと証明できたので caller にしない。
+    Exclude,
+    /// caller として残す。値は振り分け先。
+    Keep(CallerRoute),
+}
+
+/// `finish_file` の間だけ使う、参照ファイル単位の証拠とキャッシュ。
+struct RefFileEvidence<'a> {
+    filter_disabled: bool,
+    /// 変更元ごとに、Cargo の依存関係で参照ファイルから届かないと証明できたか。
+    rust_cargo_unreachable: Vec<bool>,
+    /// 変更元ごとの Python ソースの実体パス (symlink を解決済み)。
+    python_source_paths: &'a [Option<String>],
+    rust_owner_paths: HashMap<u32, Option<PathBuf>>,
+    /// 変更元ごとに、参照ファイルが旧 private 宣言のモジュール部分木に入るか。
+    /// `None` は証明できないことを表し、`Some(false)` とは区別する。
+    rust_private_scope: HashMap<usize, Option<bool>>,
+    rust_private_import_owners: HashMap<(usize, usize), bool>,
+    rust_ref_source: std::cell::OnceCell<Option<Vec<u8>>>,
+}
+
+/// 参照 1 件について、変更元に依らない事実。
+struct EventFacts {
+    python_owner: Option<String>,
+    has_parent_type: bool,
+    parent_in_this_file: bool,
+    base_route_low: bool,
+}
+
+/// 除外しなかった候補の振り分けに使う、Rust の private スコープの証拠。
+struct ScopeEvidence {
+    /// 可視性を広げただけの変更で、旧 private 部分木の中の参照と証明できた。
+    visibility_only_informational: bool,
+    private_method_candidate: bool,
+    /// private メソッドの所有型・部分木を証明できなかった。
+    private_method_low: bool,
+}
+
 impl<'a> ImpactCollector<'a> {
     /// ファイル走査完了時に呼ぶ。buffered events に対して Stage 1-6 (Stage 4b 除く) の
     /// filter を適用し、`local_maps` / `local_def_paths` に push する。バッファは clear して
     /// 次ファイルで再利用する。
+    ///
+    /// 定義の記録 → 参照ファイル単位の証拠の準備 → 参照 × 変更元ごとの判定
+    /// (`candidate_decision`) → 振り分け先への集約 (`record_caller`) の順に行う。
     pub(super) fn finish_file(self) {
-        // Definition: path を 1 回だけ intern して全 def sym へ配布
-        if !self.def_events.is_empty() {
-            let path_id = self
-                .pool
-                .lock()
-                .expect("string pool mutex poisoned")
-                .intern(self.path_str);
-            for &ix in self.def_events.iter() {
-                if let Some(paths) = self.local_def_paths.get_mut(ix as usize) {
-                    paths.push(path_id);
+        let mut collector = self;
+        collector.record_definitions();
+
+        // References: 1 件ずつ Stage 1-6 (Stage 4b 除く) の filter を適用し local_maps へ流す。
+        // Stage 6 (import 判定) と caller_name の抽出は on_ref 時点で済ませてあるため、
+        // ここでは flag / ID で判定する。Phase 4: confidence == BareNameOnly + シンボル名が
+        // generic (new/update/...) なら local_low_maps へ振り分け、強い impact 信号を汚染しない。
+        // バッファは取り出して drain し、ヒープを次のファイルで再利用するため戻す。
+        let mut events = std::mem::take(&mut *collector.ref_events);
+        let mut evidence = collector.prepare_file_evidence(&events);
+        let sym_to_fc = collector.sym_to_fc;
+        for e in events.drain(..) {
+            let fc_ixs = &sym_to_fc[e.sym_ix as usize];
+            if fc_ixs.is_empty() {
+                continue;
+            }
+            let facts = collector.event_facts(&e, evidence.filter_disabled);
+            for &fc_ix_raw in fc_ixs {
+                let fc_ix = fc_ix_raw as usize;
+                if let CandidateDecision::Keep(route) =
+                    collector.candidate_decision(&e, &facts, fc_ix, &mut evidence)
+                {
+                    collector.record_caller(&e, fc_ix, route);
                 }
             }
-            self.def_events.clear();
         }
+        *collector.ref_events = events;
 
-        // References: 1 件ずつ Stage 1-6 (Stage 4b 除く) の filter を適用し local_maps へ流す
-        // ref_events を drain することで Vec のヒープは再利用される。Stage 6 (import 判定) と
-        // caller_name の抽出は on_ref 時点で済ませてあるため、ここでは flag / ID で判定する。
-        // Phase 4: confidence == BareNameOnly + シンボル名が generic (new/update/...) なら
-        // local_low_maps へ振り分け、強い impact 信号を汚染しない。
+        // ref_hit のクリア（次ファイル向け）
+        for v in collector.ref_hit.iter_mut() {
+            *v = false;
+        }
+    }
+
+    /// Definition: path を 1 回だけ intern して全 def sym へ配布する。
+    fn record_definitions(&mut self) {
+        if self.def_events.is_empty() {
+            return;
+        }
+        let path_id = self
+            .pool
+            .lock()
+            .expect("string pool mutex poisoned")
+            .intern(self.path_str);
+        for &ix in self.def_events.iter() {
+            if let Some(paths) = self.local_def_paths.get_mut(ix as usize) {
+                paths.push(path_id);
+            }
+        }
+        self.def_events.clear();
+    }
+
+    /// 参照ファイル単位で 1 回だけ求める証拠と、候補の判定で共有するキャッシュを用意する。
+    fn prepare_file_evidence(&self, events: &[RefEventMini]) -> RefFileEvidence<'a> {
         let filter_disabled = confidence_filter_disabled();
-        let rust_cargo_unreachable =
-            if self.ref_lang == Some(LangId::Rust) && !self.ref_events.is_empty() {
-                self.file_contexts
-                    .iter()
-                    .map(|context| {
-                        context.lang_id == LangId::Rust
-                            && self
-                                .rust_cargo_reachability
-                                .proves_unreachable(self.path_str, &context.new_path)
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+        let rust_cargo_unreachable = if self.ref_lang == Some(LangId::Rust) && !events.is_empty() {
+            self.file_contexts
+                .iter()
+                .map(|context| {
+                    context.lang_id == LangId::Rust
+                        && self
+                            .rust_cargo_reachability
+                            .proves_unreachable(self.path_str, &context.new_path)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         // symlink 経由の同一ファイルを別の所有元と判定しない。変更元ごとに1回だけ解決する。
-        let python_source_paths = if self
-            .ref_events
+        let python_import_cache = self.python_import_cache;
+        let python_source_paths = if events
             .iter()
             .any(|event| event.python_import_owner_id != u32::MAX)
         {
-            self.python_import_cache
+            python_import_cache
                 .source_paths
                 .get_or_init(|| {
                     self.file_contexts
@@ -885,314 +961,383 @@ impl<'a> ImpactCollector<'a> {
         } else {
             &[]
         };
-        let mut rust_owner_paths: HashMap<u32, Option<PathBuf>> = HashMap::new();
-        let mut rust_private_scope: HashMap<usize, Option<bool>> = HashMap::new();
-        let mut rust_private_import_owners: HashMap<(usize, usize), bool> = HashMap::new();
-        let rust_ref_source = std::cell::OnceCell::new();
-        let mut route_context = RouteDecisionContext {
+        RefFileEvidence {
             filter_disabled,
-            ref_lang: self.ref_lang,
-            dir: self.dir,
-            path_str: self.path_str,
-            import_facts_cache: self.import_facts_cache,
-            reexport_moves: self.reexport_moves,
-            ts_barrels: self.ts_barrels,
+            rust_cargo_unreachable,
+            python_source_paths,
+            rust_owner_paths: HashMap::new(),
+            rust_private_scope: HashMap::new(),
+            rust_private_import_owners: HashMap::new(),
+            rust_ref_source: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// 参照 1 件について、変更元に依らない事実を求める。
+    fn event_facts(&self, e: &RefEventMini, filter_disabled: bool) -> EventFacts {
+        let sym_ix_usize = e.sym_ix as usize;
+        let python_owner = (e.python_import_owner_id != u32::MAX).then(|| {
+            self.pool
+                .lock()
+                .expect("string pool mutex poisoned")
+                .get(e.python_import_owner_id)
+                .to_owned()
+        });
+        let has_parent_type = self.parent_ix_by_sym[sym_ix_usize].is_some();
+        let parent_in_this_file = self.parent_ix_by_sym[sym_ix_usize]
+            .and_then(|pix| self.ref_hit.get(pix))
+            .copied()
+            .unwrap_or(false);
+        let base_route_low = !filter_disabled && is_low_confidence_caller(e, self.all_symbol_names);
+        EventFacts {
+            python_owner,
+            has_parent_type,
+            parent_in_this_file,
+            base_route_low,
+        }
+    }
+
+    /// 参照 `e` を変更元 `fc_ix` の caller にするか、するならどこへ振り分けるかを決める。
+    ///
+    /// 除外の証拠を所有元 → private スコープ → 参照位置の順に確かめ、残った候補だけ振り分け先を
+    /// 決める。除外には confidence filter を無効にしても効くものと止まるものが混在するので、
+    /// 各証拠の中の `filter_disabled` の条件は個別に保つ。
+    fn candidate_decision(
+        &mut self,
+        e: &RefEventMini,
+        facts: &EventFacts,
+        fc_ix: usize,
+        evidence: &mut RefFileEvidence<'a>,
+    ) -> CandidateDecision {
+        if self.excluded_by_owner_evidence(e, facts, fc_ix, evidence) {
+            return CandidateDecision::Exclude;
+        }
+        let Some(scope) = self.private_scope_evidence(e, facts, fc_ix, evidence) else {
+            return CandidateDecision::Exclude;
         };
-        for e in self.ref_events.drain(..) {
-            let sym_ix_usize = e.sym_ix as usize;
-            let python_owner = (e.python_import_owner_id != u32::MAX).then(|| {
-                self.pool
-                    .lock()
-                    .expect("string pool mutex poisoned")
-                    .get(e.python_import_owner_id)
-                    .to_owned()
-            });
-            let fc_ixs = &self.sym_to_fc[sym_ix_usize];
-            if fc_ixs.is_empty() {
-                continue;
-            }
+        if self.excluded_by_reference_site(e, facts, fc_ix, scope.private_method_candidate) {
+            return CandidateDecision::Exclude;
+        }
+        CandidateDecision::Keep(self.route(e, facts, fc_ix, &scope, evidence.filter_disabled))
+    }
 
-            let has_parent_type = self.parent_ix_by_sym[sym_ix_usize].is_some();
-            let parent_in_this_file = self.parent_ix_by_sym[sym_ix_usize]
-                .and_then(|pix| self.ref_hit.get(pix))
-                .copied()
-                .unwrap_or(false);
-            let base_route_low =
-                !filter_disabled && is_low_confidence_caller(&e, self.all_symbol_names);
-
-            for &fc_ix_raw in fc_ixs {
-                let fc_ix = fc_ix_raw as usize;
-                let ctx = &self.file_contexts[fc_ix];
-                if let Some(owner) = python_owner.as_deref()
-                    && let Some(Some(source_path)) = python_source_paths.get(fc_ix)
-                    && owner != source_path
-                {
-                    continue;
-                }
-                if e.rust_value_binding
-                    && rust_function_only(ctx, &self.all_symbol_names[sym_ix_usize])
-                {
-                    continue;
-                }
-                if e.rust_receiver_member
-                    && ctx
-                        .rust_free_function_names
-                        .contains(&self.all_symbol_names[sym_ix_usize])
-                {
-                    continue;
-                }
-                if e.rust_std_origin && ctx.lang_id == LangId::Rust {
-                    continue;
-                }
-                if e.rust_associated_type_path
-                    && ctx.lang_id == LangId::Rust
-                    && !filter_disabled
-                    && ctx
-                        .rust_free_function_names
-                        .contains(&self.all_symbol_names[sym_ix_usize])
-                {
-                    continue;
-                }
-                if e.rust_owner_path_id != u32::MAX
-                    && ctx.lang_id == LangId::Rust
-                    && !filter_disabled
-                    && (e.rust_owner_is_free_function
-                        == ctx
-                            .rust_free_function_names
-                            .contains(&self.all_symbol_names[sym_ix_usize]))
-                {
-                    let owner = rust_owner_paths
-                        .entry(e.rust_owner_path_id)
-                        .or_insert_with(|| {
-                            let owner = {
-                                let pool = self.pool.lock().expect("string pool mutex poisoned");
-                                pool.get(e.rust_owner_path_id).to_owned()
-                            };
-                            Path::new(self.dir).join(owner).canonicalize().ok()
-                        });
-                    if let (Some(owner), Some(Some(source))) =
-                        (owner.as_ref(), self.rust_source_paths.get(fc_ix))
-                        && owner != source
-                    {
-                        continue;
-                    }
-                }
-                if rust_cargo_unreachable.get(fc_ix) == Some(&true) {
-                    continue;
-                }
-                let source_path = &ctx.new_path;
-                let visibility_only_widening = ctx.lang_id == LangId::Rust
-                    && !filter_disabled
-                    && !filters::is_same_source_file(self.path_str, source_path)
-                    && ctx
-                        .rust_private_widening_names
-                        .contains(&self.all_symbol_names[sym_ix_usize])
-                    && self.rust_path_owner_project.allows_private_widening_paths();
-                let visibility_only_informational = if visibility_only_widening {
-                    let old_scope = *rust_private_scope.entry(fc_ix).or_insert_with(|| {
-                        self.rust_path_owner.get().and_then(|index| {
-                            index.private_subtree_contains(
-                                Path::new(self.dir),
-                                source_path,
-                                self.path_str,
-                                self.rust_path_owner_project,
-                            )
-                        })
-                    });
-                    if old_scope == Some(false) {
-                        continue;
-                    }
-                    old_scope == Some(true)
-                } else {
-                    false
-                };
-                if ctx.lang_id == LangId::Rust
-                    && !filter_disabled
-                    && !filters::is_same_source_file(self.path_str, source_path)
-                    && ctx
-                        .rust_private_root_names
-                        .contains(&self.all_symbol_names[sym_ix_usize])
-                {
-                    if self
-                        .rust_path_owner_project
-                        .private_source_is_leaf(source_path)
-                    {
-                        continue;
-                    }
-                    if e.rust_local_owner {
-                        continue;
-                    }
-                    let outside_subtree = rust_private_scope.entry(fc_ix).or_insert_with(|| {
-                        self.rust_path_owner.get().and_then(|index| {
-                            index.private_subtree_contains(
-                                Path::new(self.dir),
-                                source_path,
-                                self.path_str,
-                                self.rust_path_owner_project,
-                            )
-                        })
-                    }) == &Some(false);
-                    if outside_subtree {
-                        continue;
-                    }
-                    let other_import = (e.rust_import_binding_safe || e.rust_direct_import_site)
-                        && *rust_private_import_owners
-                            .entry((fc_ix, sym_ix_usize))
-                            .or_insert_with(|| {
-                                self.rust_path_owner.get().is_some_and(|index| {
-                                    rust_ref_source
-                                        .get_or_init(|| {
-                                            crate::engine::bounded_read::read_input_file(
-                                                &Path::new(self.dir).join(self.path_str),
-                                            )
-                                        })
-                                        .as_ref()
-                                        .is_some_and(|source| {
-                                            index.imports_other_private_owner(
-                                                Path::new(self.dir),
-                                                source_path,
-                                                self.path_str,
-                                                source,
-                                                &self.all_symbol_names[sym_ix_usize],
-                                                self.rust_path_owner_project,
-                                            )
-                                        })
-                                })
-                            });
-                    if other_import {
-                        continue;
-                    }
-                }
-                let private_method_candidate = ctx.lang_id == LangId::Rust
-                    && !filter_disabled
-                    && ctx
-                        .rust_private_method_owners
-                        .contains_key(&self.all_symbol_names[sym_ix_usize]);
-                if private_method_candidate && (!e.rust_method_syntax || e.is_import) {
-                    continue;
-                }
-                let private_method_owner_mismatch = private_method_candidate
-                    && e.rust_explicit_method_owner_id != u32::MAX
-                    && ctx
-                        .rust_private_method_owners
-                        .get(&self.all_symbol_names[sym_ix_usize])
-                        .is_some_and(|owner| {
-                            let pool = self.pool.lock().expect("string pool mutex poisoned");
-                            pool.get(e.rust_explicit_method_owner_id) != owner
-                        });
-                let private_method_unanchored = private_method_candidate
-                    && has_parent_type
-                    && !parent_in_this_file
-                    && e.rust_explicit_method_owner_id == u32::MAX;
-                let mut private_method_scope_uncertain = false;
-                if private_method_candidate
-                    && !filters::is_same_source_file(self.path_str, source_path)
-                {
-                    if self
-                        .rust_path_owner_project
-                        .private_source_is_leaf(source_path)
-                    {
-                        continue;
-                    }
-                    let subtree = *rust_private_scope.entry(fc_ix).or_insert_with(|| {
-                        self.rust_path_owner.get().and_then(|index| {
-                            index.private_subtree_contains(
-                                Path::new(self.dir),
-                                source_path,
-                                self.path_str,
-                                self.rust_path_owner_project,
-                            )
-                        })
-                    });
-                    if subtree == Some(false) {
-                        continue;
-                    }
-                    private_method_scope_uncertain = subtree.is_none();
-                }
-                let source_lang_group = lang_compat_group(ctx.lang_id);
-
-                if filters::is_same_source_file(self.path_str, source_path) {
-                    continue;
-                }
-                // ref file の言語は `self.ref_lang` に初期化時キャッシュ済み。
-                // ホットループ内で `LangId::from_path` を都度再導出しない (271 行と整合)。
-                if let Some(ref_lang) = self.ref_lang
-                    && lang_compat_group(ref_lang) != source_lang_group
-                {
-                    continue;
-                }
-                if has_parent_type && !parent_in_this_file && !private_method_candidate {
-                    continue;
-                }
-                if is_ref_in_target_test_context(
-                    self.source_path_str,
-                    e.line as usize,
-                    e.column as usize,
-                    self.target_cache,
-                ) {
-                    continue;
-                }
-
-                let sym_key_canonical = &self.all_symbol_names[sym_ix_usize];
-                // pool の lock 中には比較だけを行い、import 解析前に解放する。
-                let member_unchanged = e.member_path_id != u32::MAX
-                    && ctx
-                        .object_member_changes
-                        .get(sym_key_canonical)
-                        .is_some_and(|change| {
-                            let pool = self.pool.lock().expect("string pool mutex poisoned");
-                            change.read_is_unchanged(pool.get(e.member_path_id))
-                        });
-                let route = if visibility_only_informational {
-                    CallerRoute::Informational
-                } else if private_method_scope_uncertain
-                    || private_method_owner_mismatch
-                    || private_method_unanchored
-                {
-                    CallerRoute::Low
-                } else {
-                    route_context.decide(
-                        &e,
-                        ctx,
-                        sym_key_canonical,
-                        has_parent_type,
-                        base_route_low,
-                        member_unchanged,
-                    )
-                };
-                // 事前 index (ci_key→元名) で O(1) 参照。per-ref の線形 find + ci_key String 割当を排除。
-                let affected_sym_name = ctx
-                    .affected_name_by_cikey
-                    .get(sym_key_canonical.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| sym_key_canonical.clone());
-
-                let (path_id, sym_name_id) = {
-                    let mut p = self.pool.lock().expect("string pool mutex poisoned");
-                    (p.intern(self.path_str), p.intern(&affected_sym_name))
-                };
-
-                let ix_u32 = e.sym_ix;
-                let key = (path_id, e.line as usize);
-                let target_map = match route {
-                    CallerRoute::Normal => &mut self.local_maps[fc_ix],
-                    CallerRoute::Low => &mut self.local_low_maps[fc_ix],
-                    CallerRoute::Informational => &mut self.local_informational_maps[fc_ix],
-                };
-                let entry = target_map
-                    .entry(key)
-                    .or_insert_with(|| (e.caller_name_id, SymEntries::new()));
-                if !entry.1.iter().any(|(existing_ix, existing_name_id)| {
-                    *existing_ix == ix_u32 && *existing_name_id == sym_name_id
-                }) {
-                    entry.1.push((ix_u32, sym_name_id));
-                }
+    /// 参照が別の所有元を指すと証明できたか (Python の import 先、Rust の値束縛・
+    /// receiver member・std 起点・所有元のパス・Cargo の到達性)。
+    fn excluded_by_owner_evidence(
+        &self,
+        e: &RefEventMini,
+        facts: &EventFacts,
+        fc_ix: usize,
+        evidence: &mut RefFileEvidence<'a>,
+    ) -> bool {
+        let file_contexts = self.file_contexts;
+        let ctx = &file_contexts[fc_ix];
+        let all_symbol_names = self.all_symbol_names;
+        let name = &all_symbol_names[e.sym_ix as usize];
+        let filter_disabled = evidence.filter_disabled;
+        if let Some(owner) = facts.python_owner.as_deref()
+            && let Some(Some(source_path)) = evidence.python_source_paths.get(fc_ix)
+            && owner != source_path
+        {
+            return true;
+        }
+        if e.rust_value_binding && rust_function_only(ctx, name) {
+            return true;
+        }
+        if e.rust_receiver_member && ctx.rust_free_function_names.contains(name) {
+            return true;
+        }
+        if e.rust_std_origin && ctx.lang_id == LangId::Rust {
+            return true;
+        }
+        if e.rust_associated_type_path
+            && ctx.lang_id == LangId::Rust
+            && !filter_disabled
+            && ctx.rust_free_function_names.contains(name)
+        {
+            return true;
+        }
+        if e.rust_owner_path_id != u32::MAX
+            && ctx.lang_id == LangId::Rust
+            && !filter_disabled
+            && (e.rust_owner_is_free_function == ctx.rust_free_function_names.contains(name))
+        {
+            let owner = evidence
+                .rust_owner_paths
+                .entry(e.rust_owner_path_id)
+                .or_insert_with(|| {
+                    let owner = {
+                        let pool = self.pool.lock().expect("string pool mutex poisoned");
+                        pool.get(e.rust_owner_path_id).to_owned()
+                    };
+                    Path::new(self.dir).join(owner).canonicalize().ok()
+                });
+            if let (Some(owner), Some(Some(source))) =
+                (owner.as_ref(), self.rust_source_paths.get(fc_ix))
+                && owner != source
+            {
+                return true;
             }
         }
+        evidence.rust_cargo_unreachable.get(fc_ix) == Some(&true)
+    }
 
-        // ref_hit のクリア（次ファイル向け）
-        for v in self.ref_hit.iter_mut() {
-            *v = false;
+    /// Rust の private 宣言のスコープの証拠。参照が旧 private 部分木の外・葉モジュールの外・
+    /// 別の所有元の import などと証明できたら `None` (除外)。残すなら振り分けに使う証拠を返す。
+    fn private_scope_evidence(
+        &self,
+        e: &RefEventMini,
+        facts: &EventFacts,
+        fc_ix: usize,
+        evidence: &mut RefFileEvidence<'a>,
+    ) -> Option<ScopeEvidence> {
+        let file_contexts = self.file_contexts;
+        let ctx = &file_contexts[fc_ix];
+        let all_symbol_names = self.all_symbol_names;
+        let sym_ix_usize = e.sym_ix as usize;
+        let name = &all_symbol_names[sym_ix_usize];
+        let filter_disabled = evidence.filter_disabled;
+        let source_path = &ctx.new_path;
+        let visibility_only_widening = ctx.lang_id == LangId::Rust
+            && !filter_disabled
+            && !filters::is_same_source_file(self.path_str, source_path)
+            && ctx.rust_private_widening_names.contains(name)
+            && self.rust_path_owner_project.allows_private_widening_paths();
+        let visibility_only_informational = if visibility_only_widening {
+            let old_scope = *evidence
+                .rust_private_scope
+                .entry(fc_ix)
+                .or_insert_with(|| self.private_subtree_contains(source_path));
+            if old_scope == Some(false) {
+                return None;
+            }
+            old_scope == Some(true)
+        } else {
+            false
+        };
+        if ctx.lang_id == LangId::Rust
+            && !filter_disabled
+            && !filters::is_same_source_file(self.path_str, source_path)
+            && ctx.rust_private_root_names.contains(name)
+        {
+            if self
+                .rust_path_owner_project
+                .private_source_is_leaf(source_path)
+            {
+                return None;
+            }
+            if e.rust_local_owner {
+                return None;
+            }
+            let outside_subtree = evidence
+                .rust_private_scope
+                .entry(fc_ix)
+                .or_insert_with(|| self.private_subtree_contains(source_path))
+                == &Some(false);
+            if outside_subtree {
+                return None;
+            }
+            let rust_ref_source = &evidence.rust_ref_source;
+            let other_import = (e.rust_import_binding_safe || e.rust_direct_import_site)
+                && *evidence
+                    .rust_private_import_owners
+                    .entry((fc_ix, sym_ix_usize))
+                    .or_insert_with(|| {
+                        self.rust_path_owner.get().is_some_and(|index| {
+                            rust_ref_source
+                                .get_or_init(|| {
+                                    crate::engine::bounded_read::read_input_file(
+                                        &Path::new(self.dir).join(self.path_str),
+                                    )
+                                })
+                                .as_ref()
+                                .is_some_and(|source| {
+                                    index.imports_other_private_owner(
+                                        Path::new(self.dir),
+                                        source_path,
+                                        self.path_str,
+                                        source,
+                                        name,
+                                        self.rust_path_owner_project,
+                                    )
+                                })
+                        })
+                    });
+            if other_import {
+                return None;
+            }
+        }
+        let private_method_candidate = ctx.lang_id == LangId::Rust
+            && !filter_disabled
+            && ctx.rust_private_method_owners.contains_key(name);
+        if private_method_candidate && (!e.rust_method_syntax || e.is_import) {
+            return None;
+        }
+        let private_method_owner_mismatch = private_method_candidate
+            && e.rust_explicit_method_owner_id != u32::MAX
+            && ctx
+                .rust_private_method_owners
+                .get(name)
+                .is_some_and(|owner| {
+                    let pool = self.pool.lock().expect("string pool mutex poisoned");
+                    pool.get(e.rust_explicit_method_owner_id) != owner
+                });
+        let private_method_unanchored = private_method_candidate
+            && facts.has_parent_type
+            && !facts.parent_in_this_file
+            && e.rust_explicit_method_owner_id == u32::MAX;
+        let mut private_method_scope_uncertain = false;
+        if private_method_candidate && !filters::is_same_source_file(self.path_str, source_path) {
+            if self
+                .rust_path_owner_project
+                .private_source_is_leaf(source_path)
+            {
+                return None;
+            }
+            let subtree = *evidence
+                .rust_private_scope
+                .entry(fc_ix)
+                .or_insert_with(|| self.private_subtree_contains(source_path));
+            if subtree == Some(false) {
+                return None;
+            }
+            private_method_scope_uncertain = subtree.is_none();
+        }
+        Some(ScopeEvidence {
+            visibility_only_informational,
+            private_method_candidate,
+            private_method_low: private_method_scope_uncertain
+                || private_method_owner_mismatch
+                || private_method_unanchored,
+        })
+    }
+
+    /// 参照ファイルが変更元の旧 private 宣言のモジュール部分木に入るか (`None` は証明できない)。
+    fn private_subtree_contains(&self, source_path: &str) -> Option<bool> {
+        self.rust_path_owner.get().and_then(|index| {
+            index.private_subtree_contains(
+                Path::new(self.dir),
+                source_path,
+                self.path_str,
+                self.rust_path_owner_project,
+            )
+        })
+    }
+
+    /// 参照の位置から caller にならないと分かるか (変更元と同じファイル、言語の系統が違う、
+    /// 親型の参照がこのファイルに無い、テストの中)。
+    fn excluded_by_reference_site(
+        &mut self,
+        e: &RefEventMini,
+        facts: &EventFacts,
+        fc_ix: usize,
+        private_method_candidate: bool,
+    ) -> bool {
+        let file_contexts = self.file_contexts;
+        let ctx = &file_contexts[fc_ix];
+        let source_lang_group = lang_compat_group(ctx.lang_id);
+        if filters::is_same_source_file(self.path_str, &ctx.new_path) {
+            return true;
+        }
+        // ref file の言語は `self.ref_lang` に初期化時キャッシュ済み。
+        // ホットループ内で `LangId::from_path` を都度再導出しない。
+        if let Some(ref_lang) = self.ref_lang
+            && lang_compat_group(ref_lang) != source_lang_group
+        {
+            return true;
+        }
+        if facts.has_parent_type && !facts.parent_in_this_file && !private_method_candidate {
+            return true;
+        }
+        is_ref_in_target_test_context(
+            self.source_path_str,
+            e.line as usize,
+            e.column as usize,
+            self.target_cache,
+        )
+    }
+
+    /// 除外しなかった候補の振り分け先。外側の優先順位 (可視性拡大の informational →
+    /// private メソッドの Low) を先に見て、残りを `RouteDecisionContext::decide`
+    /// (informational → Low → 不変メンバーの informational → Normal) に任せる。
+    fn route(
+        &mut self,
+        e: &RefEventMini,
+        facts: &EventFacts,
+        fc_ix: usize,
+        scope: &ScopeEvidence,
+        filter_disabled: bool,
+    ) -> CallerRoute {
+        let file_contexts = self.file_contexts;
+        let ctx = &file_contexts[fc_ix];
+        let all_symbol_names = self.all_symbol_names;
+        let sym_key_canonical = &all_symbol_names[e.sym_ix as usize];
+        // pool の lock 中には比較だけを行い、import 解析前に解放する。
+        let member_unchanged = e.member_path_id != u32::MAX
+            && ctx
+                .object_member_changes
+                .get(sym_key_canonical)
+                .is_some_and(|change| {
+                    let pool = self.pool.lock().expect("string pool mutex poisoned");
+                    change.read_is_unchanged(pool.get(e.member_path_id))
+                });
+        if scope.visibility_only_informational {
+            CallerRoute::Informational
+        } else if scope.private_method_low {
+            CallerRoute::Low
+        } else {
+            RouteDecisionContext {
+                filter_disabled,
+                ref_lang: self.ref_lang,
+                dir: self.dir,
+                path_str: self.path_str,
+                import_facts_cache: &mut *self.import_facts_cache,
+                reexport_moves: self.reexport_moves,
+                ts_barrels: self.ts_barrels,
+            }
+            .decide(
+                e,
+                ctx,
+                sym_key_canonical,
+                facts.has_parent_type,
+                facts.base_route_low,
+                member_unchanged,
+            )
+        }
+    }
+
+    /// 残した候補を振り分け先の map へ足す。同じ行では最初の caller 名を保ち、
+    /// 同じ (シンボル, 表示名) の組は 1 回だけ足す。
+    fn record_caller(&mut self, e: &RefEventMini, fc_ix: usize, route: CallerRoute) {
+        let file_contexts = self.file_contexts;
+        let ctx = &file_contexts[fc_ix];
+        let all_symbol_names = self.all_symbol_names;
+        let sym_key_canonical = &all_symbol_names[e.sym_ix as usize];
+        // 事前 index (ci_key→元名) で O(1) 参照。per-ref の線形 find + ci_key String 割当を排除。
+        let affected_sym_name = ctx
+            .affected_name_by_cikey
+            .get(sym_key_canonical.as_str())
+            .cloned()
+            .unwrap_or_else(|| sym_key_canonical.clone());
+
+        let (path_id, sym_name_id) = {
+            let mut p = self.pool.lock().expect("string pool mutex poisoned");
+            (p.intern(self.path_str), p.intern(&affected_sym_name))
+        };
+
+        let ix_u32 = e.sym_ix;
+        let key = (path_id, e.line as usize);
+        let target_map = match route {
+            CallerRoute::Normal => &mut self.local_maps[fc_ix],
+            CallerRoute::Low => &mut self.local_low_maps[fc_ix],
+            CallerRoute::Informational => &mut self.local_informational_maps[fc_ix],
+        };
+        let entry = target_map
+            .entry(key)
+            .or_insert_with(|| (e.caller_name_id, SymEntries::new()));
+        if !entry.1.iter().any(|(existing_ix, existing_name_id)| {
+            *existing_ix == ix_u32 && *existing_name_id == sym_name_id
+        }) {
+            entry.1.push((ix_u32, sym_name_id));
         }
     }
 
