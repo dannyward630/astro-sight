@@ -6563,3 +6563,157 @@ fn reexport_move_of_brace_struct_compares_fields() {
         }
     }
 }
+
+/// private な inherent メソッドを属性の文字列 (`#[serde(skip_serializing_if = "...")]`) だけで
+/// 参照する子モジュールを、呼び出し元から捨てない。文字列由来の参照は AST ノードを持たず、
+/// 構文でメソッドを指さないと証明できないので、部分木を証明できなければ低確信度に残す
+/// (同じ構成で直接呼んだ場合と同じ扱い。serde の属性があると private scope の証明は無効になる)。
+/// 旧実装はノードの無い参照を「メソッドの構文ではない」として無条件に捨てていた。
+/// 対照: 同じメソッドを `pub` にすれば従来どおり blocking。
+#[test]
+fn impact_rust_private_method_referenced_from_attribute_string_is_kept() {
+    for (visibility, expected_key) in [("", "low_confidence_callers"), ("pub ", "impacted_callers")]
+    {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src/config");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write("src/lib.rs", "pub mod config;\n");
+        let config = |parameter: &str| {
+            format!(
+                "mod file;\npub struct Limits;\nimpl Limits {{\n    {visibility}fn is_unset(v: &{parameter}) -> bool {{\n        *v == 0\n    }}\n}}\n"
+            )
+        };
+        repo.write("src/config.rs", config("u32"));
+        repo.write(
+            "src/config/file.rs",
+            "#[derive(serde::Serialize)]\npub struct FileConfig {\n    #[serde(skip_serializing_if = \"super::Limits::is_unset\")]\n    pub max: u32,\n}\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("src/config.rs", config("u64"));
+
+        let context = repo.run_json("context", &["--git"]);
+        let change = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == "src/config.rs")
+            .unwrap_or_else(|| panic!("visibility={visibility:?}: {context}"));
+        let callers = |key: &str| -> Vec<(String, u64)> {
+            change[key]
+                .as_array()
+                .map(|callers| {
+                    callers
+                        .iter()
+                        .map(|caller| {
+                            (
+                                caller["path"].as_str().unwrap_or_default().to_string(),
+                                caller["line"].as_u64().unwrap_or_default(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            callers(expected_key),
+            vec![("src/config/file.rs".to_string(), 2)],
+            "visibility={visibility:?}: {context}"
+        );
+    }
+}
+
+/// 別名 import (`use crate::a::check as is_zero;`) の別名を属性の文字列
+/// (`#[serde(skip_serializing_if = "is_zero")]`) だけで使う場合も、元名の import 行を
+/// blocking に残す。別名の使用は元名の参照として検索に出ないので、import 行を情報提供へ
+/// 落とすと blocking がどこにも出ない。旧実装は別名の使用を識別子ノードでしか探さず、
+/// 引数型の変更が hook を素通りしていた。
+/// 対照: 呼び出しで使えば従来どおり blocking、使わない場合・属性の外の文字列・属性内でも
+/// 識別子として現れない場合 (`is_zero_ext`) は従来どおり情報提供。
+#[test]
+fn impact_rust_alias_used_only_in_attribute_string_keeps_import_blocking() {
+    let attribute_use = |name: &str| {
+        format!(
+            "use crate::a::check as is_zero;\n#[derive(serde::Serialize)]\npub struct Payload {{\n    #[serde(skip_serializing_if = \"{name}\")]\n    pub v: u32,\n}}\n"
+        )
+    };
+    let cases = [
+        ("attribute", attribute_use("is_zero"), "impacted_callers"),
+        (
+            "call",
+            "use crate::a::check as is_zero;\npub fn empty(v: &u32) -> bool {\n    is_zero(v)\n}\n"
+                .to_string(),
+            "impacted_callers",
+        ),
+        (
+            "unused",
+            "use crate::a::check as is_zero;\npub struct Payload {\n    pub v: u32,\n}\n"
+                .to_string(),
+            "informational_callers",
+        ),
+        (
+            "plain string",
+            "use crate::a::check as is_zero;\npub const NAME: &str = \"is_zero\";\n".to_string(),
+            "informational_callers",
+        ),
+        (
+            "other name in attribute",
+            attribute_use("is_zero_ext"),
+            "informational_callers",
+        ),
+    ];
+    for (label, caller, expected_key) in cases {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write("src/lib.rs", "pub mod a;\npub mod c;\n");
+        let check = |parameter: &str| {
+            format!("pub(crate) fn check(v: &{parameter}) -> bool {{\n    *v == 0\n}}\n")
+        };
+        repo.write("src/a.rs", check("u32"));
+        repo.write("src/c.rs", caller);
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("src/a.rs", check("u64"));
+
+        let context = repo.run_json("context", &["--git"]);
+        let change = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == "src/a.rs")
+            .unwrap_or_else(|| panic!("{label}: {context}"));
+        for key in [
+            "impacted_callers",
+            "low_confidence_callers",
+            "informational_callers",
+        ] {
+            let callers = change[key]
+                .as_array()
+                .map(|callers| {
+                    callers
+                        .iter()
+                        .map(|caller| {
+                            (
+                                caller["path"].as_str().unwrap_or_default().to_string(),
+                                caller["line"].as_u64().unwrap_or_default(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let expected = if key == expected_key {
+                vec![("src/c.rs".to_string(), 0)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(callers, expected, "{label} / {key}: {context}");
+        }
+    }
+}

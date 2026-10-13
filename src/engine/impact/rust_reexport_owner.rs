@@ -243,8 +243,41 @@ pub(super) fn alias_import_used(
         {
             return true;
         }
+        // 属性の文字列 (`#[serde(skip_serializing_if = "is_zero")]` など) も別名の使用箇所
+        // (refs は文字列由来の参照として数える)。別名の使用は元名の参照として検索に出ない
+        // ので、ここで見落とすと元名の import 行が情報提供に落ち、blocking がどこにも
+        // 出なくなる。属性ごとのキーまでは見ず、属性内の文字列に別名が識別子として現れれば
+        // 使用とみなす (保守側)。
+        if current.kind() == "string_content"
+            && string_mentions_identifier(current, source, alias)
+            && has_attribute_ancestor(current)
+        {
+            return true;
+        }
         let mut cursor = current.walk();
         pending.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+/// 文字列の中身を識別子の区切りで分けたとき、`name` (`r#` は外して比べる) が現れるか。
+fn string_mentions_identifier(node: Node<'_>, source: &[u8], name: &str) -> bool {
+    let name = name.strip_prefix("r#").unwrap_or(name);
+    node.utf8_text(source).is_ok_and(|text| {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|token| token == name)
+    })
+}
+
+/// 属性 (`#[...]` / `#![...]`) の中にあるノードか。
+fn has_attribute_ancestor(node: Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "attribute_item" | "inner_attribute_item" => return true,
+            "source_file" | "declaration_list" | "block" => return false,
+            _ => ancestor = parent.parent(),
+        }
     }
     false
 }

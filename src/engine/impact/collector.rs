@@ -486,8 +486,12 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                         .contains_key(&self.all_symbol_names[ix])
                 })
             });
+        // AST ノードを持たない参照 (属性の文字列 `"super::Limits::is_unset"` など) は構文で
+        // メソッドを指さないと証明できないので、メソッドを指し得る側に倒す。捨てるのは
+        // 素の関数呼び出しや import のように構文で否定できた参照だけで、ノードの無い参照は
+        // 部分木・葉モジュールの判定へ進める (判定できなければ低確信度)。
         let rust_method_syntax = private_method_target
-            && node.is_some_and(|node| {
+            && node.is_none_or(|node| {
                 is_rust_method_call_member(node)
                     || node.parent().is_some_and(|parent| {
                         parent.kind() == "scoped_identifier"
