@@ -188,7 +188,12 @@ fn run_symbol_query(
                 let name = node.utf8_text(source).unwrap_or("");
                 if !name.is_empty() {
                     let mut parent_node = node.parent().unwrap_or(node);
+                    // 代入から関数を作れるのは lambda を束縛した場合だけ。関数以外の capture
+                    // (`--query` の `@constant.name` / `@variable.name` 等) には当てない。
+                    // 種別を見ずに当てていたため、Python の定数を拾う独自クエリが lambda 以外の
+                    // 代入を黙って捨て、空の結果を返していた。
                     if lang_id == LangId::Python
+                        && kind == SymbolKind::Function
                         && parent_node.kind() == "assignment"
                         && crate::engine::python_callable::lambda_binding_name(parent_node)
                             .is_none()

@@ -76,6 +76,8 @@ astro-sight ast --path src/main.rs --line 10 --col 0 --depth 5 --context 5
 
 `text` and `snippet` are truncated at 256 characters, so the response size stays under control even on the huge lines of minified or generated code.
 
+`--depth` (`depth` in session and MCP) is capped at 256 levels. A larger value expands 256 levels and adds a warning to `diagnostics` saying the expansion was cut off.
+
 ## symbols: Extract Symbols
 
 ```bash

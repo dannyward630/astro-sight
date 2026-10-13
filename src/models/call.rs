@@ -58,26 +58,30 @@ pub struct CompactCallGraph {
 
 impl CallGraph {
     pub fn to_compact(&self) -> CompactCallGraph {
-        // 初出順を維持しながら呼び出し元名でグループ化する
-        let mut order: Vec<String> = Vec::new();
-        let mut groups: HashMap<String, CompactCallGroup> = HashMap::new();
+        // 初出順を維持しながら呼び出し元 (名前と範囲の組) ごとにまとめる。名前だけで
+        // まとめると、別クラスの同名メソッド (`__init__` / `new`) が 1 つのグループになり、
+        // 範囲は最初の関数のものになって、別の関数の呼び出し先が混ざる。
+        let mut groups: Vec<CompactCallGroup> = Vec::new();
+        let mut index: HashMap<(&str, [usize; 4]), usize> = HashMap::new();
 
         for edge in &self.calls {
-            let key = edge.caller.name.clone();
-            let group = groups.entry(key.clone()).or_insert_with(|| {
-                order.push(key);
-                CompactCallGroup {
-                    caller: edge.caller.name.clone(),
-                    range: [
-                        edge.caller.range.start.line,
-                        edge.caller.range.start.column,
-                        edge.caller.range.end.line,
-                        edge.caller.range.end.column,
-                    ],
-                    callees: Vec::new(),
-                }
-            });
-            group.callees.push(CompactCallee {
+            let range = [
+                edge.caller.range.start.line,
+                edge.caller.range.start.column,
+                edge.caller.range.end.line,
+                edge.caller.range.end.column,
+            ];
+            let ix = *index
+                .entry((edge.caller.name.as_str(), range))
+                .or_insert_with(|| {
+                    groups.push(CompactCallGroup {
+                        caller: edge.caller.name.clone(),
+                        range,
+                        callees: Vec::new(),
+                    });
+                    groups.len() - 1
+                });
+            groups[ix].callees.push(CompactCallee {
                 name: edge.callee.name.clone(),
                 ln: edge.call_site.line,
                 col: edge.call_site.column,
@@ -86,10 +90,70 @@ impl CallGraph {
 
         CompactCallGraph {
             lang: self.language.clone(),
-            calls: order
-                .into_iter()
-                .filter_map(|k| groups.remove(&k))
-                .collect(),
+            calls: groups,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::location::Point;
+
+    fn edge(caller: &str, start: usize, end: usize, callee: &str, line: usize) -> CallEdge {
+        let range = |s: usize, e: usize| Range {
+            start: Point { line: s, column: 0 },
+            end: Point { line: e, column: 0 },
+        };
+        CallEdge {
+            caller: CallEndpoint {
+                name: caller.to_string(),
+                range: range(start, end),
+            },
+            callee: CallEndpoint {
+                name: callee.to_string(),
+                range: range(line, line),
+            },
+            call_site: CallSite { line, column: 4 },
+        }
+    }
+
+    /// 同名でも範囲が違う呼び出し元 (別クラスの `__init__` 等) は別のグループにする。
+    /// 同じ呼び出し元からの呼び出しは 1 つにまとめ、初出順を保つ (対照)。
+    #[test]
+    fn to_compact_groups_by_caller_name_and_range() {
+        let graph = CallGraph {
+            language: "python".to_string(),
+            calls: vec![
+                edge("__init__", 1, 2, "connect", 2),
+                edge("__init__", 5, 6, "make_store", 6),
+                edge("__init__", 1, 2, "log", 2),
+                edge("run", 8, 9, "go", 9),
+            ],
+        };
+        let compact = graph.to_compact();
+        let summary: Vec<(String, usize, Vec<String>)> = compact
+            .calls
+            .iter()
+            .map(|group| {
+                (
+                    group.caller.clone(),
+                    group.range[0],
+                    group.callees.iter().map(|c| c.name.clone()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    "__init__".to_string(),
+                    1,
+                    vec!["connect".to_string(), "log".to_string()]
+                ),
+                ("__init__".to_string(), 5, vec!["make_store".to_string()]),
+                ("run".to_string(), 8, vec!["go".to_string()]),
+            ]
+        );
     }
 }

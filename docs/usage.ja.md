@@ -74,6 +74,8 @@ astro-sight ast --path src/main.rs --line 10 --col 0 --depth 5 --context 5
 
 `text` と `snippet` は 256 文字上限で切り詰められるため、minified/生成コードの巨大行でも応答サイズが暴れにくい。
 
+`--depth` (session・MCP の `depth`) は 256 段で打ち切る。それより大きい値を指定すると 256 段まで展開し、打ち切ったことを `diagnostics` に警告として出す。
+
 ## symbols - シンボル抽出
 
 ```bash

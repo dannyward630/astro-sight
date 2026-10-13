@@ -199,11 +199,14 @@ pub(crate) fn cache_hash_for_path(path: &camino::Utf8Path, content_hash: &str) -
         .unwrap_or_else(|| path.as_str().to_string());
 
     // 応答には path/lang が含まれるため、内容が同じ別ファイルとはキャッシュを分離する。
+    // 応答の path は利用者が書いた表記そのものなので、同じファイルを別の表記
+    // (`a.rs` と `../a.rs`) で指定したときに先に保存した表記を返さないよう、書いた表記も混ぜる。
     // さらに astro-sight のバージョンを混ぜ、解析ロジックや出力スキーマが変わった
     // 新バイナリが旧バージョンのキャッシュ結果を返さないようにする（アップグレード時に
     // 自動失効）。ファイル内容が不変でも解析結果が変わる場合に stale を防ぐ。
     let version = env!("CARGO_PKG_VERSION");
-    CacheStore::hash(format!("{version}\0{path_key}\0{content_hash}").as_bytes())
+    let written = path.as_str();
+    CacheStore::hash(format!("{version}\0{path_key}\0{written}\0{content_hash}").as_bytes())
 }
 
 /// diff に含まれる変更ファイル集合。caller のパスが変更ファイルに含まれるか
@@ -386,6 +389,33 @@ mod common_tests {
         let err = timed_ok::<()>("unit_test_phase", || Err(anyhow::anyhow!("boom")))
             .expect_err("error should propagate");
         assert!(err.to_string().contains("boom"));
+    }
+
+    /// 同じファイルでも書き方が違えば別のキーにする。応答の path は書いた表記そのものなので、
+    /// 旧実装 (正規化したパスだけをキーにする) は `../a.rs` で指定しても先に保存した
+    /// `a.rs` の応答を返し、cwd から見て別のファイルを指すパスを出していた。
+    /// **対照**: 同じ書き方なら同じキーのままでキャッシュが効く。
+    #[test]
+    fn cache_hash_separates_spellings_of_the_same_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
+        std::fs::write(dir.path().join("a.rs"), "fn alpha() {}\n").expect("write");
+        let direct = camino::Utf8PathBuf::from_path_buf(dir.path().join("a.rs")).expect("utf-8");
+        let via_sub =
+            camino::Utf8PathBuf::from_path_buf(dir.path().join("sub/../a.rs")).expect("utf-8");
+        assert_eq!(
+            std::fs::canonicalize(&direct).unwrap(),
+            std::fs::canonicalize(&via_sub).unwrap()
+        );
+
+        assert_eq!(
+            cache_hash_for_path(&direct, "content"),
+            cache_hash_for_path(&direct, "content")
+        );
+        assert_ne!(
+            cache_hash_for_path(&direct, "content"),
+            cache_hash_for_path(&via_sub, "content")
+        );
     }
 
     /// 影響分析の結果に現れない diff 内ファイル (トップレベルの呼び出しだけを更新した

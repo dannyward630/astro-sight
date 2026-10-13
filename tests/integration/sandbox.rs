@@ -42,6 +42,100 @@ fn sandboxed_service_rejects_path_traversal() {
     );
 }
 
+/// cochange の起点に git の pathspec magic (`:/x` / `:(top)x`) を渡しても、ワークスペース外の
+/// ファイルの履歴を読ませない。
+///
+/// `..` は字句検証で PATH_OUT_OF_BOUNDS になるが、magic は素通りして git がリポジトリの
+/// ルートから解決していた。ワークスペース外のファイルと共変更が取れ、`commits_analyzed`
+/// の 0 / 非 0 がファイルの存在の手掛かりにもなっていた。**対照**: ワークスペース内の
+/// 起点は従来どおり履歴を読む。
+#[test]
+fn sandboxed_cochange_treats_pathspec_magic_literally() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("ws");
+    repo.create_dir_all("secret");
+    for round in 0..5 {
+        repo.write("ws/a.rs", format!("pub fn a() -> u32 {{ {round} }}\n"));
+        repo.write(
+            "secret/hidden.rs",
+            format!("pub fn h() -> u32 {{ {round} }}\n"),
+        );
+        repo.commit_all(&format!("round {round}"));
+    }
+    let workspace = std::fs::canonicalize(repo.path("ws")).unwrap();
+    let service = astro_sight::service::AppService::sandboxed(workspace).unwrap();
+    let analyze = |source: &str| {
+        let opts = astro_sight::models::cochange::CoChangeOptions {
+            source_files: vec![source.to_string()],
+            min_confidence: 0.0,
+            min_samples: 1,
+            ..Default::default()
+        };
+        service
+            .analyze_cochange(".", &opts)
+            .unwrap_or_else(|e| panic!("{source}: {e}"))
+    };
+
+    for magic in [":/secret/hidden.rs", ":(top)secret/hidden.rs"] {
+        let result = analyze(magic);
+        assert_eq!(
+            result.commits_analyzed, 0,
+            "{magic}: ワークスペース外の履歴を読まないこと"
+        );
+        assert!(result.entries.is_empty(), "{magic}: {:?}", result.entries);
+    }
+    assert!(
+        analyze("a.rs").commits_analyzed > 0,
+        "ワークスペース内の起点は履歴を読むこと"
+    );
+}
+
+/// サンドボックス外のパスは、存在の有無や種類に関係なく PATH_OUT_OF_BOUNDS になる。
+///
+/// 旧実装は境界の確認より先に「存在しない (FILE_NOT_FOUND)」「ディレクトリではない
+/// (INVALID_REQUEST)」を返していたため、エラーコードの違いからワークスペース外の
+/// ファイルの有無と種類が分かった。**対照**: ワークスペース内の欠けたファイルやファイルを
+/// ディレクトリとして渡した場合は、従来どおり FILE_NOT_FOUND / INVALID_REQUEST。
+#[test]
+fn sandboxed_service_does_not_reveal_outside_paths_through_error_codes() {
+    use astro_sight::error::{AstroError, ErrorCode};
+
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("ws");
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(workspace.join("src/lib.rs"), "fn inside() {}\n").unwrap();
+    std::fs::write(outside.join("secret.rs"), "fn secret() {}\n").unwrap();
+    let workspace = std::fs::canonicalize(&workspace).unwrap();
+    let service = astro_sight::service::AppService::sandboxed(workspace).unwrap();
+
+    let code_of = |result: anyhow::Result<()>| -> ErrorCode {
+        result
+            .expect_err("エラーになること")
+            .downcast_ref::<AstroError>()
+            .map(|e| e.code)
+            .expect("AstroError であること")
+    };
+    let symbols = |path: &str| code_of(service.extract_symbols(path).map(|_| ()));
+    let refs_in = |dir: &str| code_of(service.find_references("inside", dir, None).map(|_| ()));
+
+    for path in [
+        "../outside/secret.rs",
+        "../outside/missing.rs",
+        "../missing-dir/x.rs",
+    ] {
+        assert_eq!(symbols(path), ErrorCode::PathOutOfBounds, "{path}");
+    }
+    for dir in ["../outside/secret.rs", "../outside", "../outside/missing"] {
+        assert_eq!(refs_in(dir), ErrorCode::PathOutOfBounds, "{dir}");
+    }
+    assert_eq!(symbols("src/missing.rs"), ErrorCode::FileNotFound);
+    assert_eq!(refs_in("src/lib.rs"), ErrorCode::InvalidRequest);
+    assert_eq!(refs_in("missing"), ErrorCode::FileNotFound);
+}
+
 #[test]
 fn sandboxed_service_allows_workspace_paths() {
     // AppService::sandboxed はワークスペース内のパスを許可する。

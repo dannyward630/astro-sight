@@ -178,7 +178,7 @@ pub struct CochangeAnalyzeParams {
     /// Minimum shared commit count per pair (default: 2)
     #[serde(default = "default_min_samples")]
     pub min_samples: usize,
-    /// Commits touching more files than this threshold are skipped (default: 30)
+    /// Commits touching more files than this threshold are skipped (default: 100)
     #[serde(default = "default_max_files_per_commit")]
     pub max_files_per_commit: usize,
     /// Keep generated files (declared via `.gitattributes` `linguist-generated` or a
@@ -187,16 +187,19 @@ pub struct CochangeAnalyzeParams {
     pub include_generated: bool,
 }
 
+// 既定値は CLI / session と同じ `CoChangeOptions::default()` から取る。
+// MCP だけ数値を書き写していたため、CLI 側で上限を 30 → 100 に上げた際に
+// MCP が 30 のまま残り、31〜100 ファイルのコミットを丸ごと捨てていた。
 fn default_min_confidence() -> f64 {
-    0.3
+    crate::models::cochange::CoChangeOptions::default().min_confidence
 }
 
 fn default_min_samples() -> usize {
-    2
+    crate::models::cochange::CoChangeOptions::default().min_samples
 }
 
 fn default_max_files_per_commit() -> usize {
-    30
+    crate::models::cochange::CoChangeOptions::default().max_files_per_commit
 }
 
 // ---------------------------------------------------------------------------

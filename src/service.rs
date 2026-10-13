@@ -140,13 +140,51 @@ impl AppService {
         candidate.to_path_buf()
     }
 
+    /// サンドボックスで、`candidate` がワークスペースの外を指すか。
+    ///
+    /// 存在しないパスでも、存在する最も深い祖先を正規化して判定する。存在の有無や
+    /// 種類 (ファイルかディレクトリか) で先にエラーを分けると、FILE_NOT_FOUND と
+    /// PATH_OUT_OF_BOUNDS の違いからワークスペース外のファイルの有無が分かってしまう。
+    /// 祖先を 1 つも正規化できなければ判定せず `false` (呼び出し側の通常のエラーに任せる)。
+    fn is_outside_workspace(&self, candidate: &Path) -> bool {
+        let Some(root) = &self.workspace_root else {
+            return false;
+        };
+        let mut probe = candidate;
+        loop {
+            if let Ok(canonical) = std::fs::canonicalize(probe) {
+                return !canonical.starts_with(root);
+            }
+            match probe.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => probe = parent,
+                _ => return false,
+            }
+        }
+    }
+
     /// ファイルパスを検証して正規化し、正規化済みパスを返す。
     fn validate_path(&self, path: &str) -> Result<PathBuf> {
         let candidate = self.workspace_candidate(path);
-        let canonical = std::fs::canonicalize(&candidate).map_err(|_| {
-            warn!(path = path, "⚠️ validate_path: file not found");
-            AstroError::new(ErrorCode::FileNotFound, format!("File not found: {path}"))
-        })?;
+        let canonical = match std::fs::canonicalize(&candidate) {
+            Ok(canonical) => canonical,
+            Err(_) if self.is_outside_workspace(&candidate) => {
+                warn!(
+                    path = path,
+                    "🚫 validate_path: path outside workspace boundary"
+                );
+                bail!(AstroError::new(
+                    ErrorCode::PathOutOfBounds,
+                    format!("Path outside workspace boundary: {path}"),
+                ));
+            }
+            Err(_) => {
+                warn!(path = path, "⚠️ validate_path: file not found");
+                bail!(AstroError::new(
+                    ErrorCode::FileNotFound,
+                    format!("File not found: {path}")
+                ));
+            }
+        };
         if let Some(root) = &self.workspace_root
             && !canonical.starts_with(root)
         {
@@ -178,24 +216,30 @@ impl AppService {
     /// ディレクトリパスを検証して正規化し、正規化済みパスを返す。
     fn validate_dir(&self, dir: &str) -> Result<PathBuf> {
         let candidate = self.workspace_candidate(dir);
-        let canonical = std::fs::canonicalize(&candidate).map_err(|_| {
+        let outside = || {
             AstroError::new(
+                ErrorCode::PathOutOfBounds,
+                format!("Directory outside workspace boundary: {dir}"),
+            )
+        };
+        let canonical = match std::fs::canonicalize(&candidate) {
+            Ok(canonical) => canonical,
+            Err(_) if self.is_outside_workspace(&candidate) => bail!(outside()),
+            Err(_) => bail!(AstroError::new(
                 ErrorCode::FileNotFound,
                 format!("Directory not found: {dir}"),
-            )
-        })?;
+            )),
+        };
+        // 境界の確認をディレクトリかどうかの判定より先に行う (外のパスの種類を漏らさない)。
+        if let Some(root) = &self.workspace_root
+            && !canonical.starts_with(root)
+        {
+            bail!(outside());
+        }
         if !canonical.is_dir() {
             bail!(AstroError::new(
                 ErrorCode::InvalidRequest,
                 format!("Path is not a directory: {dir}"),
-            ));
-        }
-        if let Some(root) = &self.workspace_root
-            && !canonical.starts_with(root)
-        {
-            bail!(AstroError::new(
-                ErrorCode::PathOutOfBounds,
-                format!("Directory outside workspace boundary: {dir}"),
             ));
         }
         Ok(canonical)
@@ -289,6 +333,21 @@ impl AppService {
         response.ast = Some(ast_nodes);
         response.snippet = snip;
         collect_diagnostics(root, &source, &mut response);
+        // 上限を超えた深さは黙って打ち切らず、何段まで展開したかを申告する。
+        if p.depth > extractor::MAX_AST_DEPTH {
+            response
+                .diagnostics
+                .push(crate::models::diagnostic::Diagnostic {
+                    severity: crate::models::diagnostic::Severity::Warning,
+                    message: format!(
+                        "AST depth {} exceeds the limit; expanded {} levels",
+                        p.depth,
+                        extractor::MAX_AST_DEPTH
+                    ),
+                    line: None,
+                    column: None,
+                });
+        }
         debug!(
             path = p.path,
             language = ?lang_id,
@@ -982,29 +1041,39 @@ fn collect_diagnostics(root: tree_sitter::Node<'_>, source: &[u8], response: &mu
     }
 }
 
+/// エラーを含む部分木だけを前順に辿り、ERROR / MISSING ノードを診断として集める。
+///
+/// 再帰で書くと、括弧が数万段入れ子になった中に構文エラーがあるファイル 1 つで
+/// スタックが溢れ、session / MCP サーバー / バッチがプロセスごと落ちる。
+/// 明示スタックで辿り、子は逆順に積んで再帰版と同じ順序で診断を出す。
 fn collect_error_nodes(
-    node: tree_sitter::Node<'_>,
+    root: tree_sitter::Node<'_>,
     diagnostics: &mut Vec<crate::models::diagnostic::Diagnostic>,
 ) {
-    if node.is_error() || node.is_missing() {
-        diagnostics.push(crate::models::diagnostic::Diagnostic {
-            severity: crate::models::diagnostic::Severity::Error,
-            message: format!(
-                "Parse error: {} at {}:{}",
-                node.kind(),
-                node.start_position().row,
-                node.start_position().column
-            ),
-            line: Some(node.start_position().row),
-            column: Some(node.start_position().column),
-        });
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.has_error() || child.is_error() || child.is_missing() {
-            collect_error_nodes(child, diagnostics);
+    let mut pending = vec![root];
+    let mut children = Vec::new();
+    while let Some(node) = pending.pop() {
+        if node.is_error() || node.is_missing() {
+            diagnostics.push(crate::models::diagnostic::Diagnostic {
+                severity: crate::models::diagnostic::Severity::Error,
+                message: format!(
+                    "Parse error: {} at {}:{}",
+                    node.kind(),
+                    node.start_position().row,
+                    node.start_position().column
+                ),
+                line: Some(node.start_position().row),
+                column: Some(node.start_position().column),
+            });
         }
+
+        let mut cursor = node.walk();
+        children.clear();
+        children.extend(
+            node.children(&mut cursor)
+                .filter(|child| child.has_error() || child.is_error() || child.is_missing()),
+        );
+        pending.extend(children.drain(..).rev());
     }
 }
 
@@ -1372,5 +1441,70 @@ mod tests {
 
         assert_eq!(refs.references.len(), 1);
         assert_eq!(refs.references[0].path, "only_in_workspace.rs");
+    }
+
+    /// 修正前の再帰版。反復版と診断の順序が一致することを確かめる参照実装。
+    fn collect_error_nodes_recursive(
+        node: tree_sitter::Node<'_>,
+        out: &mut Vec<(usize, usize, String)>,
+    ) {
+        if node.is_error() || node.is_missing() {
+            out.push((
+                node.start_position().row,
+                node.start_position().column,
+                node.kind().to_string(),
+            ));
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.has_error() || child.is_error() || child.is_missing() {
+                collect_error_nodes_recursive(child, out);
+            }
+        }
+    }
+
+    /// 括弧が 1.2 万段入れ子になった中の構文エラーでも、スタックを溢れさせずに診断を集める。
+    /// 再帰版はテストスレッドのスタック (2 MiB) で溢れ、プロセスごと落ちていた。
+    #[test]
+    fn collect_error_nodes_handles_deeply_nested_syntax_error() {
+        let source = format!("x = {}1 +{};\n", "(".repeat(12_000), ")".repeat(12_000));
+        let tree =
+            crate::engine::parser::parse_source(source.as_bytes(), LangId::Javascript).unwrap();
+        assert!(tree.root_node().has_error());
+        let mut diagnostics = Vec::new();
+        collect_error_nodes(tree.root_node(), &mut diagnostics);
+        assert!(!diagnostics.is_empty());
+    }
+
+    /// 反復版は再帰版と同じ順序で同じ診断を出す (出力の決定論を変えない)。
+    #[test]
+    fn collect_error_nodes_keeps_recursive_order() {
+        let source = "function a( {\n  let = ;\n}\nconst b = [1, 2\nclass { }\nif (x { y(); }\n";
+        let tree =
+            crate::engine::parser::parse_source(source.as_bytes(), LangId::Javascript).unwrap();
+        assert!(tree.root_node().has_error());
+        let mut diagnostics = Vec::new();
+        collect_error_nodes(tree.root_node(), &mut diagnostics);
+        let mut expected = Vec::new();
+        collect_error_nodes_recursive(tree.root_node(), &mut expected);
+        assert!(
+            expected.len() >= 2,
+            "複数の診断が出る入力であること: {expected:?}"
+        );
+        let actual: Vec<(usize, usize, String)> = diagnostics
+            .iter()
+            .map(|d| {
+                (
+                    d.line.unwrap_or_default(),
+                    d.column.unwrap_or_default(),
+                    d.message
+                        .strip_prefix("Parse error: ")
+                        .and_then(|rest| rest.split(" at ").next())
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected);
     }
 }

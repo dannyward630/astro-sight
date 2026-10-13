@@ -17,6 +17,14 @@ mod scoring;
 use generated_policy::GeneratedPolicy;
 use scoring::{ShardStats, commit_size_weight, compare_entries_by_ranking};
 
+/// 起点ファイルを pathspec として渡す git 呼び出しに付ける環境変数。
+///
+/// 付けないと `:/secret/x.rs` や `:(top)secret/x.rs` (pathspec magic) がリポジトリの
+/// ルートから解決され、session / MCP のワークスペース外にあるファイルの履歴を
+/// 解析できてしまう (`..` は字句検証で拒否しているのに、magic は素通りしていた)。
+/// 文字どおりに解釈させれば、`:` で始まる実在のファイル名も壊さずに扱える。
+const LITERAL_PATHSPECS_ENV: &str = "GIT_LITERAL_PATHSPECS";
+
 /// entries なし・commits_analyzed 0 の空結果を返す。起点なし / 証拠集合が空 /
 /// マージ除外後に空、の各早期 return で共用し、構築の重複を避ける。
 fn empty_cochange_result(
@@ -805,6 +813,7 @@ fn collect_changed_old_ranges(dir: &str, file: &str, base: &str) -> Result<Chang
         .arg("diff")
         .args(crate::git_support::GIT_DIFF_PARSEABLE_OUTPUT_ARGS)
         .args(["--unified=0", base, "--", file])
+        .env(LITERAL_PATHSPECS_ENV, "1")
         .current_dir(dir)
         .output()
         .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;
@@ -862,6 +871,7 @@ fn collect_blame_commits_for_file(
 
     let blame_output = Command::new("git")
         .args(&args)
+        .env(LITERAL_PATHSPECS_ENV, "1")
         .current_dir(dir)
         .output()
         .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;
@@ -958,6 +968,7 @@ fn collect_history_commits_for_file(
 
     let output = Command::new("git")
         .args(&args)
+        .env(LITERAL_PATHSPECS_ENV, "1")
         .current_dir(dir)
         .output()
         .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;

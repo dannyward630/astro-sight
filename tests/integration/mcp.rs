@@ -433,3 +433,103 @@ fn mcp_refs_search_rejects_scope_without_searchable_file() {
     assert!(message.contains("UNSUPPORTED_LANGUAGE"), "{message}");
     assert!(json.get("result").is_none(), "{json}");
 }
+
+/// cochange は引数を省略したとき、CLI・session・MCP の `cochange_analyze` が同じ既定値で
+/// 解析する。
+///
+/// 旧実装は MCP だけ `max_files_per_commit` の既定を 30 と書き写しており、CLI と
+/// session の既定 (100) を上げたときに取り残されていた。31〜100 ファイルを変える
+/// コミットが MCP でだけ丸ごと捨てられ、同じリポジトリで共変更の結果が食い違う。
+/// フィクスチャは a.rs と b.rs を毎回 40 ファイルのコミットで一緒に変えるので、
+/// 上限 30 では証拠が 1 件も残らない (対照として結果が空でないことも確かめる)。
+#[test]
+fn cochange_defaults_match_across_cli_session_and_mcp() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    for round in 0..4 {
+        repo.write("src/a.rs", format!("pub fn a() -> u32 {{ {round} }}\n"));
+        repo.write("src/b.rs", format!("pub fn b() -> u32 {{ {round} }}\n"));
+        for filler in 0..38 {
+            repo.write(
+                format!("src/f{filler}.rs"),
+                format!("pub fn f{filler}() -> u32 {{ {round} }}\n"),
+            );
+        }
+        repo.commit_all(&format!("round {round}"));
+    }
+
+    let entries_of = |json: &serde_json::Value| -> Vec<(String, String)> {
+        let mut entries: Vec<(String, String)> = json["entries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("entries 配列が必要: {json}"))
+            .iter()
+            .map(|entry| {
+                (
+                    entry["file_a"].as_str().unwrap_or_default().to_string(),
+                    entry["file_b"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        entries.sort();
+        entries
+    };
+
+    let cli = repo.run_json("cochange", &["--paths", "src/a.rs"]);
+    let cli_entries = entries_of(&cli);
+    assert!(
+        !cli_entries.is_empty(),
+        "CLI の既定値では 40 ファイルのコミットも証拠に数える: {cli}"
+    );
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "cochange_analyze",
+            "arguments": { "dir": ".", "source_files": ["src/a.rs"] }
+        }
+    })
+    .to_string();
+    let stdout = mcp_send_after_init_with(&[], Some(repo.root()), &[&request]);
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("\"id\":2"))
+        .unwrap_or_else(|| panic!("cochange_analyze のレスポンスが必要: {stdout}"));
+    let json: serde_json::Value = serde_json::from_str(line).expect("valid JSON-RPC");
+    let text = json["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("text フィールドが必要: {json}"));
+    let mcp: serde_json::Value = serde_json::from_str(text).expect("cochange JSON");
+    assert_eq!(
+        entries_of(&mcp),
+        cli_entries,
+        "MCP と CLI は既定値で同じ共変更を返す: mcp={mcp} cli={cli}"
+    );
+
+    let session = {
+        use std::io::Write;
+        let mut child = cargo_bin()
+            .arg("session")
+            .env("ASTRO_SIGHT_WORKSPACE", repo.root())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn session");
+        writeln!(
+            child.stdin.as_mut().expect("stdin"),
+            r#"{{"command":"cochange","dir":".","source_files":["src/a.rs"]}}"#
+        )
+        .expect("write session request");
+        let output = child.wait_with_output().expect("failed to wait session");
+        let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+        serde_json::from_str::<serde_json::Value>(stdout.trim())
+            .unwrap_or_else(|_| panic!("session の cochange 応答が必要: {stdout}"))
+    };
+    assert_eq!(
+        entries_of(&session),
+        cli_entries,
+        "session と CLI は既定値で同じ共変更を返す: session={session} cli={cli}"
+    );
+}

@@ -3685,6 +3685,53 @@ fn custom_query_accepts_destructuring_capture_only_for_js_ts() {
     );
 }
 
+/// Python の代入を拾う独自クエリは、lambda 以外の代入も結果に残す。
+///
+/// lambda 束縛だけを関数にする除外が capture の種別を見ていなかったため、
+/// `@constant.name` / `@variable.name` で代入を拾うクエリが lambda 以外を黙って捨て、
+/// 定数が 1 件も出なかった。**対照**: 関数としての capture (`@function.name`) では
+/// lambda 以外の代入を関数にしない (組み込みクエリと同じ規則のまま)。
+#[test]
+fn python_custom_query_keeps_non_lambda_assignments_for_non_function_captures() {
+    let src = "MAX_SIZE = 10\nhandler = lambda x: x\n";
+    let language = LangId::Python.ts_language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).unwrap();
+    let tree = parser.parse(src, None).unwrap();
+    let names_for = |query: &str| -> Vec<(String, SymbolKind)> {
+        extract_symbols_with_custom_query(tree.root_node(), src.as_bytes(), LangId::Python, query)
+            .expect("valid query")
+            .into_iter()
+            .map(|s| (s.name, s.kind))
+            .collect()
+    };
+
+    for (query, kind) in [
+        (
+            "(assignment left: (identifier) @constant.name)",
+            SymbolKind::Constant,
+        ),
+        (
+            "(assignment left: (identifier) @variable.name)",
+            SymbolKind::Variable,
+        ),
+    ] {
+        assert_eq!(
+            names_for(query),
+            vec![
+                ("MAX_SIZE".to_string(), kind),
+                ("handler".to_string(), kind)
+            ],
+            "{query}"
+        );
+    }
+    assert_eq!(
+        names_for("(assignment left: (identifier) @function.name)"),
+        vec![("handler".to_string(), SymbolKind::Function)],
+        "関数としての capture は lambda 束縛だけを残す"
+    );
+}
+
 /// Java / C# の record、Go の型エイリアス、Rust trait の必須メソッドを抽出する。
 /// extern ブロックの外部関数宣言は同じ function_signature_item でも拾わない。
 #[test]

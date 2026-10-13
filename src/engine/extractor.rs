@@ -2,6 +2,15 @@ use crate::models::ast_node::{AstEdge, AstNode};
 use crate::models::location::Range;
 use tree_sitter::{Node, Point};
 
+/// `ast` で展開する深さの上限。
+///
+/// `AstNode` は子を入れ子で持ち、変換・JSON / TOON への直列化・破棄がすべて深さぶん
+/// 再帰する。上限が無いと `--depth 100000` (session / MCP の `depth` も同じ) と深い入れ子の
+/// ファイル 1 つでスタックが溢れ、MCP サーバーや session がプロセスごと落ちていた。
+/// 通常のコードの構文木はこの深さに届かない。超えた指定は上限まで展開し、
+/// 呼び出し側 (`AppService::extract_ast`) が診断で申告する。
+pub const MAX_AST_DEPTH: usize = 256;
+
 /// 指定位置付近の AST ノードを抽出する。
 pub fn extract_at_point(
     root: Node<'_>,
@@ -10,6 +19,7 @@ pub fn extract_at_point(
     column: usize,
     depth: usize,
 ) -> Vec<AstNode> {
+    let depth = depth.min(MAX_AST_DEPTH);
     let point = Point::new(line, column);
     let node = find_deepest_node_at(root, point);
 
@@ -30,6 +40,7 @@ pub fn extract_range(
     end_col: usize,
     depth: usize,
 ) -> Vec<AstNode> {
+    let depth = depth.min(MAX_AST_DEPTH);
     let start = Point::new(start_line, start_col);
     let end = Point::new(end_line, end_col);
 
@@ -49,6 +60,7 @@ pub fn extract_range(
 
 /// ルートレベルの AST 全体を制限深度で抽出する。
 pub fn extract_full(root: Node<'_>, source: &[u8], depth: usize) -> Vec<AstNode> {
+    let depth = depth.min(MAX_AST_DEPTH);
     let mut results = Vec::new();
     let mut cursor = root.walk();
     let mut next_id = 0;
@@ -60,19 +72,35 @@ pub fn extract_full(root: Node<'_>, source: &[u8], depth: usize) -> Vec<AstNode>
     results
 }
 
-fn find_deepest_node_at<'a>(node: Node<'a>, point: Point) -> Option<Node<'a>> {
-    if !contains_point(node, point) {
+/// `point` を含む最も深い named ノード。
+///
+/// 子を先頭から試し、最初に見つかった結果を返す。子のどれからも見つからなければ、
+/// 自分が named なら自分を返す。構文木の深さぶん再帰すると深い入れ子のファイルで
+/// スタックが溢れるため、(ノード, 次に試す子) の明示スタックで同じ順序に辿る。
+fn find_deepest_node_at<'a>(root: Node<'a>, point: Point) -> Option<Node<'a>> {
+    if !contains_point(root, point) {
         return None;
     }
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if let Some(deeper) = find_deepest_node_at(child, point) {
-            return Some(deeper);
+    let mut stack: Vec<(Node<'a>, u32)> = vec![(root, 0)];
+    while let Some(&mut (node, ref mut next_child)) = stack.last_mut() {
+        if *next_child < node.child_count() {
+            let index = *next_child;
+            *next_child += 1;
+            if let Some(child) = node.child(index)
+                && contains_point(child, point)
+            {
+                stack.push((child, 0));
+            }
+            continue;
+        }
+        // どの子からも見つからなかった。named なら自分が答え (祖先はそのまま返す)。
+        stack.pop();
+        if node.is_named() {
+            return Some(node);
         }
     }
-
-    if node.is_named() { Some(node) } else { None }
+    None
 }
 
 fn contains_point(node: Node<'_>, point: Point) -> bool {
@@ -91,8 +119,10 @@ fn contains_point(node: Node<'_>, point: Point) -> bool {
     true
 }
 
+/// 範囲に完全に含まれる named ノードを前順に集める (含まれたノードの子孫には降りない)。
+/// 構文木の深さぶん再帰しないよう明示スタックで辿り、子は逆順に積んで順序を保つ。
 fn collect_nodes_in_range(
-    node: Node<'_>,
+    root: Node<'_>,
     source: &[u8],
     start: Point,
     end: Point,
@@ -100,27 +130,33 @@ fn collect_nodes_in_range(
     results: &mut Vec<AstNode>,
     next_id: &mut usize,
 ) {
-    let node_start = node.start_position();
-    let node_end = node.end_position();
+    let mut pending = vec![root];
+    let mut children = Vec::new();
+    while let Some(node) = pending.pop() {
+        let node_start = node.start_position();
+        let node_end = node.end_position();
 
-    // 範囲外のノードをスキップ
-    if node_end.row < start.row || (node_end.row == start.row && node_end.column < start.column) {
-        return;
-    }
-    if node_start.row > end.row || (node_start.row == end.row && node_start.column > end.column) {
-        return;
-    }
+        // 範囲外のノードをスキップ
+        if node_end.row < start.row || (node_end.row == start.row && node_end.column < start.column)
+        {
+            continue;
+        }
+        if node_start.row > end.row || (node_start.row == end.row && node_start.column > end.column)
+        {
+            continue;
+        }
 
-    // ノードが範囲内に完全に含まれる場合は収集
-    if node.is_named() && is_within(node_start, node_end, start, end) {
-        results.push(node_to_ast(node, source, depth, next_id));
-        return;
-    }
+        // ノードが範囲内に完全に含まれる場合は収集
+        if node.is_named() && is_within(node_start, node_end, start, end) {
+            results.push(node_to_ast(node, source, depth, next_id));
+            continue;
+        }
 
-    // 含まれない場合は子ノードを再帰走査
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_nodes_in_range(child, source, start, end, depth, results, next_id);
+        // 含まれない場合は子ノードを辿る
+        let mut cursor = node.walk();
+        children.clear();
+        children.extend(node.children(&mut cursor));
+        pending.extend(children.drain(..).rev());
     }
 }
 
@@ -388,6 +424,78 @@ mod tests {
         let nodes = extract_at_point(root, source.as_bytes(), 100, 0, 1);
         // フォールバックでルートの AST が返る
         assert!(!nodes.is_empty());
+    }
+
+    /// 入れ子の深さ (根を 1 段目とする)。深い木でも再帰しないよう明示スタックで数える。
+    fn ast_depth(nodes: &[AstNode]) -> usize {
+        let mut max = 0;
+        let mut pending: Vec<(&AstNode, usize)> = nodes.iter().map(|n| (n, 1)).collect();
+        while let Some((node, level)) = pending.pop() {
+            max = max.max(level);
+            pending.extend(node.children.iter().map(|edge| (&edge.node, level + 1)));
+        }
+        max
+    }
+
+    /// 括弧が 1.2 万段入れ子になったファイルでも、位置・範囲・全体の抽出はスタックを
+    /// 溢れさせない。要求した深さが上限を超えても `MAX_AST_DEPTH` 段で止まる。
+    /// 旧実装は位置探索・範囲探索・変換がすべて再帰で、プロセスごと落ちていた。
+    #[test]
+    fn deep_tree_extraction_does_not_overflow_and_caps_depth() {
+        let nesting = 12_000;
+        let source = format!(
+            "fn f() -> u32 {{ {}1{} }}\n",
+            "(".repeat(nesting),
+            ")".repeat(nesting)
+        );
+        let tree = parse_rust_source(&source);
+        let root = tree.root_node();
+        let innermost = "fn f() -> u32 { ".len() + nesting;
+
+        let at_point = extract_at_point(root, source.as_bytes(), 0, innermost, 3);
+        assert_eq!(at_point.len(), 1);
+        assert_eq!(at_point[0].text.as_deref(), Some("1"));
+
+        let in_range = extract_range(root, source.as_bytes(), 0, innermost, 0, innermost + 1, 3);
+        assert!(!in_range.is_empty());
+
+        let full = extract_full(root, source.as_bytes(), 1_000_000);
+        assert_eq!(ast_depth(&full), MAX_AST_DEPTH + 1);
+        let at_point_deep = extract_at_point(root, source.as_bytes(), 0, 3, usize::MAX);
+        assert!(ast_depth(&at_point_deep) <= MAX_AST_DEPTH + 1);
+    }
+
+    /// 修正前の再帰版 (位置探索)。反復版と結果が一致することを確かめる参照実装。
+    fn find_deepest_node_at_recursive<'a>(node: Node<'a>, point: Point) -> Option<Node<'a>> {
+        if !contains_point(node, point) {
+            return None;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(deeper) = find_deepest_node_at_recursive(child, point) {
+                return Some(deeper);
+            }
+        }
+        if node.is_named() { Some(node) } else { None }
+    }
+
+    /// 反復版の位置探索は、ファイル中のすべての位置で再帰版と同じノードを返す。
+    #[test]
+    fn find_deepest_node_at_matches_recursive_version_everywhere() {
+        let source = "fn add(a: u32, b: u32) -> u32 {\n    let s = a + b; // sum\n    s\n}\n\
+                      struct P { x: i32 }\n";
+        let tree = parse_rust_source(source);
+        let root = tree.root_node();
+        for (row, line) in source.lines().enumerate() {
+            for column in 0..=line.len() + 1 {
+                let point = Point::new(row, column);
+                assert_eq!(
+                    find_deepest_node_at(root, point).map(|n| n.id()),
+                    find_deepest_node_at_recursive(root, point).map(|n| n.id()),
+                    "{row}:{column}"
+                );
+            }
+        }
     }
 
     // --- extract_range テスト ---
