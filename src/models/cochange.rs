@@ -425,6 +425,12 @@ pub struct CoChangeOptions {
     /// 同じ author の短時間 burst による偽陽性を抑制する。
     /// 推奨値 7 (週単位)。
     pub author_unit_window_days: u64,
+    /// blame の対象にする変更行を index との差分 (`git diff --cached <base>`) から取る。
+    ///
+    /// review `--staged` は起点を index の diff から選ぶ。変更行だけを作業ツリーとの差分から
+    /// 取ると、同じファイルに未ステージの編集があるときに、その行の履歴で推薦が決まる。
+    /// 既定 false = 作業ツリーとの差分 (`git diff <base>`)。
+    pub changed_lines_from_index: bool,
 }
 
 impl Default for CoChangeOptions {
@@ -471,6 +477,7 @@ impl Default for CoChangeOptions {
             // 既定 7 (週単位): 同一 author の短時間 burst による偽陽性を抑制する。
             // `0` で旧挙動 (raw weighted 集計、author 圧縮なし) に戻せる。
             author_unit_window_days: 7,
+            changed_lines_from_index: false,
         }
     }
 }

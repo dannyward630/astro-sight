@@ -40,29 +40,74 @@ pub(super) struct Scope<'a> {
     pub filters: Filters,
 }
 
+/// `-z` で区切った git の一覧を 1 件ずつ `each` に渡す。`each` が `None` を返したら中断する。
+///
+/// 一覧はファイル数に比例して大きくなるので、メタデータ用の `git` (2 MiB 上限) を通さない。
+/// 2 MiB で切れると、2 万ファイル規模のリポジトリで依存の証拠と gitlink の除外が効かなくなった。
+/// 上限 (`MAX_INPUT_SIZE`) を超えた場合と git が失敗した場合は `None`。
+fn git_records(dir: &str, args: &[&str], mut each: impl FnMut(&[u8]) -> Option<()>) -> Option<()> {
+    use std::io::BufRead;
+    let mut child = crate::git_support::git_command_for_dir(dir)
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut reader = std::io::BufReader::new(child.stdout.take()?);
+    let mut record = Vec::new();
+    let mut total = 0usize;
+    let complete = loop {
+        record.clear();
+        match reader.read_until(0, &mut record) {
+            Ok(0) => break true,
+            Ok(read) => {
+                total = total.saturating_add(read);
+                let entry = record.strip_suffix(&[0]).unwrap_or(&record);
+                if total > crate::commands::common::MAX_INPUT_SIZE
+                    || (!entry.is_empty() && each(entry).is_none())
+                {
+                    break false;
+                }
+            }
+            Err(_) => break false,
+        }
+    };
+    // 途中で止めたときに git が書き込みで詰まらないよう、待つ前にパイプを閉じる。
+    drop(reader);
+    let status = child.wait().ok()?;
+    (complete && status.success()).then_some(())
+}
+
 fn tree_entries(
     dir: &str,
     revision: &str,
 ) -> Option<(HashSet<String>, HashSet<String>, HashSet<String>)> {
     let prefix = String::from_utf8(git(dir, &["rev-parse", "--show-prefix"])?).ok()?;
     let prefix = prefix.trim_end_matches('\n');
-    let data = git(dir, &["ls-tree", "--full-tree", "-r", "-z", revision, "--"])?;
     let mut paths = HashSet::new();
     let mut links = HashSet::new();
     let mut regular = HashSet::new();
-    for entry in data.split(|b| *b == 0).filter(|e| !e.is_empty()) {
-        let (header, path) = std::str::from_utf8(entry).ok()?.split_once('\t')?;
-        let Some(path) = path.strip_prefix(prefix) else {
-            continue;
-        };
-        paths.insert(path.to_owned());
-        if header.starts_with("100644 ") || header.starts_with("100755 ") {
-            regular.insert(path.to_owned());
-        }
-        if header.starts_with("160000 ") {
-            links.insert(path.to_owned());
-        }
-    }
+    git_records(
+        dir,
+        &["ls-tree", "--full-tree", "-r", "-z", revision, "--"],
+        |entry| {
+            let (header, path) = std::str::from_utf8(entry).ok()?.split_once('\t')?;
+            let Some(path) = path.strip_prefix(prefix) else {
+                return Some(());
+            };
+            paths.insert(path.to_owned());
+            if header.starts_with("100644 ") || header.starts_with("100755 ") {
+                regular.insert(path.to_owned());
+            }
+            if header.starts_with("160000 ") {
+                links.insert(path.to_owned());
+            }
+            Some(())
+        },
+    )?;
     Some((paths, links, regular))
 }
 
@@ -210,16 +255,15 @@ impl<'a> Scope<'a> {
                 paths
             })
         } else {
-            if let Some(entries) = git(dir, &["ls-files", "--stage", "-z", "--"]) {
-                for entry in entries.split(|b| *b == 0).filter(|e| !e.is_empty()) {
-                    if let Ok(entry) = std::str::from_utf8(entry)
-                        && let Some((header, path)) = entry.split_once('\t')
-                        && header.starts_with("160000 ")
-                    {
-                        gitlinks.insert(path.to_owned());
-                    }
+            git_records(dir, &["ls-files", "--stage", "-z", "--"], |entry| {
+                if let Ok(entry) = std::str::from_utf8(entry)
+                    && let Some((header, path)) = entry.split_once('\t')
+                    && header.starts_with("160000 ")
+                {
+                    gitlinks.insert(path.to_owned());
                 }
-            }
+                Some(())
+            });
             None
         };
         unavailable |= snapshot.is_some() && indexed.is_none();
@@ -677,6 +721,62 @@ mod tests {
         assert!(!scope.candidate("module"));
         assert_eq!(scope.filters.gitlink_sources, 1);
         assert_eq!(scope.filters.gitlink_candidates, 1);
+    }
+
+    /// 一覧系の git 出力は 2 MiB を超えても読み切る。メタデータ用の上限で切っていたころは、
+    /// 2 万ファイル規模で tree の一覧が取れず (`metadata_unavailable`)、gitlink が起点になっていた。
+    #[test]
+    fn large_tree_listings_keep_metadata_and_gitlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let name = root.to_str().unwrap();
+        init_git_repo_for_test(root);
+        git_commit_files(root, &[("a.ts", "export const a = 1;\n")], "base");
+        let text = |args: &[&str]| {
+            String::from_utf8(git(name, args).unwrap())
+                .unwrap()
+                .trim()
+                .to_owned()
+        };
+        let head = text(&["rev-parse", "HEAD"]);
+        let blob = text(&["rev-parse", "HEAD:a.ts"]);
+        // 作業ツリーには書かず、長い名前のエントリを index に積んで 2 MiB を超えさせる。
+        let mut entries = String::new();
+        for n in 0..8000 {
+            entries.push_str(&format!("100644 {blob}\tbulk/{n:05}{}\n", "x".repeat(235)));
+        }
+        entries.push_str(&format!("160000 {head}\tmodule\n"));
+        let mut child = std::process::Command::new("git")
+            .args(["update-index", "--index-info"])
+            .current_dir(root)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), entries.as_bytes()).unwrap();
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        let output = std::process::Command::new("git")
+            .args(["commit", "-qm", "bulk"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let listing = std::process::Command::new("git")
+            .args(["ls-tree", "--full-tree", "-r", "-z", "HEAD"])
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .stdout;
+        assert!(
+            listing.len() > 2 * 1024 * 1024,
+            "前提: 一覧が 2 MiB を超える"
+        );
+
+        let mut scope = Scope::new(name, Some("HEAD"), &[], &[], &[]).unwrap();
+        assert!(!scope.filters.metadata_unavailable);
+        assert!(!scope.source("module"), "gitlink は起点にしない");
+        assert_eq!(scope.filters.gitlink_sources, 1);
+        assert!(scope.source("a.ts"), "通常のファイルは起点のまま");
     }
 
     #[test]

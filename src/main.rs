@@ -680,6 +680,8 @@ fn dispatch_cochange(
         history_limit,
         per_source_limit,
         author_unit_window_days,
+        // standalone の cochange は作業ツリーとの差分で起点を選ぶ (`--staged` は持たない)。
+        changed_lines_from_index: false,
     };
     cmd_cochange(service, &dir, &opts, output, cochange_skip)
 }

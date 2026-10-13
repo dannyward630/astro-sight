@@ -3595,6 +3595,37 @@ fn review_hook_keeps_forwarded_public_value_changes_blocking() {
     }
 }
 
+/// 明示 diff (`--diff` / `--diff-file`) の review も、recent 注釈は解決済みの base で評価する。
+/// 以前は `HEAD` という名前のまま渡り、OID でないというだけで理由が必ず invalid_metadata になった。
+#[test]
+fn review_explicit_diff_resolves_the_recent_cochange_base() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    for version in 0..5 {
+        repo.write("spec.md", format!("Specification version {version}\n"));
+        repo.write("detail.md", format!("Detail version {version}\n"));
+        repo.commit_all(&format!("document {version}"));
+    }
+    repo.write("spec.md", "Specification version 6\n");
+    let diff = std::process::Command::new("git")
+        .args(["diff", "HEAD"])
+        .current_dir(repo.root())
+        .output()
+        .unwrap();
+    assert!(diff.status.success());
+    let diff = String::from_utf8(diff.stdout).unwrap();
+    let interpretation = |result: &serde_json::Value| {
+        let entries = result["missing_cochanges"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{result}");
+        assert_eq!(entries[0]["file"], "detail.md");
+        entries[0]["interpretation"].clone()
+    };
+    let git = interpretation(&repo.run_json("review", &["--git"]));
+    let explicit = interpretation(&repo.run_json("review", &["--diff", &diff]));
+    assert_eq!(explicit["recent"]["reason"], "no_upstream", "{explicit}");
+    assert_eq!(explicit, git);
+}
+
 /// 高い履歴頻度でも、今回の変更必要性や対応完了の証明にはしない。
 #[test]
 fn review_cochange_history_candidates_explain_unassessed_actionability_and_ranking() {

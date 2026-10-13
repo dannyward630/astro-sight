@@ -261,6 +261,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
                 min_confidence,
                 min_samples: cochange_min_samples,
                 base: Some(analysis_base),
+                staged: matches!(new_side, crate::models::impact::DiffNewSide::Index),
                 include_generated,
                 exclude_dirs: extra_exclude_dirs,
                 exclude_globs: extra_exclude_globs,

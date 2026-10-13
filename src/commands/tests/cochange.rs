@@ -60,6 +60,7 @@ fn review_cochange_prefers_current_import_evidence_and_marks_small_samples() {
             min_confidence: 0.3,
             min_samples: 3,
             base: Some("HEAD"),
+            staged: false,
             include_generated: false,
             exclude_dirs: &[],
             exclude_globs: &[],
@@ -90,6 +91,171 @@ fn review_cochange_prefers_current_import_evidence_and_marks_small_samples() {
         history.interpretation.actionability,
         crate::models::cochange::CoChangeActionability::HistoryOnly
     );
+}
+
+/// `review --staged` の missing_cochanges は、index で変えた行の履歴から推薦する。
+/// 同じファイルに未ステージの編集があると、以前は作業ツリーの変更行で blame していたため、
+/// index では触っていない行の相方 (c.rs) が推薦された (対照: unstaged の review は c.rs)。
+#[test]
+fn review_staged_cochange_blames_index_lines_not_unstaged_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    // 2-4 行目は b.rs と、8-10 行目は c.rs と一緒に 1 行ずつ変える (blame の証拠が 3 コミット)。
+    let mut lines: Vec<String> = (1..=12).map(|n| format!("line{n}")).collect();
+    let text = |lines: &[String]| lines.join("\n") + "\n";
+    git_commit_files(
+        repo,
+        &[("a.rs", &text(&lines)), ("b.rs", "b0\n"), ("c.rs", "c0\n")],
+        "base",
+    );
+    for n in 1..=3 {
+        lines[n] = format!("early{n}");
+        git_commit_files(
+            repo,
+            &[("a.rs", &text(&lines)), ("b.rs", &format!("b{n}\n"))],
+            "early line with b",
+        );
+    }
+    for n in 1..=3 {
+        lines[6 + n] = format!("late{n}");
+        git_commit_files(
+            repo,
+            &[("a.rs", &text(&lines)), ("c.rs", &format!("c{n}\n"))],
+            "late line with c",
+        );
+    }
+    let committed = lines.clone();
+    for line in &mut lines[1..=3] {
+        *line = "staged".into();
+    }
+    fs::write(repo.join("a.rs"), text(&lines)).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["add", "a.rs"])
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // 作業ツリーでは index の変更を戻し、別の行だけを変える (`MM a.rs`)。
+    let mut unstaged = committed;
+    for line in &mut unstaged[7..=9] {
+        *line = "unstaged".into();
+    }
+    fs::write(repo.join("a.rs"), text(&unstaged)).unwrap();
+    let files = HashSet::from(["a.rs".to_owned()]);
+    let service = AppService::new();
+    let recommended = |staged: bool| {
+        let report = detect_missing_cochanges_scoped(
+            &service,
+            ReviewCochangeInput {
+                dir: repo.to_str().unwrap(),
+                analysis_dir: repo.to_str().unwrap(),
+                changed_files: &files,
+                diff_files: &[],
+                min_confidence: 0.3,
+                min_samples: 3,
+                base: Some("HEAD"),
+                staged,
+                include_generated: false,
+                exclude_dirs: &[],
+                exclude_globs: &[],
+            },
+        )
+        .unwrap();
+        report
+            .missing
+            .iter()
+            .map(|item| item.file.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(recommended(true), ["b.rs"]);
+    assert_eq!(recommended(false), ["c.rs"]);
+}
+
+/// `.mailmap` があっても missing_cochanges の `ranking_score` は 1 つに決まる。
+/// 同じコミット X が a.rs の変更行 blame と 0b.rs の履歴 fallback の両方に入り、以前は履歴だけが
+/// mailmap 前の author を使ったため、どちらの起点を先に見るかで X の author 単位が変わった
+/// (実測 0.2 と 0.2727 が実行ごとに入れ替わった)。履歴 fallback の起点がパス順で先に来る
+/// 名前にしてあるので、起点を整列しても author の取り違えは隠れない。
+#[test]
+fn review_cochange_ranking_uses_mailmap_identity_for_history_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let commit = |files: &[(&str, &str)], author: (&str, &str), time: u64| {
+        for (name, content) in files {
+            fs::write(repo.join(name), content).unwrap();
+        }
+        for args in [&["add", "-A"][..], &["commit", "-qm", "change"][..]] {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("GIT_AUTHOR_NAME", author.0)
+                .env("GIT_AUTHOR_EMAIL", author.1)
+                .env("GIT_AUTHOR_DATE", format!("{time} +0000"))
+                .env("GIT_COMMITTER_DATE", format!("{time} +0000"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+    };
+    let new = ("New Name", "new@example.com");
+    let start = 1_700_000_000;
+    commit(
+        &[
+            (".mailmap", "New Name <new@example.com> <old@example.com>\n"),
+            ("a.rs", "l1\nl2\nl3\nl4\nl5\n"),
+            ("0b.rs", "b1\nb2\n"),
+            ("c.rs", "c0\n"),
+        ],
+        new,
+        start,
+    );
+    commit(
+        &[
+            ("a.rs", "l1\nx\nl3\nl4\nl5\n"),
+            ("0b.rs", "bx\nb2\n"),
+            ("c.rs", "c1\n"),
+        ],
+        ("Old Name", "old@example.com"),
+        start + 100,
+    );
+    commit(
+        &[("a.rs", "l1\nx\nz1\nl4\nl5\n"), ("c.rs", "c2\n")],
+        new,
+        start + 200,
+    );
+    commit(
+        &[("a.rs", "l1\nx\nz1\nz2\nl5\n"), ("c.rs", "c3\n")],
+        new,
+        start + 300,
+    );
+    fs::write(repo.join("a.rs"), "l1\nA\nB\nC\nl5\n").unwrap();
+    fs::write(repo.join("0b.rs"), "B\nb2\n").unwrap();
+    let service = AppService::new();
+    for _ in 0..8 {
+        // 毎回新しい集合を作り、反復順の違いも通す。
+        let files: HashSet<String> = ["a.rs", "0b.rs"].into_iter().map(str::to_owned).collect();
+        let report = detect_missing_cochanges(
+            &service,
+            repo.to_str().unwrap(),
+            &files,
+            0.3,
+            0,
+            Some("HEAD"),
+            false,
+        )
+        .unwrap();
+        let ranked: Vec<_> = report
+            .missing
+            .iter()
+            .map(|m| (m.file.as_str(), m.expected_with.as_str(), m.ranking_score))
+            .collect();
+        // X・Z1・Z2 は mailmap で同じ author の同じ週 = 1 unit: (1+α)/(1+α+β) = 2/10。
+        assert_eq!(ranked, [("c.rs", "a.rs", Some(0.2))]);
+    }
 }
 
 #[test]
@@ -139,6 +305,7 @@ fn review_cochange_deletion_keeps_only_observed_references_and_honors_exclusions
                     min_confidence: 0.3,
                     min_samples: 3,
                     base: Some("HEAD"),
+                    staged: false,
                     include_generated: false,
                     exclude_dirs: &[],
                     exclude_globs: if exclude { &excluded } else { &[] },

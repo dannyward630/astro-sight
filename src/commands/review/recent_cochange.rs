@@ -242,10 +242,24 @@ fn annotate_at(dir: &str, base: Option<&str>, items: &mut [MissingCochange], now
     if items.is_empty() {
         return;
     }
-    let base = base
-        .map(str::to_owned)
-        .or_else(|| text(dir, &["rev-parse", "--verify", "HEAD^{commit}"]))
-        .unwrap_or_default();
+    // 先頭コミットとの照合に OID が要る。`--git` は解決済みの OID を渡すが、明示 diff の review は
+    // `--base` (既定 HEAD) をそのまま渡すので、ここで解決する。解決できなければ元の値のまま
+    // (OID でないので invalid_metadata になる)。
+    let requested = base.unwrap_or("HEAD");
+    let base = if oid(requested) {
+        requested.to_owned()
+    } else {
+        crate::git_support::validate_git_revision(requested, "base")
+            .ok()
+            .and_then(|()| {
+                text(
+                    dir,
+                    &["rev-parse", "--verify", &format!("{requested}^{{commit}}")],
+                )
+            })
+            .filter(|resolved| oid(resolved))
+            .unwrap_or_else(|| base.unwrap_or_default().to_owned())
+    };
     let scan = scan(dir, &base, now);
     for item in items {
         let mut evidence = scan.evidence.clone();
@@ -445,6 +459,36 @@ mod tests {
             current[0].interpretation.resolution,
             CoChangeResolution::NotChangedInRecentSuffix
         );
+    }
+
+    /// 名前で渡された base (明示 diff の review は `HEAD`) も OID に解決してから評価する。
+    /// 以前は OID でないというだけで理由が必ず invalid_metadata になった。解決できない名前と
+    /// オプションに見える値は従来どおり invalid_metadata。
+    #[test]
+    fn symbolic_base_is_resolved_before_scanning() {
+        let dir = repo(true);
+        let p = dir.path();
+        commit(p, "b.txt", "prior update", START + 100, false);
+        let head = text(p.to_str().unwrap(), &["rev-parse", "HEAD"]).unwrap();
+        for base in [None, Some("HEAD"), Some(head.as_str())] {
+            let mut items = vec![item("b.txt", "a.txt")];
+            annotate_at(p.to_str().unwrap(), base, &mut items, START + 200);
+            assert_eq!(
+                items[0].interpretation.resolution,
+                CoChangeResolution::ChangedInRecentCommits,
+                "{base:?}"
+            );
+            assert_eq!(items[0].interpretation.recent.as_ref().unwrap().base, head);
+        }
+        for base in ["no-such-ref", "-HEAD"] {
+            let mut items = vec![item("b.txt", "a.txt")];
+            annotate_at(p.to_str().unwrap(), Some(base), &mut items, START + 200);
+            assert_eq!(
+                items[0].interpretation.recent.as_ref().unwrap().reason,
+                Some(Reason::InvalidMetadata),
+                "{base}"
+            );
+        }
     }
 
     #[test]

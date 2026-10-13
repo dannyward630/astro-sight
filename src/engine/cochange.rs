@@ -745,10 +745,11 @@ fn collect_evidence_for_file(
     min_denom: usize,
     opts: &CoChangeOptions,
 ) -> SourceEvidence {
-    let changed = collect_changed_old_ranges(dir, file, base).unwrap_or(ChangedOldRanges {
-        git_failed: true,
-        ..Default::default()
-    });
+    let changed = collect_changed_old_ranges(dir, file, base, opts.changed_lines_from_index)
+        .unwrap_or(ChangedOldRanges {
+            git_failed: true,
+            ..Default::default()
+        });
 
     let mut ev = SourceEvidence::empty(CoChangeEvidence::Blame);
     ev.new_file = changed.new_file;
@@ -798,20 +799,31 @@ struct ChangedOldRanges {
     git_failed: bool,
 }
 
-/// `git diff --unified=0 <base> HEAD -- <file>` から hunk 旧側 range を抽出する。
+/// `git diff --unified=0 <base> -- <file>` から hunk 旧側 range を抽出する。
+/// `from_index` なら `--cached` を付け、index との差分にする (review `--staged`)。
 ///
 /// `new_file` は diff ヘッダの `--- /dev/null` で判定する
 /// (base 側にファイルが無い = 新規追加 = 履歴 fallback も効かない)。
-fn collect_changed_old_ranges(dir: &str, file: &str, base: &str) -> Result<ChangedOldRanges> {
+fn collect_changed_old_ranges(
+    dir: &str,
+    file: &str,
+    base: &str,
+    from_index: bool,
+) -> Result<ChangedOldRanges> {
     // revision は `<base>` 単独 (`<base> HEAD` ではない)。2 revision 形式では
     // 未コミットの作業ツリー変更が hunk に現れず、pre-commit レビュー時に
     // 変更行 blame の証拠が常に空になる (他の --git コマンドと意味を揃える)。
     // 利用者の git 設定で出力形式が変わらないよう固定する。外部 diff が設定されていると
     // git ごと失敗して起点の証拠が空になり、色設定では `@@` 行を読めなくなる
     // (`GIT_DIFF_PARSEABLE_OUTPUT_ARGS` の doc 参照)。
-    let diff_output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("diff")
-        .args(crate::git_support::GIT_DIFF_PARSEABLE_OUTPUT_ARGS)
+        .args(crate::git_support::GIT_DIFF_PARSEABLE_OUTPUT_ARGS);
+    if from_index {
+        command.arg("--cached");
+    }
+    let diff_output = command
         .args(["--unified=0", base, "--", file])
         .env(LITERAL_PATHSPECS_ENV, "1")
         .current_dir(dir)
@@ -934,8 +946,8 @@ struct BlameInfo {
 /// 履歴 fallback: `git log <base> -n <limit> -- <file>` でファイル自身のコミット集合を取る。
 ///
 /// 変更行 blame が使えない起点 (diff が無い / 純粋追加のみ) や、blame 集合が小さすぎて
-/// `min_denominator` を満たさない起点の代替証拠。`%H%x00%ae%x00%at` で SHA・author mail・
-/// author time を 1 起動でまとめて取り、blame 経路と同じ `BlameInfo` を組み立てる。
+/// `min_denominator` を満たさない起点の代替証拠。`%H%x00%aE%x00%at` で SHA・author mail
+/// (mailmap 適用済み)・author time を 1 起動でまとめて取り、blame 経路と同じ `BlameInfo` を組み立てる。
 ///
 /// - `<base>` を起点にするため、レビュー対象コミット自身は含まれない。
 /// - `ignore_merges` のときは `--no-merges` を付ける。後段の一括マージ除外でも落ちるが、
@@ -951,9 +963,12 @@ fn collect_history_commits_for_file(
     if opts.history_limit == 0 {
         return Ok(HashMap::new());
     }
+    // author mail は `.mailmap` を適用した `%aE` で取る。blame の `author-mail` は mailmap 適用済み
+    // なので、`%ae` だと同じコミットが経路によって別の author になり、SHA ごとに最初に見た
+    // 起点の値が採られる集計 (`sha_to_info`) で起点の並び順がスコアに漏れる。
     let mut args: Vec<String> = vec![
         "log".into(),
-        "--format=%H%x00%ae%x00%at".into(),
+        "--format=%H%x00%aE%x00%at".into(),
         format!("-n{}", opts.history_limit),
     ];
     if opts.ignore_merges {
@@ -1376,7 +1391,7 @@ mod tests {
         std::fs::write(repo.join("a.rs"), "fn a() {}\nfn b2() {}\nfn c() {}\n").unwrap();
         let dir_str = repo.to_str().unwrap();
 
-        let expected = collect_changed_old_ranges(dir_str, "a.rs", "HEAD").unwrap();
+        let expected = collect_changed_old_ranges(dir_str, "a.rs", "HEAD", false).unwrap();
         assert_eq!(
             expected.ranges,
             vec![(2, 1)],
@@ -1398,11 +1413,136 @@ mod tests {
                 );
             };
             git_config(&["config", key, value]);
-            let got = collect_changed_old_ranges(dir_str, "a.rs", "HEAD").unwrap();
+            let got = collect_changed_old_ranges(dir_str, "a.rs", "HEAD", false).unwrap();
             git_config(&["config", "--unset", key]);
             assert!(!got.git_failed, "{key}: git diff が失敗してはいけない");
             assert_eq!(got.ranges, expected.ranges, "{key}: hunk 旧側 range");
         }
+    }
+
+    /// `from_index` の変更行は index との差分から取る。同じファイルに未ステージの編集が
+    /// あっても、blame の対象は index で変えた行のまま (対照: 作業ツリーとの差分は別の行)。
+    #[test]
+    fn collect_changed_old_ranges_from_index_ignores_unstaged_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        let lines = |edit: &dyn Fn(usize) -> Option<&'static str>| {
+            (1..=10)
+                .map(|n| {
+                    format!(
+                        "{}\n",
+                        edit(n).map_or_else(|| format!("line{n}"), str::to_owned)
+                    )
+                })
+                .collect::<String>()
+        };
+        commit_files(repo, &[("a.rs", &lines(&|_| None))], "init");
+        std::fs::write(repo.join("a.rs"), lines(&|n| (n == 2).then_some("staged"))).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "a.rs"])
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(
+            repo.join("a.rs"),
+            lines(&|n| (n == 8).then_some("unstaged")),
+        )
+        .unwrap();
+        let dir_str = repo.to_str().unwrap();
+
+        let staged = collect_changed_old_ranges(dir_str, "a.rs", "HEAD", true).unwrap();
+        assert!(!staged.git_failed);
+        assert_eq!(staged.ranges, vec![(2, 1)]);
+        let worktree = collect_changed_old_ranges(dir_str, "a.rs", "HEAD", false).unwrap();
+        assert_eq!(worktree.ranges, vec![(8, 1)]);
+    }
+
+    /// author 単位の集計は、同じコミットを blame 経由で見ても履歴 fallback 経由で見ても
+    /// 同じ author にする (どちらも `.mailmap` を適用する)。以前は履歴 fallback だけが
+    /// mailmap 前の `%ae` を使い、SHA ごとの author は最初に見た起点のものになるため、
+    /// 起点の並び順でスコアが変わった (review は起点を HashSet の反復順で渡していた)。
+    #[test]
+    fn author_units_use_mailmap_identity_regardless_of_source_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        let commit = |files: &[(&str, &str)], author: (&str, &str), time: u64| {
+            for (name, content) in files {
+                std::fs::write(repo.join(name), content).unwrap();
+            }
+            let git = |args: &[&str]| {
+                let output = Command::new("git")
+                    .args(args)
+                    .current_dir(repo)
+                    .env("GIT_AUTHOR_NAME", author.0)
+                    .env("GIT_AUTHOR_EMAIL", author.1)
+                    .env("GIT_AUTHOR_DATE", format!("{time} +0000"))
+                    .env("GIT_COMMITTER_DATE", format!("{time} +0000"))
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "git {args:?}");
+            };
+            git(&["add", "-A"]);
+            git(&["commit", "-qm", "change"]);
+        };
+        let new = ("New Name", "new@example.com");
+        let old = ("Old Name", "old@example.com");
+        let start = 1_700_000_000;
+        commit(
+            &[
+                (".mailmap", "New Name <new@example.com> <old@example.com>\n"),
+                ("a.rs", "l1\nl2\nl3\nl4\nl5\n"),
+                ("b.rs", "b1\nb2\n"),
+                ("c.rs", "c0\n"),
+            ],
+            new,
+            start,
+        );
+        // X は旧アドレスで書かれたコミット。a.rs (blame) と b.rs (履歴 fallback) の両方の証拠に入る。
+        commit(
+            &[
+                ("a.rs", "l1\nx\nl3\nl4\nl5\n"),
+                ("b.rs", "bx\nb2\n"),
+                ("c.rs", "c1\n"),
+            ],
+            old,
+            start + 100,
+        );
+        commit(
+            &[("a.rs", "l1\nx\nz1\nl4\nl5\n"), ("c.rs", "c2\n")],
+            new,
+            start + 200,
+        );
+        commit(
+            &[("a.rs", "l1\nx\nz1\nz2\nl5\n"), ("c.rs", "c3\n")],
+            new,
+            start + 300,
+        );
+        // a.rs は 2-4 行目 (blame で 3 コミット)、b.rs は 1 行目 (blame は 1 コミットなので履歴へ)。
+        std::fs::write(repo.join("a.rs"), "l1\nA\nB\nC\nl5\n").unwrap();
+        std::fs::write(repo.join("b.rs"), "B\nb2\n").unwrap();
+        let score = |sources: [&str; 2]| {
+            let opts = CoChangeOptions {
+                source_files: sources.iter().map(|s| s.to_string()).collect(),
+                ..CoChangeOptions::default()
+            };
+            let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
+            result
+                .entries
+                .iter()
+                .find(|e| e.file_a == "a.rs" && e.file_b == "c.rs")
+                .and_then(|e| e.score)
+                .expect("a.rs -> c.rs")
+        };
+        let forward = score(["a.rs", "b.rs"]);
+        let backward = score(["b.rs", "a.rs"]);
+        assert_eq!(forward, backward, "source order must not change the score");
+        // X・Z1・Z2 は mailmap で同じ author の同じ週 = 1 unit: (1+α)/(1+α+β) = 2/10。
+        assert!((forward - 0.2).abs() < 1e-12, "{forward}");
     }
 
     /// blame モード: 起点ファイルの過去変更行に関わるコミットで他ファイルが

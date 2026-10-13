@@ -415,6 +415,8 @@ pub(crate) struct ReviewCochangeInput<'a> {
     pub min_confidence: f64,
     pub min_samples: usize,
     pub base: Option<&'a str>,
+    /// review `--staged`。blame の対象にする変更行を index との差分から取る。
+    pub staged: bool,
     pub include_generated: bool,
     pub exclude_dirs: &'a [String],
     pub exclude_globs: &'a [String],
@@ -443,11 +445,30 @@ pub(crate) fn detect_missing_cochanges(
             min_confidence,
             min_samples,
             base,
+            staged: false,
             include_generated,
             exclude_dirs: &[],
             exclude_globs: &[],
         },
     )
+}
+
+/// cochange エンジンへ渡す起点を、変更ファイルの集合から選んでパス順に並べる。
+///
+/// エンジンは起点の順で証拠を集め、同じ SHA のコミット情報は最初に見た起点のものを使う。
+/// 集合 (HashSet) の反復順のまま渡すと、その順が実行ごとに変わってエンジンの入力に入る。
+fn review_source_files(
+    changed_files: &HashSet<String>,
+    mut in_scope: impl FnMut(&str) -> bool,
+) -> Vec<String> {
+    let mut source_files: Vec<String> = changed_files
+        .iter()
+        .filter(|f| !is_dependency_lock_path(f))
+        .filter(|f| in_scope(f))
+        .cloned()
+        .collect();
+    source_files.sort_unstable();
+    source_files
 }
 
 fn attach_filters(
@@ -471,6 +492,7 @@ pub(crate) fn detect_missing_cochanges_scoped(
         min_confidence,
         min_samples,
         base,
+        staged,
         include_generated,
         exclude_dirs,
         exclude_globs,
@@ -490,12 +512,7 @@ pub(crate) fn detect_missing_cochanges_scoped(
     // 推奨に意味が無く (依存更新コマンドの副産物)、依存追加コミットで一緒に変わった
     // ソースを軒並み相方として引き当てるだけになる。engine 側の候補除外
     // (`CoChangeExclude`) は相方側にしか効かないため、起点側はここで落とす。
-    let source_files: Vec<String> = changed_files
-        .iter()
-        .filter(|f| !is_dependency_lock_path(f))
-        .filter(|f| scope.source(f))
-        .cloned()
-        .collect();
+    let source_files = review_source_files(changed_files, |f| scope.source(f));
     if source_files.is_empty() {
         let mut diagnostics = Default::default();
         attach_filters(&mut diagnostics, &scope);
@@ -538,6 +555,8 @@ pub(crate) fn detect_missing_cochanges_scoped(
             min_samples
         },
         include_generated,
+        // 起点は index の diff から選んだので、変更行も index との差分から取る。
+        changed_lines_from_index: staged,
         ..CoChangeOptions::default()
     };
     let smoothing_on = !opts.disable_smoothing;
@@ -674,6 +693,20 @@ mod tests {
             score: Some(ranking),
         };
         RankedMissingCochange::from_entry(&entry, file, expected_with, true)
+    }
+
+    /// 起点はパス順に並べ、lock は外す。集合の反復順をエンジンの入力に持ち込まない。
+    #[test]
+    fn review_source_files_are_sorted_without_lock_files() {
+        let changed: HashSet<String> =
+            ["src/z.rs", "Cargo.lock", "src/a.rs", "lib/m.rs", "skip.rs"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+        assert_eq!(
+            review_source_files(&changed, |f| f != "skip.rs"),
+            ["lib/m.rs", "src/a.rs", "src/z.rs"]
+        );
     }
 
     #[test]
