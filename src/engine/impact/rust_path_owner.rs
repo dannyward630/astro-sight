@@ -1629,22 +1629,32 @@ pub(super) fn scope_can_rebind_import_name(scope: Node<'_>, source: &[u8], name:
 }
 
 pub(super) fn path_segments(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
-    match node.kind() {
-        "identifier" | "type_identifier" | "crate" | "self" | "super" => {
-            Some(vec![node.utf8_text(source).ok()?.to_owned()])
+    // `a::b::c` は `path` 側へ入れ子になる。段数だけ再帰しないよう、`path` を先頭まで
+    // たどって末尾側から名前を集め、最後に並べ直す。
+    let mut reversed = Vec::new();
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" | "type_identifier" | "crate" | "self" | "super" => {
+                reversed.push(current.utf8_text(source).ok()?.to_owned());
+                break;
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                let path = current.child_by_field_name("path")?;
+                reversed.push(
+                    current
+                        .child_by_field_name("name")?
+                        .utf8_text(source)
+                        .ok()?
+                        .to_owned(),
+                );
+                current = path;
+            }
+            _ => return None,
         }
-        "scoped_identifier" | "scoped_type_identifier" => {
-            let mut segments = path_segments(node.child_by_field_name("path")?, source)?;
-            segments.push(
-                node.child_by_field_name("name")?
-                    .utf8_text(source)
-                    .ok()?
-                    .to_owned(),
-            );
-            Some(segments)
-        }
-        _ => None,
     }
+    reversed.reverse();
+    Some(reversed)
 }
 
 fn plain_crate_import_path(text: &str) -> Option<Vec<String>> {
@@ -2104,5 +2114,53 @@ mod tests {
         )
         .unwrap();
         assert!(!scan_ordinary_sources(&root.path().join("child")));
+    }
+
+    /// 修正前の再帰版 (浅い入力で反復版と比べるためだけに残す)。
+    fn path_segments_recursive(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+        match node.kind() {
+            "identifier" | "type_identifier" | "crate" | "self" | "super" => {
+                Some(vec![node.utf8_text(source).ok()?.to_owned()])
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                let mut segments =
+                    path_segments_recursive(node.child_by_field_name("path")?, source)?;
+                segments.push(
+                    node.child_by_field_name("name")?
+                        .utf8_text(source)
+                        .ok()?
+                        .to_owned(),
+                );
+                Some(segments)
+            }
+            _ => None,
+        }
+    }
+
+    /// 反復に書き換えた path の分解が、浅い入力の全ノードで修正前の再帰版と同じ結果を返す
+    /// (`path` の無い `::name` や式・ジェネリクスのように分解できない形を含む)。
+    #[test]
+    fn iterative_path_segments_match_recursive_version() {
+        let source = b"use crate::a::b::{c, d::e};\nfn f(x: self::G<super::H>, y: ::std::ops::Range<u8>, z: <T as Tr>::C) -> crate::m::N { super::super::g::h(x); a::b::<u8>::c(); }\n";
+        let tree = parser::parse_source(source, LangId::Rust).unwrap();
+        let mut cursor = tree.root_node().walk();
+        let mut nodes = vec![tree.root_node()];
+        let mut next = 0;
+        let mut resolved = 0;
+        while next < nodes.len() {
+            let node = nodes[next];
+            nodes.extend(node.children(&mut cursor));
+            next += 1;
+            let iterative = super::path_segments(node, source);
+            assert_eq!(
+                iterative,
+                path_segments_recursive(node, source),
+                "{}: {}",
+                node.kind(),
+                node.utf8_text(source).unwrap()
+            );
+            resolved += usize::from(iterative.is_some_and(|segments| segments.len() > 1));
+        }
+        assert!(resolved >= 8, "修飾パスを含む: {resolved}");
     }
 }

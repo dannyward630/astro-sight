@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use tree_sitter::Node;
@@ -220,72 +221,78 @@ impl RustStdOriginIndex {
     }
 
     fn collect_use(&mut self, node: Node<'_>, source: &[u8], scope: usize, prefix: &[String]) {
-        match node.kind() {
-            "scoped_use_list" => {
-                let mut complete = prefix.to_vec();
-                if let Some(path) = node.child_by_field_name("path") {
+        // `a::{b::{c::{…}}}` の入れ子の深さだけ再帰しないよう、明示スタックで前順に辿る。
+        // 子は逆順に積み、束縛を登録する順序を子を順に再帰した場合と同じに保つ。
+        let mut pending: Vec<(Node<'_>, Rc<[String]>)> = vec![(node, Rc::from(prefix))];
+        while let Some((node, prefix)) = pending.pop() {
+            match node.kind() {
+                "scoped_use_list" => {
+                    let mut complete = prefix.to_vec();
+                    if let Some(path) = node.child_by_field_name("path") {
+                        let Some(mut segments) = path_segments(path, source) else {
+                            self.mark_unknown_use(scope);
+                            continue;
+                        };
+                        complete.append(&mut segments);
+                    }
+                    if let Some(list) = node.child_by_field_name("list") {
+                        pending.push((list, Rc::from(complete)));
+                    } else {
+                        self.mark_unknown_use(scope);
+                    }
+                }
+                "use_list" => {
+                    let mut cursor = node.walk();
+                    let children: Vec<_> = node.named_children(&mut cursor).collect();
+                    for child in children.into_iter().rev() {
+                        pending.push((child, Rc::clone(&prefix)));
+                    }
+                }
+                "use_wildcard" => {
+                    self.mark_unknown_use(scope);
+                }
+                "use_as_clause" => {
+                    let Some(path) = node.child_by_field_name("path") else {
+                        self.mark_unknown_use(scope);
+                        continue;
+                    };
                     let Some(mut segments) = path_segments(path, source) else {
                         self.mark_unknown_use(scope);
-                        return;
+                        continue;
                     };
-                    complete.append(&mut segments);
-                }
-                if let Some(list) = node.child_by_field_name("list") {
-                    self.collect_use(list, source, scope, &complete);
-                } else {
-                    self.mark_unknown_use(scope);
-                }
-            }
-            "use_list" => {
-                let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
-                    self.collect_use(child, source, scope, prefix);
-                }
-            }
-            "use_wildcard" => {
-                self.mark_unknown_use(scope);
-            }
-            "use_as_clause" => {
-                let Some(path) = node.child_by_field_name("path") else {
-                    self.mark_unknown_use(scope);
-                    return;
-                };
-                let Some(mut segments) = path_segments(path, source) else {
-                    self.mark_unknown_use(scope);
-                    return;
-                };
-                let Some(alias) = node
-                    .child_by_field_name("alias")
-                    .and_then(|alias| alias.utf8_text(source).ok())
-                else {
-                    self.mark_unknown_use(scope);
-                    return;
-                };
-                if alias == "_" {
-                    return;
-                }
-                let mut complete = prefix.to_vec();
-                complete.append(&mut segments);
-                self.record_use_path(path, &complete);
-                self.bind_use(scope, alias, &complete);
-            }
-            "self" => {
-                if let Some(name) = prefix.last() {
-                    self.bind_use(scope, name, prefix);
-                } else {
-                    self.mark_unknown_use(scope);
-                }
-            }
-            _ => {
-                if let Some(mut segments) = path_segments(node, source) {
+                    let Some(alias) = node
+                        .child_by_field_name("alias")
+                        .and_then(|alias| alias.utf8_text(source).ok())
+                    else {
+                        self.mark_unknown_use(scope);
+                        continue;
+                    };
+                    if alias == "_" {
+                        continue;
+                    }
                     let mut complete = prefix.to_vec();
                     complete.append(&mut segments);
-                    if let Some(name) = complete.last() {
-                        self.record_use_path(node, &complete);
-                        self.bind_use(scope, name, &complete);
+                    self.record_use_path(path, &complete);
+                    self.bind_use(scope, alias, &complete);
+                }
+                "self" => {
+                    if let Some(name) = prefix.last() {
+                        self.bind_use(scope, name, &prefix);
+                    } else {
+                        self.mark_unknown_use(scope);
                     }
-                } else {
-                    self.mark_unknown_use(scope);
+                }
+                _ => {
+                    if let Some(mut segments) = path_segments(node, source) {
+                        let mut complete = prefix.to_vec();
+                        complete.append(&mut segments);
+                        if let Some(name) = complete.last() {
+                            self.record_use_path(node, &complete);
+                            self.bind_use(scope, name, &complete);
+                        }
+                    } else {
+                        self.mark_unknown_use(scope);
+                    }
                 }
             }
         }
@@ -412,22 +419,32 @@ impl RustStdOriginIndex {
 }
 
 fn path_segments(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
-    match node.kind() {
-        "identifier" | "type_identifier" | "crate" | "self" | "super" => {
-            Some(vec![node.utf8_text(source).ok()?.to_owned()])
+    // `a::b::c` は `path` 側へ入れ子になる。段数だけ再帰しないよう、`path` を先頭まで
+    // たどって末尾側から名前を集め、最後に並べ直す (`path` の無い `::name` はそこで終わる)。
+    let mut reversed = Vec::new();
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" | "type_identifier" | "crate" | "self" | "super" => {
+                reversed.push(current.utf8_text(source).ok()?.to_owned());
+                break;
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                let name = current
+                    .child_by_field_name("name")?
+                    .utf8_text(source)
+                    .ok()?;
+                reversed.push(name.to_owned());
+                match current.child_by_field_name("path") {
+                    Some(path) => current = path,
+                    None => break,
+                }
+            }
+            _ => return None,
         }
-        "scoped_identifier" | "scoped_type_identifier" => {
-            let mut parts = if let Some(path) = node.child_by_field_name("path") {
-                path_segments(path, source)?
-            } else {
-                Vec::new()
-            };
-            let name = node.child_by_field_name("name")?.utf8_text(source).ok()?;
-            parts.push(name.to_owned());
-            Some(parts)
-        }
-        _ => None,
     }
+    reversed.reverse();
+    Some(reversed)
 }
 
 #[derive(Clone)]
@@ -976,5 +993,181 @@ mod tests {
         .unwrap();
         std::fs::write(&source, "#[macro_use]\nextern crate fake;\n").unwrap();
         assert!(!RustStdProjectProof::new(dir.path()).allows(source.to_str().unwrap()));
+    }
+
+    /// 修正前の再帰版 (浅い入力で反復版と比べるためだけに残す)。
+    fn path_segments_recursive(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+        match node.kind() {
+            "identifier" | "type_identifier" | "crate" | "self" | "super" => {
+                Some(vec![node.utf8_text(source).ok()?.to_owned()])
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                let mut parts = if let Some(path) = node.child_by_field_name("path") {
+                    path_segments_recursive(path, source)?
+                } else {
+                    Vec::new()
+                };
+                parts.push(
+                    node.child_by_field_name("name")?
+                        .utf8_text(source)
+                        .ok()?
+                        .to_owned(),
+                );
+                Some(parts)
+            }
+            _ => None,
+        }
+    }
+
+    fn collect_use_recursive(
+        index: &mut RustStdOriginIndex,
+        node: Node<'_>,
+        source: &[u8],
+        scope: usize,
+        prefix: &[String],
+    ) {
+        match node.kind() {
+            "scoped_use_list" => {
+                let mut complete = prefix.to_vec();
+                if let Some(path) = node.child_by_field_name("path") {
+                    let Some(mut segments) = path_segments_recursive(path, source) else {
+                        index.mark_unknown_use(scope);
+                        return;
+                    };
+                    complete.append(&mut segments);
+                }
+                if let Some(list) = node.child_by_field_name("list") {
+                    collect_use_recursive(index, list, source, scope, &complete);
+                } else {
+                    index.mark_unknown_use(scope);
+                }
+            }
+            "use_list" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    collect_use_recursive(index, child, source, scope, prefix);
+                }
+            }
+            "use_wildcard" => index.mark_unknown_use(scope),
+            "use_as_clause" => {
+                let Some(path) = node.child_by_field_name("path") else {
+                    index.mark_unknown_use(scope);
+                    return;
+                };
+                let Some(mut segments) = path_segments_recursive(path, source) else {
+                    index.mark_unknown_use(scope);
+                    return;
+                };
+                let Some(alias) = node
+                    .child_by_field_name("alias")
+                    .and_then(|alias| alias.utf8_text(source).ok())
+                else {
+                    index.mark_unknown_use(scope);
+                    return;
+                };
+                if alias == "_" {
+                    return;
+                }
+                let mut complete = prefix.to_vec();
+                complete.append(&mut segments);
+                index.record_use_path(path, &complete);
+                index.bind_use(scope, alias, &complete);
+            }
+            "self" => {
+                if let Some(name) = prefix.last() {
+                    index.bind_use(scope, name, prefix);
+                } else {
+                    index.mark_unknown_use(scope);
+                }
+            }
+            _ => {
+                if let Some(mut segments) = path_segments_recursive(node, source) {
+                    let mut complete = prefix.to_vec();
+                    complete.append(&mut segments);
+                    if let Some(name) = complete.last() {
+                        index.record_use_path(node, &complete);
+                        index.bind_use(scope, name, &complete);
+                    }
+                } else {
+                    index.mark_unknown_use(scope);
+                }
+            }
+        }
+    }
+
+    type UseSummary = (
+        Vec<(String, Vec<Option<String>>)>,
+        bool,
+        Vec<(usize, String)>,
+    );
+
+    fn summarize_uses(index: &RustStdOriginIndex) -> UseSummary {
+        let scope = &index.scopes[&0];
+        let mut bindings: Vec<_> = scope
+            .bindings
+            .iter()
+            .map(|(name, bindings)| {
+                let roots = bindings
+                    .iter()
+                    .map(|binding| binding.root.clone())
+                    .collect();
+                (name.clone(), roots)
+            })
+            .collect();
+        bindings.sort();
+        let mut uses: Vec<_> = index
+            .std_use_nodes
+            .iter()
+            .map(|(id, root)| (*id, root.clone()))
+            .collect();
+        uses.sort();
+        (bindings, scope.has_glob, uses)
+    }
+
+    /// 反復に書き換えた use の束縛の収集と path の分解が、浅い入力で修正前の再帰版と
+    /// 同じ結果 (束縛の順序、不明な use の印、std の use の位置) を返す。
+    #[test]
+    fn iterative_use_collection_matches_recursive_version() {
+        let source = b"use std::{fmt, io::{self, Read as R, Write as _}, collections::*};\nuse core::mem;\nuse alloc::{vec::Vec, string::{String, ToString}};\nuse crate::{a::{b, c::d}, e as f};\nuse self::g::{self};\nuse ::std::ops::Range;\nuse {h, i::j};\nuse super::k::l;\nuse {std::fmt, crate::x::{fmt, y::fmt as fmt}};\nfn t(x: std::ops::Range<u8>, y: a::B, z: <T as Tr>::C) { let _ = a::b::c(); }\n";
+        let tree = parser::parse_source(source, LangId::Rust).unwrap();
+        let mut cursor = tree.root_node().walk();
+        let mut nodes = vec![tree.root_node()];
+        let mut next = 0;
+        while next < nodes.len() {
+            let node = nodes[next];
+            nodes.extend(node.named_children(&mut cursor));
+            next += 1;
+        }
+        let mut uses = 0;
+        for node in nodes {
+            assert_eq!(
+                path_segments(node, source),
+                path_segments_recursive(node, source),
+                "{}: {}",
+                node.kind(),
+                node.utf8_text(source).unwrap()
+            );
+            if node.kind() != "use_declaration" {
+                continue;
+            }
+            let argument = node.child_by_field_name("argument").unwrap();
+            let fresh = || RustStdOriginIndex {
+                scopes: HashMap::from([(0, Scope::default())]),
+                std_use_nodes: HashMap::new(),
+            };
+            for prefix in [Vec::new(), vec!["outer".to_owned()]] {
+                let (mut iterative, mut recursive) = (fresh(), fresh());
+                iterative.collect_use(argument, source, 0, &prefix);
+                collect_use_recursive(&mut recursive, argument, source, 0, &prefix);
+                assert_eq!(
+                    summarize_uses(&iterative),
+                    summarize_uses(&recursive),
+                    "{}",
+                    node.utf8_text(source).unwrap()
+                );
+            }
+            uses += 1;
+        }
+        assert_eq!(uses, 9);
     }
 }

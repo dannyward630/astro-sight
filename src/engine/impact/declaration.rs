@@ -473,44 +473,47 @@ fn collect_rust_use_tree_bindings(
     names: &mut HashSet<String>,
     uncertain: &mut bool,
 ) {
-    match node.kind() {
-        "identifier" => match node.utf8_text(source) {
-            Ok(name) => {
-                names.insert(name.to_string());
+    // `{a::{b::{…}}}` の入れ子の深さだけ再帰しないよう、明示スタックで辿る
+    // (名前の集合と不確実の印を集めるだけなので、辿る順序は結果に影響しない)。
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "identifier" => match node.utf8_text(source) {
+                Ok(name) => {
+                    names.insert(name.to_string());
+                }
+                Err(_) => *uncertain = true,
+            },
+            "scoped_identifier" => {
+                if let Some(leaf) = node.child_by_field_name("name") {
+                    pending.push(leaf);
+                } else {
+                    *uncertain = true;
+                }
             }
-            Err(_) => *uncertain = true,
-        },
-        "scoped_identifier" => {
-            if let Some(leaf) = node.child_by_field_name("name") {
-                collect_rust_use_tree_bindings(leaf, source, names, uncertain);
-            } else {
-                *uncertain = true;
+            "use_as_clause" => {
+                let mut cursor = node.walk();
+                if let Some(alias) = node.named_children(&mut cursor).last() {
+                    pending.push(alias);
+                } else {
+                    *uncertain = true;
+                }
             }
+            "scoped_use_list" => {
+                if let Some(list) = node.child_by_field_name("list") {
+                    pending.push(list);
+                } else {
+                    *uncertain = true;
+                }
+            }
+            "use_list" => {
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            }
+            "use_wildcard" => *uncertain = true,
+            // `self` は親モジュール名を束縛するが、ここでは名前を解決しない。
+            _ => *uncertain = true,
         }
-        "use_as_clause" => {
-            let mut cursor = node.walk();
-            if let Some(alias) = node.named_children(&mut cursor).last() {
-                collect_rust_use_tree_bindings(alias, source, names, uncertain);
-            } else {
-                *uncertain = true;
-            }
-        }
-        "scoped_use_list" => {
-            if let Some(list) = node.child_by_field_name("list") {
-                collect_rust_use_tree_bindings(list, source, names, uncertain);
-            } else {
-                *uncertain = true;
-            }
-        }
-        "use_list" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                collect_rust_use_tree_bindings(child, source, names, uncertain);
-            }
-        }
-        "use_wildcard" => *uncertain = true,
-        // `self` は親モジュール名を束縛するが、ここでは名前を解決しない。
-        _ => *uncertain = true,
     }
 }
 
@@ -2027,5 +2030,80 @@ mod tests {
             !sig_changes.iter().any(|sc| sc.name == "foo"),
             "{sig_changes:?}"
         );
+    }
+
+    /// 修正前の再帰版 (浅い入力で反復版と比べるためだけに残す)。
+    fn collect_rust_use_tree_bindings_recursive(
+        node: Node<'_>,
+        source: &[u8],
+        names: &mut HashSet<String>,
+        uncertain: &mut bool,
+    ) {
+        match node.kind() {
+            "identifier" => match node.utf8_text(source) {
+                Ok(name) => {
+                    names.insert(name.to_string());
+                }
+                Err(_) => *uncertain = true,
+            },
+            "scoped_identifier" => match node.child_by_field_name("name") {
+                Some(leaf) => {
+                    collect_rust_use_tree_bindings_recursive(leaf, source, names, uncertain)
+                }
+                None => *uncertain = true,
+            },
+            "use_as_clause" => {
+                let mut cursor = node.walk();
+                match node.named_children(&mut cursor).last() {
+                    Some(alias) => {
+                        collect_rust_use_tree_bindings_recursive(alias, source, names, uncertain)
+                    }
+                    None => *uncertain = true,
+                }
+            }
+            "scoped_use_list" => match node.child_by_field_name("list") {
+                Some(list) => {
+                    collect_rust_use_tree_bindings_recursive(list, source, names, uncertain)
+                }
+                None => *uncertain = true,
+            },
+            "use_list" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    collect_rust_use_tree_bindings_recursive(child, source, names, uncertain);
+                }
+            }
+            _ => *uncertain = true,
+        }
+    }
+
+    /// 反復に書き換えた use の束縛名の収集が、浅い入力で修正前の再帰版と同じ名前の集合と
+    /// 不確実の印を返す (別名・入れ子の group・`self`・glob を含む)。
+    #[test]
+    fn iterative_use_binding_collection_matches_recursive_version() {
+        let source = b"use a::b;\nuse c::{d, e::{f, g as h}};\nuse i::{self, j::*};\nuse k as l;\nuse {m, n::{o::{p, q}}};\nuse crate::r::{s as _, t};\n";
+        let tree = parser::parse_source(source, LangId::Rust).unwrap();
+        let mut cursor = tree.root_node().walk();
+        let mut checked = 0;
+        for item in tree.root_node().named_children(&mut cursor) {
+            let argument = item.child_by_field_name("argument").unwrap();
+            let (mut names, mut uncertain) = (HashSet::new(), false);
+            collect_rust_use_tree_bindings(argument, source, &mut names, &mut uncertain);
+            let (mut expected, mut expected_uncertain) = (HashSet::new(), false);
+            collect_rust_use_tree_bindings_recursive(
+                argument,
+                source,
+                &mut expected,
+                &mut expected_uncertain,
+            );
+            assert_eq!(
+                (names, uncertain),
+                (expected, expected_uncertain),
+                "{}",
+                item.utf8_text(source).unwrap()
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 6);
     }
 }

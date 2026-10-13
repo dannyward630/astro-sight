@@ -5,10 +5,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::ops::ControlFlow;
 
 use tree_sitter::Node;
 
 use crate::engine::parser;
+use crate::engine::tree_walk::{Children, Walk, any_node, walk_preorder};
 use crate::language::LangId;
 
 /// old/new それぞれの同一ファイル内 `pub type` を使い、関数シグネチャの型表現が
@@ -366,6 +368,12 @@ fn canonicalize_signature(signature: &str, aliases: &TypeAliasIndex) -> Option<C
     Some(canonical)
 }
 
+/// `node` の部分木を、子を順に辿った前順のトークン列へ正規化する。
+///
+/// 型の入れ子 (`Option<Option<…>>`) の深さだけ再帰しないよう、1 つの TreeCursor の
+/// 前順走査で辿る。再帰するのは別名の展開 (`canonicalize_alias`、上限 32 段) だけ。
+/// 親は `Node::parent` (根から辿り直すので深さに比例する) で引かず、前順の深さに
+/// 合わせて保つ祖先の列から引く (深い入れ子で 2 乗の時間にしない)。
 fn canonicalize_node(
     node: Node<'_>,
     source: &[u8],
@@ -375,9 +383,35 @@ fn canonicalize_node(
     stack: &mut Vec<String>,
     canonical: &mut CanonicalSignature,
 ) -> Option<()> {
-    if node.start_byte() >= end {
-        return Some(());
-    }
+    let root_parent = node.parent();
+    let mut ancestors = Vec::new();
+    let flow = walk_preorder(node, Children::All, |node, depth| {
+        if node.start_byte() >= end {
+            return ControlFlow::Continue(Walk::Skip);
+        }
+        ancestors.truncate(depth);
+        let parent = if depth == 0 {
+            root_parent
+        } else {
+            ancestors.last().copied()
+        };
+        ancestors.push(node);
+        canonicalize_visit(node, parent, source, aliases, shadowed, stack, canonical)
+            .map_or(ControlFlow::Break(()), ControlFlow::Continue)
+    });
+    flow.is_continue().then_some(())
+}
+
+/// `canonicalize_node` の 1 ノード分。`None` は正規化の失敗 (同値と証明しない)。
+fn canonicalize_visit(
+    node: Node<'_>,
+    parent: Option<Node<'_>>,
+    source: &[u8],
+    aliases: &TypeAliasIndex,
+    shadowed: &HashSet<String>,
+    stack: &mut Vec<String>,
+    canonical: &mut CanonicalSignature,
+) -> Option<Walk> {
     // 配列長と const generic 引数は値の評価が要る。関数・関連定数・式が
     // 同じ字面でも別の値になり得るため、リテラル以外を同値の証拠にしない。
     if node.kind() == "array_type"
@@ -406,7 +440,7 @@ fn canonicalize_node(
         if aliases.blocked.contains(name) {
             return None;
         }
-        let qualified = node.parent().is_some_and(|parent| {
+        let qualified = parent.is_some_and(|parent| {
             matches!(
                 parent.kind(),
                 "scoped_type_identifier" | "scoped_identifier"
@@ -418,7 +452,8 @@ fn canonicalize_node(
             }
             canonical.expanded_alias = true;
             canonical.expanded_alias_names.insert(name.to_string());
-            return canonicalize_alias(name, aliases, shadowed, stack, canonical);
+            canonicalize_alias(name, aliases, shadowed, stack, canonical)?;
+            return Some(Walk::Skip);
         }
     }
 
@@ -426,14 +461,9 @@ fn canonicalize_node(
         if !matches!(node.kind(), "line_comment" | "block_comment") {
             push_token(canonical, node.kind(), node.utf8_text(source).ok()?);
         }
-        return Some(());
+        return Some(Walk::Skip);
     }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        canonicalize_node(child, source, end, aliases, shadowed, stack, canonical)?;
-    }
-    Some(())
+    Some(Walk::Descend)
 }
 
 fn canonicalize_alias(
@@ -472,12 +502,9 @@ fn canonicalize_alias(
 }
 
 fn contains_unsupported_alias_type(node: Node<'_>) -> bool {
-    if matches!(node.kind(), "dynamic_type" | "macro_invocation") {
-        return true;
-    }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(contains_unsupported_alias_type)
+    any_node(node, Children::Named, |node| {
+        matches!(node.kind(), "dynamic_type" | "macro_invocation")
+    })
 }
 
 fn canonical_token_stream(node: Node<'_>, source: &[u8]) -> Option<String> {
@@ -505,14 +532,16 @@ fn collect_type_identifiers(
     source: &[u8],
     names: &mut HashSet<String>,
 ) -> Option<()> {
-    if node.kind() == "type_identifier" {
-        names.insert(node.utf8_text(source).ok()?.to_string());
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_type_identifiers(child, source, names)?;
-    }
-    Some(())
+    let flow = walk_preorder(node, Children::Named, |node, _| {
+        if node.kind() == "type_identifier" {
+            let Ok(name) = node.utf8_text(source) else {
+                return ControlFlow::Break(());
+            };
+            names.insert(name.to_string());
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
+    flow.is_continue().then_some(())
 }
 
 fn push_token(canonical: &mut CanonicalSignature, kind: &str, text: &str) {
@@ -598,16 +627,16 @@ fn direct_named_child<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree
 }
 
 fn find_function_node(node: Node<'_>) -> Option<Node<'_>> {
-    if matches!(node.kind(), "function_item" | "function_signature_item") {
-        return Some(node);
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_function_node(child) {
-            return Some(found);
+    match walk_preorder(node, Children::Named, |node, _| {
+        if matches!(node.kind(), "function_item" | "function_signature_item") {
+            ControlFlow::Break(node)
+        } else {
+            ControlFlow::Continue(Walk::Descend)
         }
+    }) {
+        ControlFlow::Break(found) => Some(found),
+        ControlFlow::Continue(()) => None,
     }
-    None
 }
 
 fn rebuild_without_ranges(
@@ -887,6 +916,287 @@ mod tests {
             let context = RustTypeAliasEquivalence::new(old.as_bytes(), new.as_bytes())
                 .expect("valid syntax trees");
             assert!(context.prove_function("collect"), "{old} -> {new}");
+        }
+    }
+
+    /// 修正前の再帰版 (浅い入力で反復版と比べるためだけに残す)。
+    fn canonicalize_node_recursive(
+        node: Node<'_>,
+        source: &[u8],
+        end: usize,
+        aliases: &TypeAliasIndex,
+        shadowed: &HashSet<String>,
+        stack: &mut Vec<String>,
+        canonical: &mut CanonicalSignature,
+    ) -> Option<()> {
+        if node.start_byte() >= end {
+            return Some(());
+        }
+        if node.kind() == "array_type"
+            && node
+                .child_by_field_name("length")
+                .is_some_and(|length| length.kind() != "integer_literal")
+        {
+            return None;
+        }
+        if node.kind() == "type_arguments" {
+            let mut cursor = node.walk();
+            if node.named_children(&mut cursor).any(|child| {
+                matches!(child.kind(), "identifier" | "scoped_identifier" | "block")
+                    || child.kind().ends_with("_expression")
+            }) {
+                return None;
+            }
+        }
+        if matches!(node.kind(), "identifier" | "type_identifier") {
+            canonical
+                .names
+                .insert(node.utf8_text(source).ok()?.to_string());
+        }
+        if node.kind() == "type_identifier" {
+            let name = node.utf8_text(source).ok()?;
+            if aliases.blocked.contains(name) {
+                return None;
+            }
+            let qualified = node.parent().is_some_and(|parent| {
+                matches!(
+                    parent.kind(),
+                    "scoped_type_identifier" | "scoped_identifier"
+                )
+            });
+            if aliases.aliases.contains_key(name) && !shadowed.contains(name) && !qualified {
+                if !shadowed.is_empty() {
+                    return None;
+                }
+                canonical.expanded_alias = true;
+                canonical.expanded_alias_names.insert(name.to_string());
+                if stack.len() >= 32 || stack.iter().any(|active| active == name) {
+                    return None;
+                }
+                let rhs = aliases.aliases.get(name)?;
+                stack.push(name.to_string());
+                let wrapped = format!("type __AstroSightAlias = {rhs};");
+                let tree = parser::parse_source(wrapped.as_bytes(), LangId::Rust).ok()?;
+                if tree.root_node().has_error() {
+                    return None;
+                }
+                let type_item = direct_named_child(tree.root_node(), "type_item")?;
+                let rhs_node = type_item.child_by_field_name("type")?;
+                if contains_unsupported_alias_type_recursive(rhs_node) {
+                    return None;
+                }
+                canonicalize_node_recursive(
+                    rhs_node,
+                    wrapped.as_bytes(),
+                    wrapped.len(),
+                    aliases,
+                    shadowed,
+                    stack,
+                    canonical,
+                )?;
+                stack.pop();
+                return Some(());
+            }
+        }
+        if node.child_count() == 0 {
+            if !matches!(node.kind(), "line_comment" | "block_comment") {
+                push_token(canonical, node.kind(), node.utf8_text(source).ok()?);
+            }
+            return Some(());
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            canonicalize_node_recursive(child, source, end, aliases, shadowed, stack, canonical)?;
+        }
+        Some(())
+    }
+
+    fn contains_unsupported_alias_type_recursive(node: Node<'_>) -> bool {
+        if matches!(node.kind(), "dynamic_type" | "macro_invocation") {
+            return true;
+        }
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .any(contains_unsupported_alias_type_recursive)
+    }
+
+    fn collect_type_identifiers_recursive(
+        node: Node<'_>,
+        source: &[u8],
+        names: &mut HashSet<String>,
+    ) -> Option<()> {
+        if node.kind() == "type_identifier" {
+            names.insert(node.utf8_text(source).ok()?.to_string());
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_type_identifiers_recursive(child, source, names)?;
+        }
+        Some(())
+    }
+
+    fn find_function_node_recursive(node: Node<'_>) -> Option<Node<'_>> {
+        if matches!(node.kind(), "function_item" | "function_signature_item") {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if let Some(found) = find_function_node_recursive(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    type CanonicalSummary = (Option<()>, String, bool, Vec<String>, Vec<String>, usize);
+
+    fn summarize(
+        result: Option<()>,
+        canonical: &CanonicalSignature,
+        stack: &[String],
+    ) -> CanonicalSummary {
+        let mut expanded: Vec<_> = canonical.expanded_alias_names.iter().cloned().collect();
+        expanded.sort();
+        let mut names: Vec<_> = canonical.names.iter().cloned().collect();
+        names.sort();
+        (
+            result,
+            canonical.tokens.clone(),
+            canonical.expanded_alias,
+            expanded,
+            names,
+            stack.len(),
+        )
+    }
+
+    fn empty_canonical() -> CanonicalSignature {
+        CanonicalSignature {
+            tokens: String::new(),
+            expanded_alias: false,
+            expanded_alias_names: HashSet::new(),
+            function_name: String::new(),
+            names: HashSet::new(),
+        }
+    }
+
+    /// 反復に書き換えた正規化・別名の検査・型名の収集・関数の探索が、浅い入力で修正前の
+    /// 再帰版と同じ結果 (失敗の有無、トークン列、名前、展開した別名、途中で失敗した時点の
+    /// 状態まで) を返す。別名の展開・循環・未対応の別名・修飾パス・型引数の式・
+    /// コメント・本体の手前で切る位置の各分岐を通す。
+    #[test]
+    fn iterative_canonicalization_matches_recursive_version() {
+        let alias_source = b"pub type A = u32;\npub type B = Option<A>;\npub type Dyn = Box<dyn Fn()>;\npub type Mac = m!();\npub(crate) type R = u8;\npub type Cyc = Cyc2;\npub type Cyc2 = Cyc;\npub type Arr = [A; N];\n";
+        let index = TypeAliasIndex::from_source(alias_source).unwrap();
+        let signatures = [
+            "pub fn f(x: A, y: B) -> Option<A> {",
+            "pub fn f(x: crate::A, y: A::Assoc) -> u32 {",
+            "pub fn f<T: Into<A>>(x: T, y: A) {",
+            "pub fn f<T>(x: T) -> T {",
+            "pub fn f(x: [u8; N]) {",
+            "pub fn f(x: Foo<{ N }>, y: Bar<N>) {",
+            "pub fn f(x: R) {",
+            "pub fn f(x: Dyn) {",
+            "pub fn f(x: Mac) {",
+            "pub fn f(x: Cyc) {",
+            "pub fn f(x: Arr) {",
+            "pub fn f(x: /* c */ A, // d\n y: [u8; 4]) -> Vec<A> where A: Copy {",
+            "fn g(x: A);",
+            "pub fn f(x: A) -> A { let y: B = x; y }",
+            "pub async unsafe fn f<'a>(x: &'a mut A, ...) -> impl Iterator<Item = B> + 'a {",
+            "struct S;",
+            "impl S { fn m(&self, a: A) -> B {} }",
+        ];
+        for signature in signatures {
+            let (source, original_len) = parseable_signature_source(signature);
+            let tree = parser::parse_source(&source, LangId::Rust).unwrap();
+            let root = tree.root_node();
+            assert_eq!(
+                find_function_node(root).map(|node| node.id()),
+                find_function_node_recursive(root).map(|node| node.id()),
+                "{signature}"
+            );
+            let mut cursor = root.walk();
+            let mut nodes = vec![root];
+            let mut index_in_tree = 0;
+            while index_in_tree < nodes.len() {
+                let node = nodes[index_in_tree];
+                nodes.extend(node.named_children(&mut cursor));
+                index_in_tree += 1;
+            }
+            for node in nodes {
+                assert_eq!(
+                    contains_unsupported_alias_type(node),
+                    contains_unsupported_alias_type_recursive(node),
+                    "{signature} / {}",
+                    node.kind()
+                );
+                let (mut iterative, mut recursive) = (HashSet::new(), HashSet::new());
+                assert_eq!(
+                    collect_type_identifiers(node, &source, &mut iterative),
+                    collect_type_identifiers_recursive(node, &source, &mut recursive),
+                    "{signature} / {}",
+                    node.kind()
+                );
+                assert_eq!(iterative, recursive, "{signature} / {}", node.kind());
+            }
+            let Some(function) = find_function_node(root) else {
+                continue;
+            };
+            let end = function
+                .child_by_field_name("body")
+                .map(|body| body.start_byte())
+                .unwrap_or(original_len)
+                .min(original_len);
+            for shadowed in [HashSet::new(), HashSet::from(["T".to_string()])] {
+                let (mut stack, mut canonical) = (Vec::new(), empty_canonical());
+                let result = canonicalize_node(
+                    function,
+                    &source,
+                    end,
+                    &index,
+                    &shadowed,
+                    &mut stack,
+                    &mut canonical,
+                );
+                let iterative = summarize(result, &canonical, &stack);
+                let (mut stack, mut canonical) = (Vec::new(), empty_canonical());
+                let result = canonicalize_node_recursive(
+                    function,
+                    &source,
+                    end,
+                    &index,
+                    &shadowed,
+                    &mut stack,
+                    &mut canonical,
+                );
+                assert_eq!(
+                    iterative,
+                    summarize(result, &canonical, &stack),
+                    "{signature} / shadowed {shadowed:?}"
+                );
+            }
+        }
+        // import 行の正規化 (`canonical_token_stream`) も同じ走査を使う。
+        let imports = b"use a::{b, c::{d as e}, f::*};\nuse crate::g /* c */ ::h;\n";
+        let tree = parser::parse_source(imports, LangId::Rust).unwrap();
+        let mut cursor = tree.root_node().walk();
+        for item in tree.root_node().named_children(&mut cursor) {
+            let (mut stack, mut canonical) = (Vec::new(), empty_canonical());
+            let result = canonicalize_node_recursive(
+                item,
+                imports,
+                item.end_byte(),
+                &TypeAliasIndex::default(),
+                &HashSet::new(),
+                &mut stack,
+                &mut canonical,
+            );
+            assert_eq!(
+                canonical_token_stream(item, imports),
+                result.map(|()| canonical.tokens),
+                "{}",
+                item.utf8_text(imports).unwrap()
+            );
         }
     }
 }

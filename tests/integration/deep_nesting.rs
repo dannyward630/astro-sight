@@ -460,6 +460,159 @@ fn impact_handles_deep_php_function_body() {
     );
 }
 
+/// `src/a.rs` の `f` を `a_old` から `a_new` へ変えた Cargo プロジェクト (`src/c.rs` が呼ぶ)。
+fn rust_impact_repo(a_old: &str, a_new: &str, c: &str) -> TestRepo {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "pub mod a;\npub mod c;\n");
+    repo.write("src/a.rs", a_old);
+    repo.write("src/c.rs", c);
+    repo.commit_all("init");
+    repo.write("src/a.rs", a_new);
+    repo
+}
+
+/// `context --git` の `src/a.rs` の変更について、呼び出し元の (path, line) を種類ごとに返す。
+fn rust_context_callers(label: &str, repo: &TestRepo) -> Vec<(String, Vec<(String, u64)>)> {
+    let mut command = cargo_bin();
+    command.args(["context", "--git", "--dir"]).arg(repo.root());
+    let stdout = assert_finished(label, &run_bounded(command, None));
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("context JSON");
+    let change = json["changes"]
+        .as_array()
+        .and_then(|changes| changes.iter().find(|change| change["path"] == "src/a.rs"))
+        .unwrap_or_else(|| panic!("{label}: {}", stdout.chars().take(400).collect::<String>()));
+    [
+        "impacted_callers",
+        "low_confidence_callers",
+        "informational_callers",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        let callers: Vec<(String, u64)> = change[key]
+            .as_array()?
+            .iter()
+            .map(|caller| {
+                (
+                    caller["path"].as_str().unwrap_or_default().to_owned(),
+                    caller["line"].as_u64().unwrap_or_default(),
+                )
+            })
+            .collect();
+        Some((key.to_owned(), callers))
+    })
+    .collect()
+}
+
+fn callers(entries: &[(&str, &[(&str, u64)])]) -> Vec<(String, Vec<(String, u64)>)> {
+    entries
+        .iter()
+        .map(|(key, list)| {
+            let list = list
+                .iter()
+                .map(|(path, line)| ((*path).to_owned(), *line))
+                .collect();
+            ((*key).to_owned(), list)
+        })
+        .collect()
+}
+
+/// Rust の証明 (型別名の同値・修飾パスの所有元・use ツリーの展開・std 起点の束縛・
+/// 旧側の use の束縛名) は、深い入れ子でもスタックを溢れさせずに呼び出し元を返す。
+/// どの深さも修正前は exit 134 (stack overflow) で落ちていた。
+#[test]
+fn rust_impact_proofs_handle_deep_nesting() {
+    // 型別名の同値証明: 深い型を持つ関数ヘッダの正規化。
+    let deep_type = nested("Option<", "u8", ">", 20_000);
+    let repo = rust_impact_repo(
+        "pub fn f(x: u32) -> u32 {\n    x\n}\n",
+        &format!("pub type A = u32;\npub fn f(x: A, y: {deep_type}) -> u32 {{\n    x\n}}\n"),
+        "pub fn g() -> u32 {\n    crate::a::f(1)\n}\n",
+    );
+    assert_eq!(
+        rust_context_callers("alias context", &repo),
+        callers(&[("impacted_callers", &[("src/c.rs", 1)])])
+    );
+    let mut command = cargo_bin();
+    command.args(["impact", "--git", "--dir"]).arg(repo.root());
+    let output = run_bounded(command, None);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "alias impact: {stderr}");
+    assert!(
+        stderr.contains("→ src/c.rs:2 [f]"),
+        "alias impact: {stderr}"
+    );
+
+    // 修飾パスの分解: `crate::m::…::f(2)` の path を 1 段ずつたどる。
+    let changed_f = "pub fn f(x: u32, y: u32) -> u32 {\n    x + y\n}\n";
+    let repo = rust_impact_repo(
+        "pub fn f(x: u32) -> u32 {\n    x\n}\n",
+        changed_f,
+        &format!(
+            "pub fn g() -> u32 {{\n    crate::a::f(1)\n}}\npub fn h() -> u32 {{\n    crate::{}f(2)\n}}\n",
+            "m::".repeat(10_000)
+        ),
+    );
+    assert_eq!(
+        rust_context_callers("path context", &repo),
+        callers(&[("impacted_callers", &[("src/c.rs", 1), ("src/c.rs", 4)])])
+    );
+
+    // 再公開の所有元: 呼び出し元の import 行の use ツリーを展開する。
+    let deep_use = |root: &str, depth: usize| {
+        format!("use {root}::{{{};\n", nested("m::{", "x", "}", depth) + "}")
+    };
+    let repo = rust_impact_repo(
+        "pub fn f(x: u32) -> u32 {\n    x\n}\n",
+        changed_f,
+        &format!(
+            "use crate::{{a::f, {}}};\npub fn g() -> u32 {{\n    f(1)\n}}\n",
+            nested("m::{", "x", "}", 3_000)
+        ),
+    );
+    assert_eq!(
+        rust_context_callers("reexport context", &repo),
+        callers(&[
+            ("impacted_callers", &[("src/c.rs", 2)]),
+            ("informational_callers", &[("src/c.rs", 0)]),
+        ])
+    );
+
+    // std 起点の証明: 参照ファイルの use ツリーから束縛を集める。
+    let repo = rust_impact_repo(
+        "pub fn f(x: u32) -> u32 {\n    x\n}\n",
+        changed_f,
+        &format!(
+            "{}use crate::a::f;\npub fn g() -> u32 {{\n    f(1)\n}}\n",
+            deep_use("std", 3_000)
+        ),
+    );
+    assert_eq!(
+        rust_context_callers("std origin context", &repo),
+        callers(&[
+            ("impacted_callers", &[("src/c.rs", 3)]),
+            ("informational_callers", &[("src/c.rs", 1)]),
+        ])
+    );
+
+    // 変更ファイルの旧側の use が束縛する名前と import の正規化。
+    let old_use = deep_use("crate", 30_000);
+    let repo = rust_impact_repo(
+        &format!("{old_use}pub fn f(x: u32) -> u32 {{\n    x\n}}\n"),
+        &format!("{old_use}{changed_f}"),
+        "pub fn g() -> u32 {\n    crate::a::f(1)\n}\n",
+    );
+    assert_eq!(
+        rust_context_callers("old use context", &repo),
+        callers(&[("impacted_callers", &[("src/c.rs", 1)])])
+    );
+}
+
 /// session は深い入力の要求の後も、同じ接続で後続の要求を処理する。
 #[test]
 fn session_keeps_serving_after_deep_inputs() {
