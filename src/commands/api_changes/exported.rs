@@ -76,6 +76,7 @@ pub(crate) fn extract_exported_symbols_from_file_inner(
     .map(|(_, syms)| syms)
 }
 
+#[cfg(test)]
 pub(crate) fn extract_exported_symbols_from_file_inner_with_lang(
     dir: &str,
     file_path: &str,

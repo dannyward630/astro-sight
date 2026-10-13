@@ -10,7 +10,7 @@ use crate::models::review::DeadSymbol;
 
 #[cfg(test)]
 use super::api_changes::extract_exported_symbols_from_file_inner;
-use super::api_changes::{bare_name, extract_exported_symbols_from_file_inner_with_lang};
+use super::api_changes::{ExportedSymbols, bare_name, filter_exported_symbols};
 use super::dead_code_default_liveness::DefaultExportLiveness;
 use super::dead_code_member_liveness::{
     JsTsMemberLiveness, MemberStatus, PhpMemberLiveness, RustMemberLiveness,
@@ -387,6 +387,7 @@ impl DeclarationLines {
 }
 
 /// `dir` 相対の `file_path` からシンボルを抽出する (container 付き)。
+/// 宣言行の表にしか使わないので、循環的複雑度は計算しない。
 fn extract_file_symbols(dir: &str, file_path: &str) -> Option<Vec<crate::models::symbol::Symbol>> {
     let full = std::path::Path::new(dir).join(file_path);
     let utf8 = camino::Utf8Path::new(full.to_str()?);
@@ -396,7 +397,8 @@ fn extract_file_symbols(dir: &str, file_path: &str) -> Option<Vec<crate::models:
         return Some(crate::engine::lexer::extract_symbols(&source, lexer_lang));
     }
     let tree = parser::parse_source(&source, lang_id).ok()?;
-    crate::engine::symbols::extract_symbols(tree.root_node(), &source, lang_id).ok()
+    crate::engine::symbols::extract_symbols_without_complexity(tree.root_node(), &source, lang_id)
+        .ok()
 }
 
 /// 候補収集の中間状態。dead-code 候補シンボルと C/C++ liveness 補助情報を保持する。
@@ -416,55 +418,46 @@ struct DeadCodeCandidates {
 ///
 /// 生成物は既定で候補から外す (生成コードの未使用 export を dead として並べてもノイズになる)。
 /// 外したファイルは申告用に記録する。`include_generated` のときは候補に含める。
+///
+/// ファイルごとの読み込み・parse・抽出は互いに独立しているので並列に行い、結果は
+/// 入力の順に組み立てる (直列で処理したときと同じ順序になる)。
 fn collect_dead_code_candidates(
     dir: &str,
     canonical_dir: &std::path::Path,
     files: &[std::path::PathBuf],
     include_generated: bool,
 ) -> DeadCodeCandidates {
+    use rayon::prelude::*;
+
     // .gitattributes の linguist-generated 指定ファイルは dead-code 検出から除外する
     let gitattrs = crate::engine::gitattributes::GitAttributes::load(canonical_dir);
+    let scan = |path: &std::path::PathBuf| {
+        scan_candidate_file(dir, canonical_dir, path, &gitattrs, include_generated)
+    };
+    // 参照の集計と同じ上限付きのプールで回す (`ASTRO_SIGHT_BATCH_WORKERS` で低メモリ環境向けに
+    // 並列度を下げられる)。プールを作れなければ直列に処理する (結果は同じ)。
+    let scanned: Vec<CandidateFile> = match crate::engine::refs::build_bounded_pool() {
+        Ok(pool) => pool.install(|| files.par_iter().map(scan).collect()),
+        Err(_) => files.iter().map(scan).collect(),
+    };
 
     let mut all_syms: Vec<(String, String, String, crate::language::LangId)> = Vec::new();
     let mut liveness_raw: Vec<(String, String, Vec<String>, crate::language::LangId)> = Vec::new();
     let mut generated_skipped: Vec<String> = Vec::new();
-    for path in files {
-        // canonicalize で削除済みファイルをスキップ、dir 外のパスも除外
-        let canonical_path = match std::fs::canonicalize(path) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        // diff 由来のパス (常に `/` 区切り) と突き合わせるため区切り文字を正規化する。
-        // そろえないと filter_dead_by_touched_symbols / filter_dead_by_wip_added の突合せが
-        // Windows で常に不一致になり、前者は dead を全件落とし (= review --hook の既定スコープで
-        // dead 検出が丸ごと消える)、後者は WIP 抑止が効かなくなる。
-        let rel = match canonical_path.strip_prefix(canonical_dir) {
-            Ok(p) => normalize_workspace_separators(&p.to_string_lossy()),
-            Err(_) => continue, // dir 外のパスは除外（セキュリティ境界）
-        };
-        // ファイル先頭の「自動生成」マーカーコメントでも除外する (.gitattributes が
-        // 無いリポジトリでも tree-sitter の parser.c / protoc の *.pb.go 等を無視できる)
-        if !include_generated
-            && (gitattrs.is_generated(&rel)
-                || crate::engine::generated::is_auto_generated(&canonical_path))
-        {
-            generated_skipped.push(rel);
-            continue;
-        }
-        if let Some((lang, syms)) =
-            extract_exported_symbols_from_file_inner_with_lang(dir, &rel, true, true)
-        {
-            for (name, kind, _sig) in syms {
-                all_syms.push((name, kind, rel.clone(), lang));
-            }
-            // C/C++ では enum の列挙子・typedef alias を liveness 補助名として集める。
-            // enum 型名が直接使われなくても列挙子が使われていれば live、body あり typedef tag が
-            // alias 名でのみ使われていても live と判定するために使う (Issue #11/#12)。
-            if matches!(
-                lang,
-                crate::language::LangId::C | crate::language::LangId::Cpp
-            ) {
-                for (sym, extras) in collect_cpp_liveness_for_file(dir, &rel, lang) {
+    for file in scanned {
+        match file {
+            CandidateFile::Ignored => {}
+            CandidateFile::Generated(rel) => generated_skipped.push(rel),
+            CandidateFile::Extracted(rel, candidates) => {
+                let FileCandidates {
+                    lang,
+                    symbols,
+                    cpp_liveness,
+                } = candidates;
+                for (name, kind, _sig) in symbols {
+                    all_syms.push((name, kind, rel.clone(), lang));
+                }
+                for (sym, extras) in cpp_liveness {
                     liveness_raw.push((rel.clone(), sym, extras, lang));
                 }
             }
@@ -476,6 +469,110 @@ fn collect_dead_code_candidates(
         liveness_raw,
         generated_skipped,
     }
+}
+
+/// 候補抽出の 1 ファイルぶんの結果。
+enum CandidateFile {
+    /// 削除済み・`dir` の外・抽出できないなどで候補を持たないファイル。
+    Ignored,
+    /// 生成物として候補から外したファイル (`dir` 相対、`/` 区切り)。
+    Generated(String),
+    /// 候補を抽出したファイル (`dir` 相対、`/` 区切り) とその候補。
+    Extracted(String, FileCandidates),
+}
+
+/// `collect_dead_code_candidates` の 1 ファイルぶんの処理。
+fn scan_candidate_file(
+    dir: &str,
+    canonical_dir: &std::path::Path,
+    path: &std::path::Path,
+    gitattrs: &crate::engine::gitattributes::GitAttributes,
+    include_generated: bool,
+) -> CandidateFile {
+    // canonicalize で削除済みファイルをスキップ、dir 外のパスも除外
+    let Ok(canonical_path) = std::fs::canonicalize(path) else {
+        return CandidateFile::Ignored;
+    };
+    // diff 由来のパス (常に `/` 区切り) と突き合わせるため区切り文字を正規化する。
+    // そろえないと filter_dead_by_touched_symbols / filter_dead_by_wip_added の突合せが
+    // Windows で常に不一致になり、前者は dead を全件落とし (= review --hook の既定スコープで
+    // dead 検出が丸ごと消える)、後者は WIP 抑止が効かなくなる。
+    let rel = match canonical_path.strip_prefix(canonical_dir) {
+        Ok(p) => normalize_workspace_separators(&p.to_string_lossy()),
+        Err(_) => return CandidateFile::Ignored, // dir 外のパスは除外（セキュリティ境界）
+    };
+    // ファイル先頭の「自動生成」マーカーコメントでも除外する (.gitattributes が
+    // 無いリポジトリでも tree-sitter の parser.c / protoc の *.pb.go 等を無視できる)
+    if !include_generated
+        && (gitattrs.is_generated(&rel)
+            || crate::engine::generated::is_auto_generated(&canonical_path))
+    {
+        return CandidateFile::Generated(rel);
+    }
+    match extract_file_candidates(dir, &rel) {
+        Some(candidates) => CandidateFile::Extracted(rel, candidates),
+        None => CandidateFile::Ignored,
+    }
+}
+
+/// 1 ファイルぶんの dead-code 候補。
+struct FileCandidates {
+    lang: crate::language::LangId,
+    /// エクスポートシンボル (name, kind, signature)。trait impl メソッドと
+    /// フレームワークの実行時入口は除外済み。
+    symbols: ExportedSymbols,
+    /// C/C++ の liveness 補助情報 (シンボル名, 追加名リスト)。他の言語では空。
+    cpp_liveness: Vec<(String, Vec<String>)>,
+}
+
+/// `dir` 相対の `file_path` から dead-code の候補を抽出する。
+///
+/// 読み込み・言語判定・parse は 1 回だけ行う。C/C++ の liveness 補助情報 (enum の列挙子・
+/// typedef alias) も同じ構文木から集める (旧実装は候補抽出とは別に読み直して parse していた)。
+/// enum 型名が直接使われなくても列挙子が使われていれば live、body あり typedef tag が alias 名で
+/// のみ使われていても live と判定するために使う (Issue #11/#12)。
+///
+/// 候補は名前・種別・シグネチャしか使わないので、循環的複雑度は計算しない。
+/// それ以外は `extract_exported_symbols_from_file_inner_with_lang(dir, file_path, true, true)`
+/// と同じ候補を返す。
+fn extract_file_candidates(dir: &str, file_path: &str) -> Option<FileCandidates> {
+    // `../etc/passwd` 等のトラバーサルや絶対パスを拒否し、workspace 外のファイルを読まない。
+    if !crate::engine::impact::is_safe_diff_path(file_path) {
+        return None;
+    }
+    let full_path = std::path::Path::new(dir).join(file_path);
+    let utf8_path = camino::Utf8Path::new(full_path.to_str()?);
+    let source = parser::read_file(utf8_path).ok()?;
+    let lang = parser::detect_lang(utf8_path, &source).ok()?;
+
+    // lexer-only 言語 (現状 Xojo) は tree-sitter を持たないため、lexer 経由で
+    // export 相当のシンボルを抽出する。
+    if let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang.detected() {
+        return Some(FileCandidates {
+            lang,
+            symbols: crate::engine::lexer::extract_exported_symbols(&source, lexer_lang, true),
+            cpp_liveness: Vec::new(),
+        });
+    }
+
+    let tree = parser::parse_source(&source, lang).ok()?;
+    let root = tree.root_node();
+    let syms =
+        crate::engine::symbols::extract_symbols_without_complexity(root, &source, lang).ok()?;
+    let symbols = filter_exported_symbols(&syms, root, &source, lang, true, true, Some(file_path));
+    let cpp_liveness = if matches!(
+        lang,
+        crate::language::LangId::C | crate::language::LangId::Cpp
+    ) {
+        crate::engine::symbols::collect_cpp_dead_liveness_aliases(root, &source, lang)
+    } else {
+        Vec::new()
+    };
+    Some(FileCandidates {
+        lang,
+        symbols,
+        cpp_liveness,
+    })
 }
 
 /// 検索インデックスの中間状態。正規化済み bare name の同名カウント / liveness alias / 検索対象名。
@@ -794,27 +891,6 @@ fn classify_dead_symbols(
     classified
 }
 
-/// C/C++ ファイルをパースし、dead-code liveness 補助情報 (enum→列挙子 / typedef tag→alias) を返す。
-/// `detect_dead_symbols_from_files` で enum / typedef tag の生存判定を補強するために使う。
-pub(crate) fn collect_cpp_liveness_for_file(
-    dir: &str,
-    rel: &str,
-    lang: crate::language::LangId,
-) -> Vec<(String, Vec<String>)> {
-    let full = std::path::Path::new(dir).join(rel);
-    let Some(full_str) = full.to_str() else {
-        return Vec::new();
-    };
-    let utf8 = camino::Utf8Path::new(full_str);
-    let Ok(source) = parser::read_file(utf8) else {
-        return Vec::new();
-    };
-    let Ok(tree) = parser::parse_source(&source, lang) else {
-        return Vec::new();
-    };
-    crate::engine::symbols::collect_cpp_dead_liveness_aliases(tree.root_node(), &source, lang)
-}
-
 /// テストディレクトリとみなすセグメント名一覧。
 ///
 /// - 言語共通: `tests`, `Tests`, `__tests__`, `spec`, `testdata`
@@ -888,7 +964,7 @@ pub(crate) fn extract_dead_code_candidates_from_file(
     // 登録デコレータが付いた関数を除外する。デコレータ経由でフレームワーク内部
     // レジストリに登録されるため、識別子レベルの cross-file refs では caller を
     // 追跡できず偽陽性源になる。
-    extract_exported_symbols_from_file_inner(dir, file_path, true, true)
+    extract_file_candidates(dir, file_path).map(|candidates| candidates.symbols)
 }
 
 pub(crate) fn filter_dead_by_touched_symbols(
@@ -1946,5 +2022,255 @@ mod uncounted_tests {
         // 対照: 失敗が無ければ何も未観測にしない
         let clean = UnobservedReferences::new(&names, &[]);
         assert_eq!(clean.may_be_referenced(&["alpha"]), (false, false));
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+    use crate::language::LangId;
+
+    /// 変更前の C/C++ liveness 収集 (候補抽出とは別に読み直して parse していた)。
+    fn reference_cpp_liveness(dir: &str, rel: &str, lang: LangId) -> Vec<(String, Vec<String>)> {
+        let full = std::path::Path::new(dir).join(rel);
+        let Some(full_str) = full.to_str() else {
+            return Vec::new();
+        };
+        let utf8 = camino::Utf8Path::new(full_str);
+        let Ok(source) = parser::read_file(utf8) else {
+            return Vec::new();
+        };
+        let Ok(tree) = parser::parse_source(&source, lang) else {
+            return Vec::new();
+        };
+        crate::engine::symbols::collect_cpp_dead_liveness_aliases(tree.root_node(), &source, lang)
+    }
+
+    type ReferenceCandidates = (
+        Vec<(String, String, String, LangId)>,
+        Vec<(String, String, Vec<String>, LangId)>,
+        Vec<String>,
+    );
+
+    /// 変更前の候補収集 (64bfb37)。直列に処理し、複雑度も計算する公開 API 用の抽出を使い、
+    /// C/C++ は liveness のために読み直して parse していた。
+    fn reference_collect(
+        dir: &str,
+        canonical_dir: &std::path::Path,
+        files: &[std::path::PathBuf],
+        include_generated: bool,
+    ) -> ReferenceCandidates {
+        let gitattrs = crate::engine::gitattributes::GitAttributes::load(canonical_dir);
+        let mut all_syms = Vec::new();
+        let mut liveness_raw = Vec::new();
+        let mut generated_skipped = Vec::new();
+        for path in files {
+            let Ok(canonical_path) = std::fs::canonicalize(path) else {
+                continue;
+            };
+            let rel = match canonical_path.strip_prefix(canonical_dir) {
+                Ok(p) => normalize_workspace_separators(&p.to_string_lossy()),
+                Err(_) => continue,
+            };
+            if !include_generated
+                && (gitattrs.is_generated(&rel)
+                    || crate::engine::generated::is_auto_generated(&canonical_path))
+            {
+                generated_skipped.push(rel);
+                continue;
+            }
+            if let Some((lang, syms)) =
+                super::super::api_changes::extract_exported_symbols_from_file_inner_with_lang(
+                    dir, &rel, true, true,
+                )
+            {
+                for (name, kind, _sig) in syms {
+                    all_syms.push((name, kind, rel.clone(), lang));
+                }
+                if matches!(lang, LangId::C | LangId::Cpp) {
+                    for (sym, extras) in reference_cpp_liveness(dir, &rel, lang) {
+                        liveness_raw.push((rel.clone(), sym, extras, lang));
+                    }
+                }
+            }
+        }
+        (all_syms, liveness_raw, generated_skipped)
+    }
+
+    fn list_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                list_files(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    /// 多言語の候補を持つリポジトリ。tests/fixtures の各言語のサンプルに、C/C++ の liveness・
+    /// 生成物 (ヘッダのマーカーと .gitattributes)・lexer-only・shebang のファイルを足す。
+    fn write_fixture_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let src = repo.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for entry in std::fs::read_dir(&fixtures).expect("fixtures") {
+            let path = entry.expect("entry").path();
+            if path.is_file() {
+                std::fs::copy(&path, src.join(path.file_name().unwrap())).expect("copy");
+            }
+        }
+        let extra = [
+            (
+                "src/lib.rs",
+                "pub fn top() -> u32 { 1 }\npub struct Holder;\nimpl Holder {\n    pub fn get(&self) -> u32 { if true { 2 } else { 3 } }\n}\nimpl Default for Holder {\n    fn default() -> Self { Holder }\n}\npub trait Shape {\n    fn area(&self) -> f64;\n}\npub const LIMIT: u32 = 3;\n",
+            ),
+            (
+                "src/enums.h",
+                "typedef enum { RED, GREEN } color_t;\nenum mode { MODE_A, MODE_B };\ntypedef struct node { int v; } node_t;\nint api(void);\nint api(void) { return RED; }\n",
+            ),
+            (
+                "src/widget.tsx",
+                "export function Widget() { return <div />; }\nexport class Store {\n  load() { return 1; }\n}\n",
+            ),
+            (
+                "src/util.js",
+                "export function helper() { return 1; }\nexport const value = 2;\n",
+            ),
+            (
+                "src/gen.go",
+                "// Code generated by tool. DO NOT EDIT.\npackage gen\n\nfunc Generated() {}\n",
+            ),
+            ("src/marked.py", "def marked():\n    return 1\n"),
+            ("src/notes.txt", "not a source file\n"),
+            (
+                "bin/tool",
+                "#!/usr/bin/env python3\ndef tool_main():\n    return 0\n",
+            ),
+            (".gitattributes", "src/marked.py linguist-generated\n"),
+        ];
+        for (rel, body) in extra {
+            let path = repo.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+            std::fs::write(path, body).expect("write");
+        }
+        repo
+    }
+
+    /// 並列化した候補収集は、変更前の直列の収集と同じ候補・liveness・生成物の申告を同じ順序で
+    /// 返す (C/C++ の liveness を候補抽出の構文木から集めても、複雑度を計算しなくても同じ)。
+    /// 入力の順を逆にしても、その順のまま組み立てる。
+    #[test]
+    fn candidate_collection_matches_sequential_reference() {
+        let repo = write_fixture_repo();
+        let dir = repo.path().to_str().expect("utf-8 path");
+        let canonical_dir = std::fs::canonicalize(repo.path()).expect("canonicalize");
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            outside.path().join("x.ts"),
+            "export function outside() {}\n",
+        )
+        .expect("write");
+
+        let mut files = Vec::new();
+        list_files(repo.path(), &mut files);
+        files.sort();
+        files.reverse();
+        files.push(repo.path().join("src/missing.ts"));
+        files.push(outside.path().join("x.ts"));
+
+        for include_generated in [false, true] {
+            let actual =
+                collect_dead_code_candidates(dir, &canonical_dir, &files, include_generated);
+            let (all_syms, liveness_raw, generated_skipped) =
+                reference_collect(dir, &canonical_dir, &files, include_generated);
+            assert_eq!(
+                actual.all_syms, all_syms,
+                "include_generated={include_generated}"
+            );
+            assert_eq!(
+                actual.liveness_raw, liveness_raw,
+                "include_generated={include_generated}"
+            );
+            assert_eq!(
+                actual.generated_skipped, generated_skipped,
+                "include_generated={include_generated}"
+            );
+
+            // 空振り防止: 比べた中身に各経路が実際に含まれている
+            let langs: HashSet<LangId> = all_syms.iter().map(|(_, _, _, lang)| *lang).collect();
+            assert!(langs.len() >= 12, "{langs:?}");
+            assert!(langs.contains(&LangId::Xojo), "lexer-only: {langs:?}");
+            assert!(
+                all_syms
+                    .iter()
+                    .any(|(name, _, file, _)| name == "tool_main" && file == "bin/tool"),
+                "shebang で判定するファイル"
+            );
+            assert!(!liveness_raw.is_empty(), "C/C++ の liveness 補助情報");
+            if include_generated {
+                assert!(generated_skipped.is_empty());
+            } else {
+                assert_eq!(generated_skipped, vec!["src/marked.py", "src/gen.go"]);
+            }
+        }
+
+        // ファイル単位でも、旧関数 (公開 API 用の抽出を dead-code の設定で呼ぶもの) と同じ候補
+        let mut compared = 0;
+        for path in &files {
+            let Ok(canonical) = std::fs::canonicalize(path) else {
+                continue;
+            };
+            let Ok(rel) = canonical.strip_prefix(&canonical_dir) else {
+                continue;
+            };
+            let rel = normalize_workspace_separators(&rel.to_string_lossy());
+            let expected = extract_exported_symbols_from_file_inner(dir, &rel, true, true);
+            compared += usize::from(expected.is_some());
+            assert_eq!(
+                extract_dead_code_candidates_from_file(dir, &rel),
+                expected,
+                "{rel}"
+            );
+        }
+        assert!(compared >= 20, "{compared}");
+    }
+
+    /// dead-code の候補抽出に使う `extract_symbols_without_complexity` は、`extract_symbols` と
+    /// 同じシンボルを複雑度だけ計算せずに返す。
+    #[test]
+    fn symbols_without_complexity_differ_only_in_complexity() {
+        let repo = write_fixture_repo();
+        let mut files = Vec::new();
+        list_files(repo.path(), &mut files);
+        files.sort();
+        let mut functions_with_complexity = 0;
+        for path in files {
+            let utf8 = camino::Utf8Path::new(path.to_str().expect("utf-8 path"));
+            let source = parser::read_file(utf8).expect("read");
+            let Ok(lang) = parser::detect_lang(utf8, &source) else {
+                continue;
+            };
+            if lang.is_lexer_only() {
+                continue;
+            }
+            let tree = parser::parse_source(&source, lang).expect("parse");
+            let root = tree.root_node();
+            let mut with = crate::engine::symbols::extract_symbols(root, &source, lang).unwrap();
+            let without =
+                crate::engine::symbols::extract_symbols_without_complexity(root, &source, lang)
+                    .unwrap();
+            functions_with_complexity += with.iter().filter(|s| s.complexity.is_some()).count();
+            assert!(without.iter().all(|s| s.complexity.is_none()), "{path:?}");
+            for symbol in &mut with {
+                symbol.complexity = None;
+            }
+            assert_eq!(format!("{with:?}"), format!("{without:?}"), "{path:?}");
+        }
+        assert!(
+            functions_with_complexity > 0,
+            "複雑度を持つ関数を含む入力で比べる"
+        );
     }
 }

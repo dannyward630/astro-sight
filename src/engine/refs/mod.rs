@@ -65,7 +65,8 @@ fn bounded_worker_count() -> usize {
 
 /// `find_references` / `find_references_batch` 共通の rayon プールを構築する。
 /// ワーカー数は物理コア数と `bounded_worker_count()` の小さい方。
-fn build_bounded_pool() -> Result<rayon::ThreadPool> {
+/// dead-code の候補抽出も、全ファイルを parse する点が同じなのでこのプールで回す。
+pub(crate) fn build_bounded_pool() -> Result<rayon::ThreadPool> {
     let worker_limit = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)

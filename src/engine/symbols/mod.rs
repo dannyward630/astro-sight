@@ -113,11 +113,32 @@ fn is_js_function_body(node: Node) -> bool {
 
 /// パース済み AST からシンボルを抽出する。
 pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
+    extract_builtin_symbols(root, source, lang_id, true)
+}
+
+/// `extract_symbols` と同じシンボルを、循環的複雑度 (`complexity`) を計算せずに抽出する。
+///
+/// dead-code の候補抽出は名前・種別・シグネチャしか使わないのに、関数ごとの複雑度の計算
+/// (本体全体の走査) が抽出時間の半分以上を占めていた。`complexity` 以外は同一。
+pub(crate) fn extract_symbols_without_complexity(
+    root: Node<'_>,
+    source: &[u8],
+    lang_id: LangId,
+) -> Result<Vec<Symbol>> {
+    extract_builtin_symbols(root, source, lang_id, false)
+}
+
+fn extract_builtin_symbols(
+    root: Node<'_>,
+    source: &[u8],
+    lang_id: LangId,
+    with_complexity: bool,
+) -> Result<Vec<Symbol>> {
     let query_src = symbol_query(lang_id);
     if query_src.is_empty() {
         return Ok(fallback_symbols(root, source));
     }
-    run_symbol_query(root, source, lang_id, query_src)
+    run_symbol_query(root, source, lang_id, query_src, with_complexity)
 }
 
 /// カスタム tree-sitter クエリでシンボルを抽出する (`symbols --query`)。
@@ -162,15 +183,17 @@ pub fn extract_symbols_with_custom_query(
         )
         .into());
     }
-    run_symbol_query(root, source, lang_id, custom_query)
+    run_symbol_query(root, source, lang_id, custom_query, true)
 }
 
 /// symbol クエリ本体の実行 (built-in / custom 共通)。
+/// `with_complexity` が false なら関数・メソッドの `complexity` を計算せず `None` にする。
 fn run_symbol_query(
     root: Node<'_>,
     source: &[u8],
     lang_id: LangId,
     query_src: &str,
+    with_complexity: bool,
 ) -> Result<Vec<Symbol>> {
     let query = crate::engine::query_cache::cached_query(lang_id, query_src)?;
     let mut cursor = QueryCursor::new();
@@ -257,7 +280,9 @@ fn run_symbol_query(
                         extract_doc_comment(node, source)
                     };
                     // 関数/メソッドの場合のみ循環的複雑度を算出
-                    let complexity = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+                    let complexity = if with_complexity
+                        && matches!(kind, SymbolKind::Function | SymbolKind::Method)
+                    {
                         Some(calculate_complexity(parent_node, lang_id))
                     } else {
                         None

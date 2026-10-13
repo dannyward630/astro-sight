@@ -26,6 +26,7 @@ use super::git_input::git_show_blob;
 
 pub(crate) type ExportedSymbols = Vec<(String, String, String)>;
 
+#[cfg(test)]
 type ExportedSymbolsWithLang = (crate::language::LangId, ExportedSymbols);
 
 /// `detect_api_changes` に渡す diff ファイル一覧。`diff_files` (= `parse_unified_diff` の結果) に、
