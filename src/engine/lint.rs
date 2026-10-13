@@ -113,42 +113,47 @@ pub fn lint_file(
     Ok((matches, warnings))
 }
 
-/// AST を再帰走査し、identifier ノードをテキストパターンと照合する。
+/// AST を走査し、identifier ノードをテキストパターンと照合する。
+///
+/// 木全体を辿るので、子 1 段ごとに再帰すると深い式を持つファイル 1 つでスタックを
+/// 使い切る。children の再帰と同じ前順で反復して辿り、一致を同じ順に返す。
 fn collect_pattern_matches(
-    node: Node<'_>,
+    root: Node<'_>,
     source: &[u8],
     pattern: &str,
     rule: &Rule,
     matches: &mut Vec<PatternMatch>,
 ) {
-    let kind = node.kind();
-    // identifier 系ノードをチェック
-    let is_identifier = kind == "identifier"
-        || kind == "field_identifier"
-        || kind == "type_identifier"
-        || kind == "property_identifier"
-        || kind == "simple_identifier"
-        || kind == "word"
-        || kind == "name";
+    use std::ops::ControlFlow;
 
-    if is_identifier
-        && let Ok(text) = node.utf8_text(source)
-        && text.contains(pattern)
-    {
-        matches.push(PatternMatch {
-            rule_id: rule.id.clone(),
-            severity: rule.severity,
-            message: rule.message.clone(),
-            line: node.start_position().row,
-            column: node.start_position().column,
-            matched_text: text.to_string(),
-        });
-    }
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_pattern_matches(child, source, pattern, rule, matches);
-    }
+    let _: ControlFlow<()> = walk_preorder(root, Children::All, |node, _| {
+        let kind = node.kind();
+        // identifier 系ノードをチェック
+        let is_identifier = kind == "identifier"
+            || kind == "field_identifier"
+            || kind == "type_identifier"
+            || kind == "property_identifier"
+            || kind == "simple_identifier"
+            || kind == "word"
+            || kind == "name";
+
+        if is_identifier
+            && let Ok(text) = node.utf8_text(source)
+            && text.contains(pattern)
+        {
+            matches.push(PatternMatch {
+                rule_id: rule.id.clone(),
+                severity: rule.severity,
+                message: rule.message.clone(),
+                line: node.start_position().row,
+                column: node.start_position().column,
+                matched_text: text.to_string(),
+            });
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
 }
 
 #[cfg(test)]
@@ -375,5 +380,74 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].line, 1); // 2行目（0-indexed）
         assert_eq!(matches[0].matched_text, "bar_target");
+    }
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn collect_pattern_matches_recursive(
+        node: Node<'_>,
+        source: &[u8],
+        pattern: &str,
+        rule: &Rule,
+        matches: &mut Vec<PatternMatch>,
+    ) {
+        let kind = node.kind();
+        let is_identifier = kind == "identifier"
+            || kind == "field_identifier"
+            || kind == "type_identifier"
+            || kind == "property_identifier"
+            || kind == "simple_identifier"
+            || kind == "word"
+            || kind == "name";
+        if is_identifier
+            && let Ok(text) = node.utf8_text(source)
+            && text.contains(pattern)
+        {
+            matches.push(PatternMatch {
+                rule_id: rule.id.clone(),
+                severity: rule.severity,
+                message: rule.message.clone(),
+                line: node.start_position().row,
+                column: node.start_position().column,
+                matched_text: text.to_string(),
+            });
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_pattern_matches_recursive(child, source, pattern, rule, matches);
+        }
+    }
+
+    /// パターンの一致は、反復版と再帰版で同じものを同じ順に返す。
+    #[test]
+    fn pattern_matches_match_recursive_version() {
+        let source = "struct TargetBox { target_field: u32 }\n\
+                      impl TargetBox {\n\
+                      \x20   fn target_method(&self) -> u32 { let target = self.target_field; target + other_target() }\n\
+                      }\n\
+                      fn other_target() -> u32 { (((1))) }\n";
+        let (tree, _) = parse_rust(source);
+        let rule = make_rule("t", "rust", Severity::Info, None, Some("arget"));
+        let mut actual = Vec::new();
+        collect_pattern_matches(
+            tree.root_node(),
+            source.as_bytes(),
+            "arget",
+            &rule,
+            &mut actual,
+        );
+        let mut expected = Vec::new();
+        collect_pattern_matches_recursive(
+            tree.root_node(),
+            source.as_bytes(),
+            "arget",
+            &rule,
+            &mut expected,
+        );
+        let key = |m: &PatternMatch| (m.line, m.column, m.matched_text.clone());
+        assert_eq!(
+            actual.iter().map(key).collect::<Vec<_>>(),
+            expected.iter().map(key).collect::<Vec<_>>()
+        );
+        assert!(actual.len() >= 7, "{}", actual.len());
     }
 }

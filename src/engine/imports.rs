@@ -89,8 +89,15 @@ pub fn import_statement_lines(root: Node<'_>) -> HashSet<usize> {
     lines
 }
 
-/// import 系ノードの行範囲を再帰的に集める。import 文の中はさらに潜らない。
-fn collect_import_statement_lines(node: Node<'_>, lines: &mut HashSet<usize>) {
+/// import 系ノードの行範囲を集める。import 文の中はさらに潜らない。
+///
+/// 木全体を辿るので、子 1 段ごとに再帰すると深い式を持つファイル 1 つでスタックを
+/// 使い切る。children の再帰と同じ順序で反復して辿る。
+fn collect_import_statement_lines(root: Node<'_>, lines: &mut HashSet<usize>) {
+    use std::ops::ControlFlow;
+
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+
     // 宣言系のみ対象 (require()/@import 等の呼び出し式は実行コードなので除く)。
     const IMPORT_STATEMENT_KINDS: &[&str] = &[
         "use_declaration",
@@ -102,16 +109,15 @@ fn collect_import_statement_lines(node: Node<'_>, lines: &mut HashSet<usize>) {
         "import_header",
         "preproc_include",
     ];
-    if IMPORT_STATEMENT_KINDS.contains(&node.kind()) {
-        for row in node.start_position().row..=node.end_position().row {
-            lines.insert(row);
+    let _: ControlFlow<()> = walk_preorder(root, Children::All, |node, _| {
+        if IMPORT_STATEMENT_KINDS.contains(&node.kind()) {
+            for row in node.start_position().row..=node.end_position().row {
+                lines.insert(row);
+            }
+            return ControlFlow::Continue(Walk::Skip);
         }
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_import_statement_lines(child, lines);
-    }
+        ControlFlow::Continue(Walk::Descend)
+    });
 }
 
 /// PHP grouped use の clause 内 capture に対し、宣言側の namespace prefix を返す。
@@ -534,5 +540,91 @@ echo not_source\n";
         assert!(sources.contains(&"App\\Services\\Mailer"), "{sources:?}");
         assert!(sources.contains(&"App\\Services\\Logger"), "{sources:?}");
         assert!(sources.contains(&"Single\\Plain"), "{sources:?}");
+    }
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn collect_import_statement_lines_recursive(node: Node<'_>, lines: &mut HashSet<usize>) {
+        const IMPORT_STATEMENT_KINDS: &[&str] = &[
+            "use_declaration",
+            "import_statement",
+            "import_from_statement",
+            "import_declaration",
+            "namespace_use_declaration",
+            "using_directive",
+            "import_header",
+            "preproc_include",
+        ];
+        if IMPORT_STATEMENT_KINDS.contains(&node.kind()) {
+            for row in node.start_position().row..=node.end_position().row {
+                lines.insert(row);
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_import_statement_lines_recursive(child, lines);
+        }
+    }
+
+    /// import 文の行集合は、反復版と再帰版で一致する (複数行の use / 入れ子の mod を含む)。
+    #[test]
+    fn import_statement_lines_match_recursive_version() {
+        let cases: [(LangId, &str); 6] = [
+            (
+                LangId::Rust,
+                "use std::{\n    fmt,\n    io,\n};\nmod inner {\n    use super::fmt;\n    fn f() { let _ = fmt::Error; }\n}\n",
+            ),
+            (
+                LangId::Typescript,
+                "import {\n  a,\n  b,\n} from \"./x\";\nexport function f() { return require(\"y\"); }\n",
+            ),
+            (
+                LangId::Python,
+                "import os\nfrom pkg import (\n    a,\n    b,\n)\ndef f():\n    import sys\n    return sys\n",
+            ),
+            (
+                LangId::Php,
+                "<?php\nnamespace App;\nuse App\\Services\\{\n    Mailer,\n    Logger\n};\nfunction f() { return 1; }\n",
+            ),
+            (
+                LangId::CSharp,
+                "using System;\nusing Alias = System.Text.StringBuilder;\nnamespace N { class C {} }\n",
+            ),
+            (
+                LangId::Cpp,
+                "#include <vector>\n#include \"a.h\"\nnamespace n {\n#include \"inner.h\"\nint f() { return 0; }\n}\n",
+            ),
+        ];
+        for (lang, source) in cases {
+            let tree = parser::parse_source(source.as_bytes(), lang).unwrap();
+            let actual = import_statement_lines(tree.root_node());
+            let mut expected = HashSet::new();
+            collect_import_statement_lines_recursive(tree.root_node(), &mut expected);
+            assert_eq!(actual, expected, "{lang:?}");
+            assert!(!actual.is_empty(), "{lang:?}: import 行を集めている");
+        }
+    }
+
+    /// 深い式を持つファイルでも、import 行の収集がスタックを使い切らない。子プロセスの
+    /// 256 KiB のスタックで 2 万段の括弧を辿り、深い式の後ろの import も拾う
+    /// (再帰版はここで溢れて子プロセスごと落ちる)。
+    #[test]
+    fn import_statement_lines_handle_deep_expressions() {
+        crate::engine::tree_walk::run_deep_test_isolated(
+            module_path!(),
+            "import_statement_lines_handle_deep_expressions",
+            || {
+                let source = format!(
+                    "import {{ a }} from \"./a\";\nexport const v = {}1{};\nimport {{ b }} from \"./b\";\n",
+                    "(".repeat(20_000),
+                    ")".repeat(20_000)
+                );
+                let tree = parser::parse_source(source.as_bytes(), LangId::Typescript).unwrap();
+                assert_eq!(
+                    import_statement_lines(tree.root_node()),
+                    HashSet::from([0, 2])
+                );
+            },
+        );
     }
 }

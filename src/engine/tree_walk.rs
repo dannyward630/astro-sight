@@ -85,6 +85,57 @@ pub(crate) fn any_node<'tree>(
     .is_break()
 }
 
+/// 深い入力の単体テストを、テストバイナリの子プロセスで小さいスタックのスレッドに通す。
+///
+/// スタック溢れはプロセスごと abort するので、同じプロセスで走らせると他のテストも道連れに
+/// なる。親は自分自身 (テストバイナリ) を `--exact <テスト名>` で起動し、子は `run` を
+/// 256 KiB のスタックのスレッドで実行する。親は子が正常終了し、`run` が最後まで走ったこと
+/// (印の出力) だけを確かめる。印を見ないと、テスト名の誤りで子が 0 件のまま成功しても
+/// 気付けない。
+///
+/// CLI からは別の処理 (祖先をたどる `Node::parent` の繰り返しなど) が先に時間を使い、
+/// 深い入力を現実的な時間で通せない関数に使う。`test_name` はテスト関数の名前、
+/// `module` はそのテストの `module_path!()`。
+#[cfg(test)]
+pub(crate) fn run_deep_test_isolated(module: &str, test_name: &str, run: impl FnOnce() + Send) {
+    const CHILD_ENV: &str = "ASTRO_SIGHT_DEEP_TEST_CHILD";
+    const DONE_MARKER: &str = "ASTRO_SIGHT_DEEP_TEST_DONE";
+    // libtest のテスト名はクレート名を含まない (`engine::...::tests::name`)。
+    let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+    let full_name = format!("{module}::{test_name}");
+    if std::env::var(CHILD_ENV).as_deref() == Ok(full_name.as_str()) {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn_scoped(scope, run)
+                .expect("spawn small-stack thread")
+                .join()
+                .expect("deep test body panicked");
+        });
+        println!("{DONE_MARKER}");
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            full_name.as_str(),
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_ENV, &full_name)
+        .output()
+        .expect("spawn test binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains(DONE_MARKER),
+        "{full_name}: child {:?}\nstdout={}\nstderr={}",
+        output.status,
+        stdout.chars().take(2000).collect::<String>(),
+        stderr.chars().take(2000).collect::<String>()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

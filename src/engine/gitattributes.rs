@@ -129,36 +129,49 @@ impl Pattern {
 
     fn matches(&self, path: &str) -> bool {
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let matched = match_segments_from_each_start(&self.segments, &parts);
         if self.anchored {
-            match_segments(&self.segments, &parts)
+            matched[0]
         } else {
             // 非 anchored パターンは任意のディレクトリから始まる一致を許す。
             // 例: `parser.c` は `src/parser.c` にもマッチ。
-            (0..=parts.len()).any(|start| match_segments(&self.segments, &parts[start..]))
+            matched.contains(&true)
         }
     }
 }
 
-fn match_segments(segments: &[Segment], parts: &[&str]) -> bool {
-    match segments.split_first() {
-        None => parts.is_empty(),
-        Some((Segment::DoubleStar, rest)) => {
-            if rest.is_empty() {
-                return true;
+/// `segments` が `parts[start..]` 全体に一致するかを、`start` = 0..=parts.len() のそれぞれに
+/// ついて返す。
+///
+/// セグメントを先頭から 1 つずつ再帰で照合すると、パターンのセグメント数だけスタックを使い
+/// (`**/**/**/...` が続く 1 行で溢れる)、`**` が続くと試す組み合わせが指数的に増える。
+/// 末尾のセグメントから順に「各位置以降に一致するか」の表を作り、セグメント数 × パスの長さで
+/// 済ませる。結果は再帰で照合した場合と同じ。
+fn match_segments_from_each_start(segments: &[Segment], parts: &[&str]) -> Vec<bool> {
+    let n = parts.len();
+    // セグメントが残っていなければ、パスも残っていないときだけ一致する。
+    let mut matched: Vec<bool> = (0..=n).map(|start| start == n).collect();
+    for (i, segment) in segments.iter().enumerate().rev() {
+        matched = match segment {
+            // 末尾の `**` は、残りのパスが何であっても一致する。
+            Segment::DoubleStar if i + 1 == segments.len() => vec![true; n + 1],
+            // `**` は 0 個以上のセグメントを読み飛ばす: start 以降のどこかから残りが一致すればよい。
+            Segment::DoubleStar => {
+                let mut any_later = false;
+                let mut row = vec![false; n + 1];
+                for start in (0..=n).rev() {
+                    any_later |= matched[start];
+                    row[start] = any_later;
+                }
+                row
             }
-            (0..=parts.len()).any(|skip| match_segments(rest, &parts[skip..]))
-        }
-        Some((Segment::Glob(pat), rest)) => {
-            if parts.is_empty() {
-                return false;
-            }
-            if glob_match(pat, parts[0]) {
-                match_segments(rest, &parts[1..])
-            } else {
-                false
-            }
-        }
+            // 通常のセグメントは先頭の 1 つに一致し、残りがその次から一致すればよい。
+            Segment::Glob(pattern) => (0..=n)
+                .map(|start| start < n && matched[start + 1] && glob_match(pattern, parts[start]))
+                .collect(),
+        };
     }
+    matched
 }
 
 /// セグメント単位の glob マッチ。`*`, `?`, `[...]` のうち `*` と `?` のみ対応。
@@ -299,5 +312,110 @@ mod tests {
     fn backslash_paths_normalized() {
         let ga = GitAttributes::parse("src/parser.c linguist-generated\n");
         assert!(ga.is_generated("src\\parser.c"));
+    }
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn match_segments_recursive(segments: &[Segment], parts: &[&str]) -> bool {
+        match segments.split_first() {
+            None => parts.is_empty(),
+            Some((Segment::DoubleStar, rest)) => {
+                if rest.is_empty() {
+                    return true;
+                }
+                (0..=parts.len()).any(|skip| match_segments_recursive(rest, &parts[skip..]))
+            }
+            Some((Segment::Glob(pat), rest)) => {
+                if parts.is_empty() {
+                    return false;
+                }
+                if glob_match(pat, parts[0]) {
+                    match_segments_recursive(rest, &parts[1..])
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn matches_recursive(pattern: &Pattern, path: &str) -> bool {
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if pattern.anchored {
+            match_segments_recursive(&pattern.segments, &parts)
+        } else {
+            (0..=parts.len())
+                .any(|start| match_segments_recursive(&pattern.segments, &parts[start..]))
+        }
+    }
+
+    /// 表による照合は、再帰で照合した場合と全組み合わせで一致する
+    /// (`**` の連続・先頭・末尾、anchored とそうでないもの、空のパス)。
+    #[test]
+    fn matches_agree_with_recursive_version() {
+        let segments = ["**", "*", "a", "b", "a*", "?", "c.ts"];
+        let mut patterns = vec![String::new()];
+        for _ in 0..3 {
+            let mut next = Vec::new();
+            for prefix in &patterns {
+                for seg in segments {
+                    next.push(if prefix.is_empty() {
+                        seg.to_string()
+                    } else {
+                        format!("{prefix}/{seg}")
+                    });
+                }
+            }
+            patterns.extend(next);
+        }
+        patterns.retain(|p| !p.is_empty());
+        let raw_patterns: Vec<String> = patterns
+            .iter()
+            .flat_map(|p| [p.clone(), format!("/{p}")])
+            .collect();
+        let paths = [
+            "",
+            "a",
+            "b",
+            "c.ts",
+            "a/b",
+            "a/c.ts",
+            "b/a/c.ts",
+            "a/a/a",
+            "x/a/b/c.ts",
+            "ab/b/c.ts",
+            "a/b/c/d/e",
+        ];
+        let (mut matched, mut unmatched) = (0, 0);
+        for raw in &raw_patterns {
+            let pattern = Pattern::parse(raw);
+            for path in paths {
+                let expected = matches_recursive(&pattern, path);
+                assert_eq!(pattern.matches(path), expected, "{raw} vs {path}");
+                if expected {
+                    matched += 1;
+                } else {
+                    unmatched += 1;
+                }
+            }
+        }
+        assert!(
+            matched > 1000 && unmatched > 1000,
+            "matched={matched} unmatched={unmatched}"
+        );
+    }
+
+    /// `**` が 10 万個続くパターンでも照合がスタックを使い切らず、すぐに終わる。
+    /// 子プロセスの 256 KiB のスタックで照合する (再帰版はここで溢れて子プロセスごと落ちる)。
+    #[test]
+    fn long_double_star_pattern_does_not_overflow() {
+        crate::engine::tree_walk::run_deep_test_isolated(
+            module_path!(),
+            "long_double_star_pattern_does_not_overflow",
+            || {
+                let line = format!("{}gen.ts linguist-generated\n", "**/".repeat(100_000));
+                let ga = GitAttributes::parse(&line);
+                assert!(ga.is_generated("src/deep/gen.ts"));
+                assert!(!ga.is_generated("src/deep/other.ts"));
+            },
+        );
     }
 }

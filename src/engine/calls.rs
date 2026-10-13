@@ -261,22 +261,32 @@ fn js_ts_binding_name_for_function(node: Node<'_>, source: &[u8]) -> Option<Stri
 
 /// C/C++ の宣言子ノードから末尾の関数名 (identifier / field_identifier /
 /// qualified_identifier) を取り出す。pointer_declarator / reference_declarator /
-/// parenthesized_declarator / array_declarator を再帰的に辿る。
+/// parenthesized_declarator / array_declarator を辿る。
+///
+/// 宣言子は `int ****f(void)` のように任意に深く入れ子にできるので、1 段ごとに再帰せず
+/// ループで辿る。末尾の名前が取れなかったときは、辿ってきた qualified_identifier のうち
+/// 最も内側のものの全体 (`Foo::bar<T>` など) を返す (再帰で辿った場合と同じ)。
 fn c_function_name_from_declarator(decl: Node<'_>, source: &[u8]) -> Option<String> {
-    match decl.kind() {
-        "identifier" | "field_identifier" => decl.utf8_text(source).ok().map(|s| s.to_string()),
-        // Foo::bar の末尾識別子を返す
-        "qualified_identifier" => decl
-            .child_by_field_name("name")
-            .and_then(|n| c_function_name_from_declarator(n, source))
-            .or_else(|| decl.utf8_text(source).ok().map(|s| s.to_string())),
-        "function_declarator"
-        | "pointer_declarator"
-        | "reference_declarator"
-        | "parenthesized_declarator"
-        | "array_declarator" => decl
-            .child_by_field_name("declarator")
-            .or_else(|| {
+    let mut qualified: Vec<Node<'_>> = Vec::new();
+    let mut current = Some(decl);
+    let name = loop {
+        let Some(decl) = current else {
+            break None;
+        };
+        current = match decl.kind() {
+            "identifier" | "field_identifier" => {
+                break decl.utf8_text(source).ok().map(|s| s.to_string());
+            }
+            // Foo::bar の末尾識別子を返す
+            "qualified_identifier" => {
+                qualified.push(decl);
+                decl.child_by_field_name("name")
+            }
+            "function_declarator"
+            | "pointer_declarator"
+            | "reference_declarator"
+            | "parenthesized_declarator"
+            | "array_declarator" => decl.child_by_field_name("declarator").or_else(|| {
                 // reference_declarator は declarator フィールドを持たないため子から探す
                 let mut c = decl.walk();
                 decl.children(&mut c).find(|ch| {
@@ -291,10 +301,16 @@ fn c_function_name_from_declarator(decl: Node<'_>, source: &[u8]) -> Option<Stri
                             | "qualified_identifier"
                     )
                 })
-            })
-            .and_then(|d| c_function_name_from_declarator(d, source)),
-        _ => None,
-    }
+            }),
+            _ => None,
+        };
+    };
+    name.or_else(|| {
+        qualified
+            .iter()
+            .rev()
+            .find_map(|q| q.utf8_text(source).ok().map(|s| s.to_string()))
+    })
 }
 
 /// 言語別の call expression 用 tree-sitter クエリを返す。
@@ -425,6 +441,76 @@ fn call_query(lang_id: LangId) -> &'static str {
 mod tests {
     use super::*;
     use crate::engine::parser;
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn c_function_name_from_declarator_recursive(decl: Node<'_>, source: &[u8]) -> Option<String> {
+        match decl.kind() {
+            "identifier" | "field_identifier" => decl.utf8_text(source).ok().map(|s| s.to_string()),
+            "qualified_identifier" => decl
+                .child_by_field_name("name")
+                .and_then(|n| c_function_name_from_declarator_recursive(n, source))
+                .or_else(|| decl.utf8_text(source).ok().map(|s| s.to_string())),
+            "function_declarator"
+            | "pointer_declarator"
+            | "reference_declarator"
+            | "parenthesized_declarator"
+            | "array_declarator" => decl
+                .child_by_field_name("declarator")
+                .or_else(|| {
+                    let mut c = decl.walk();
+                    decl.children(&mut c).find(|ch| {
+                        matches!(
+                            ch.kind(),
+                            "function_declarator"
+                                | "pointer_declarator"
+                                | "reference_declarator"
+                                | "parenthesized_declarator"
+                                | "identifier"
+                                | "field_identifier"
+                                | "qualified_identifier"
+                        )
+                    })
+                })
+                .and_then(|d| c_function_name_from_declarator_recursive(d, source)),
+            _ => None,
+        }
+    }
+
+    /// 関数の宣言子からの名前の取り出しは、ループ版と再帰版で一致する。ポインタ・参照の
+    /// 戻り値、クラス外定義、入れ子の名前空間、テンプレート (末尾の名前が取れず
+    /// qualified_identifier 全体へ戻る場合) を含む。
+    #[test]
+    fn c_function_name_from_declarator_matches_recursive_version() {
+        let source = "int plain(void) { return 0; }\n\
+                      int **ptr(void) { return 0; }\n\
+                      int &ref_ret() { static int v; return v; }\n\
+                      int (*paren(void))(int) { return 0; }\n\
+                      void Outer::Inner::method() {}\n\
+                      template <typename T> void Box<T>::put(T v) {}\n\
+                      void ns::Box<int>::get() {}\n\
+                      int Foo::operator+(int x) { return x; }\n\
+                      Foo::~Foo() {}\n";
+        let tree = parser::parse_source(source.as_bytes(), LangId::Cpp).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut compared = 0;
+        while let Some(n) = stack.pop() {
+            if n.kind() == "function_definition"
+                && let Some(decl) = n.child_by_field_name("declarator")
+            {
+                assert_eq!(
+                    c_function_name_from_declarator(decl, source.as_bytes()),
+                    c_function_name_from_declarator_recursive(decl, source.as_bytes()),
+                    "{:?}",
+                    decl.utf8_text(source.as_bytes())
+                );
+                compared += 1;
+            }
+            let mut cursor = n.walk();
+            let children: Vec<_> = n.named_children(&mut cursor).collect();
+            stack.extend(children.into_iter().rev());
+        }
+        assert!(compared >= 9, "{compared}");
+    }
 
     /// Rust の関数呼び出しを正しく抽出する
     #[test]

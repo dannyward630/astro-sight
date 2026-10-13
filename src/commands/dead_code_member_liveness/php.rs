@@ -533,6 +533,9 @@ fn collect_php_aliases_from_node(
 
 /// `namespace_use_declaration` 配下の clause (grouped use 含む) から
 /// alias 名 → 対象末尾クラス名を登録する。同一 alias 名の再定義は競合として記録する。
+///
+/// 構文エラーの回復で use 文の中に任意の部分木が入りうるので、1 段ごとに再帰せず
+/// named_children の再帰と同じ順序で反復して辿る。clause の中へは潜らない。
 fn collect_php_use_clause_aliases(
     node: tree_sitter::Node<'_>,
     source: &[u8],
@@ -540,30 +543,40 @@ fn collect_php_use_clause_aliases(
     alias_names: &mut HashSet<String>,
     conflicted: &mut bool,
 ) {
-    if node.kind() == "namespace_use_clause" {
-        let mut cursor = node.walk();
-        let named: Vec<tree_sitter::Node<'_>> = node.named_children(&mut cursor).collect();
-        // clause = [target(qualified_name|name), alias(name)?]
-        let Some(target) = named.first() else {
-            return;
-        };
-        let Some(target_key) = php_node_key(*target, source) else {
-            *conflicted = true;
-            return;
-        };
-        let alias_key = named
-            .get(1)
-            .and_then(|alias| php_node_key(*alias, source))
-            .unwrap_or_else(|| target_key.clone());
-        alias_names.insert(alias_key.clone());
-        if map.insert(alias_key, target_key).is_some() {
-            *conflicted = true;
+    let _: ControlFlow<()> = walk_preorder(node, Children::Named, |node, _| {
+        if node.kind() == "namespace_use_clause" {
+            register_php_use_clause_alias(node, source, map, alias_names, conflicted);
+            return ControlFlow::Continue(Walk::Skip);
         }
+        ControlFlow::Continue(Walk::Descend)
+    });
+}
+
+/// `namespace_use_clause` 1 件の alias 名 → 対象末尾クラス名を登録する。
+fn register_php_use_clause_alias(
+    clause: tree_sitter::Node<'_>,
+    source: &[u8],
+    map: &mut HashMap<String, String>,
+    alias_names: &mut HashSet<String>,
+    conflicted: &mut bool,
+) {
+    let mut cursor = clause.walk();
+    let named: Vec<tree_sitter::Node<'_>> = clause.named_children(&mut cursor).collect();
+    // clause = [target(qualified_name|name), alias(name)?]
+    let Some(target) = named.first() else {
         return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_php_use_clause_aliases(child, source, map, alias_names, conflicted);
+    };
+    let Some(target_key) = php_node_key(*target, source) else {
+        *conflicted = true;
+        return;
+    };
+    let alias_key = named
+        .get(1)
+        .and_then(|alias| php_node_key(*alias, source))
+        .unwrap_or_else(|| target_key.clone());
+    alias_names.insert(alias_key.clone());
+    if map.insert(alias_key, target_key).is_some() {
+        *conflicted = true;
     }
 }
 
@@ -1016,6 +1029,13 @@ fn php_resolve_trait_dispatch(
     PhpOwnerResolution::Resolved(owner)
 }
 
+/// `dispatch_owner` から trait の `use` を辿り、`bare_key` の実装を持つ候補 owner を
+/// `matching` に集める。循環 (`visiting` に入っている trait へ戻る) や解決できない合成は
+/// `ambiguous` にする。
+///
+/// trait の `use` は鎖のように任意に長くできるので、1 段ごとに再帰せず明示スタックで辿る。
+/// 再帰で辿った場合と同じ順に訪れ、`visiting` は入るときに加えて出るときに外す
+/// (循環の検出は辿っている経路についてだけ行う)。
 fn collect_php_trait_dispatch_targets(
     dispatch_owner: &str,
     bare_key: &str,
@@ -1025,32 +1045,44 @@ fn collect_php_trait_dispatch_targets(
     matching: &mut HashSet<String>,
     ambiguous: &mut bool,
 ) {
-    if owners.contains(dispatch_owner) {
-        matching.insert(dispatch_owner.to_string());
-        return;
+    enum Frame<'a> {
+        Enter(&'a str),
+        Exit(&'a str),
     }
-    let Some(composition) = trait_uses.get(dispatch_owner) else {
-        return;
-    };
-    // 合成先が同名の**具象**メソッドを自己宣言している場合、PHP の解決順
-    // (自クラス > trait) により trait 側へは到達しない。candidate へ辿らず打ち切る
-    // (自己宣言メソッドは candidate ではないため票は入らない = Ignore 方向)。
-    if composition.declared_methods.contains(bare_key) {
-        return;
+    let mut stack = vec![Frame::Enter(dispatch_owner)];
+    while let Some(frame) = stack.pop() {
+        let owner = match frame {
+            Frame::Enter(owner) => owner,
+            Frame::Exit(owner) => {
+                visiting.remove(owner);
+                continue;
+            }
+        };
+        if owners.contains(owner) {
+            matching.insert(owner.to_string());
+            continue;
+        }
+        let Some(composition) = trait_uses.get(owner) else {
+            continue;
+        };
+        // 合成先が同名の**具象**メソッドを自己宣言している場合、PHP の解決順
+        // (自クラス > trait) により trait 側へは到達しない。candidate へ辿らず打ち切る
+        // (自己宣言メソッドは candidate ではないため票は入らない = Ignore 方向)。
+        if composition.declared_methods.contains(bare_key) {
+            continue;
+        }
+        if !visiting.insert(owner.to_string()) {
+            *ambiguous = true;
+            continue;
+        }
+        if composition.has_adaptation || composition.ambiguous {
+            *ambiguous = true;
+        }
+        stack.push(Frame::Exit(owner));
+        let first = stack.len();
+        stack.extend(composition.traits.iter().map(|name| Frame::Enter(name)));
+        stack[first..].reverse();
     }
-    if !visiting.insert(dispatch_owner.to_string()) {
-        *ambiguous = true;
-        return;
-    }
-    if composition.has_adaptation || composition.ambiguous {
-        *ambiguous = true;
-    }
-    for trait_name in &composition.traits {
-        collect_php_trait_dispatch_targets(
-            trait_name, bare_key, owners, trait_uses, visiting, matching, ambiguous,
-        );
-    }
-    visiting.remove(dispatch_owner);
 }
 
 fn php_call_name_matches(node: tree_sitter::Node<'_>, source: &[u8], bare_key: &str) -> bool {
@@ -1125,7 +1157,13 @@ mod tests {
         match node.kind() {
             "namespace_definition" => *namespace_count += 1,
             "namespace_use_declaration" => {
-                collect_php_use_clause_aliases(node, source, map, alias_names, conflicted);
+                collect_php_use_clause_aliases_recursive(
+                    node,
+                    source,
+                    map,
+                    alias_names,
+                    conflicted,
+                );
             }
             _ => {}
         }
@@ -1140,6 +1178,181 @@ mod tests {
                 namespace_count,
             );
         }
+    }
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn collect_php_use_clause_aliases_recursive(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        map: &mut HashMap<String, String>,
+        alias_names: &mut HashSet<String>,
+        conflicted: &mut bool,
+    ) {
+        if node.kind() == "namespace_use_clause" {
+            register_php_use_clause_alias(node, source, map, alias_names, conflicted);
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_php_use_clause_aliases_recursive(child, source, map, alias_names, conflicted);
+        }
+    }
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn collect_php_trait_dispatch_targets_recursive(
+        dispatch_owner: &str,
+        bare_key: &str,
+        owners: &HashSet<String>,
+        trait_uses: &HashMap<String, PhpTraitUses>,
+        visiting: &mut HashSet<String>,
+        matching: &mut HashSet<String>,
+        ambiguous: &mut bool,
+    ) {
+        if owners.contains(dispatch_owner) {
+            matching.insert(dispatch_owner.to_string());
+            return;
+        }
+        let Some(composition) = trait_uses.get(dispatch_owner) else {
+            return;
+        };
+        if composition.declared_methods.contains(bare_key) {
+            return;
+        }
+        if !visiting.insert(dispatch_owner.to_string()) {
+            *ambiguous = true;
+            return;
+        }
+        if composition.has_adaptation || composition.ambiguous {
+            *ambiguous = true;
+        }
+        for trait_name in &composition.traits {
+            collect_php_trait_dispatch_targets_recursive(
+                trait_name, bare_key, owners, trait_uses, visiting, matching, ambiguous,
+            );
+        }
+        visiting.remove(dispatch_owner);
+    }
+
+    fn trait_uses_of(edges: &[(&str, &[&str], bool, &[&str])]) -> HashMap<String, PhpTraitUses> {
+        edges
+            .iter()
+            .map(|(site, traits, has_adaptation, declared)| {
+                (
+                    site.to_string(),
+                    PhpTraitUses {
+                        traits: traits.iter().map(|t| t.to_string()).collect(),
+                        has_adaptation: *has_adaptation,
+                        ambiguous: false,
+                        declared_methods: declared.iter().map(|m| m.to_string()).collect(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// trait の合成をたどる探索は、明示スタックの版と再帰版で同じ候補・ambiguous を返し、
+    /// `visiting` を空に戻す。鎖・菱形・循環・adaptation・自己宣言の具象メソッドを含む。
+    #[test]
+    fn trait_dispatch_targets_match_recursive_version() {
+        let trait_uses = trait_uses_of(&[
+            ("site", &["t1", "t2"], false, &[]),
+            ("t1", &["t3"], false, &[]),
+            ("t2", &["t3", "t4"], false, &[]),
+            ("t3", &["owner_a"], false, &[]),
+            ("t4", &["owner_b"], true, &[]),
+            ("loop_a", &["loop_b"], false, &[]),
+            ("loop_b", &["loop_a", "owner_a"], false, &[]),
+            ("shadowed", &["owner_a"], false, &["fmt"]),
+            ("chain0", &["chain1"], false, &[]),
+            ("chain1", &["chain2"], false, &[]),
+            ("chain2", &["owner_b"], false, &[]),
+        ]);
+        let owners: HashSet<String> = ["owner_a", "owner_b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let run = |owner: &str, key: &str, recursive: bool| {
+            let (mut visiting, mut matching, mut ambiguous) =
+                (HashSet::new(), HashSet::new(), false);
+            if recursive {
+                collect_php_trait_dispatch_targets_recursive(
+                    owner,
+                    key,
+                    &owners,
+                    &trait_uses,
+                    &mut visiting,
+                    &mut matching,
+                    &mut ambiguous,
+                );
+            } else {
+                collect_php_trait_dispatch_targets(
+                    owner,
+                    key,
+                    &owners,
+                    &trait_uses,
+                    &mut visiting,
+                    &mut matching,
+                    &mut ambiguous,
+                );
+            }
+            (
+                matching.into_iter().collect::<BTreeSet<_>>(),
+                ambiguous,
+                visiting.is_empty(),
+            )
+        };
+        let mut outcomes = BTreeSet::new();
+        for owner in [
+            "site", "t1", "t2", "loop_a", "shadowed", "chain0", "owner_a", "unknown",
+        ] {
+            for key in ["fmt", "other"] {
+                let actual = run(owner, key, false);
+                assert_eq!(actual, run(owner, key, true), "{owner} / {key}");
+                assert!(actual.2, "{owner} / {key}: visiting を空に戻す");
+                outcomes.insert((actual.0.len(), actual.1));
+            }
+        }
+        // 空振り防止: 候補なし・1 つ・2 つ、ambiguous の有無がどれも現れる
+        assert!(outcomes.len() >= 4, "{outcomes:?}");
+    }
+
+    /// trait の鎖が長くても探索がスタックを使い切らない。子プロセスの 256 KiB のスタックで
+    /// 10 万段の鎖を辿り、末端の候補を見つける (再帰版はここで溢れて子プロセスごと落ちる)。
+    #[test]
+    fn trait_dispatch_targets_handle_long_trait_chain() {
+        crate::engine::tree_walk::run_deep_test_isolated(
+            module_path!(),
+            "trait_dispatch_targets_handle_long_trait_chain",
+            || {
+                const LENGTH: usize = 100_000;
+                let mut trait_uses = HashMap::new();
+                for i in 0..LENGTH {
+                    trait_uses.insert(
+                        format!("t{i}"),
+                        PhpTraitUses {
+                            traits: [format!("t{}", i + 1)].into_iter().collect(),
+                            has_adaptation: false,
+                            ambiguous: false,
+                            declared_methods: HashSet::new(),
+                        },
+                    );
+                }
+                let owners: HashSet<String> = [format!("t{LENGTH}")].into_iter().collect();
+                let (mut visiting, mut matching, mut ambiguous) =
+                    (HashSet::new(), HashSet::new(), false);
+                collect_php_trait_dispatch_targets(
+                    "t0",
+                    "fmt",
+                    &owners,
+                    &trait_uses,
+                    &mut visiting,
+                    &mut matching,
+                    &mut ambiguous,
+                );
+                assert_eq!(matching, owners);
+                assert!(!ambiguous && visiting.is_empty());
+            },
+        );
     }
 
     #[expect(clippy::too_many_arguments)]

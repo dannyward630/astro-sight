@@ -621,37 +621,21 @@ fn register_binding<'a>(
 /// すべて `Unresolvable` として登録する。中身の型は静的に辿れないため owner 推論は
 /// しない。収集漏れは shadow 見逃し → import owner への誤帰属 (fail-open) になる
 /// ため、未知の構造は全 named children を辿って leaf の identifier を漏らさない。
+///
+/// 束縛位置の規則 (`{ key: alias }` は value 側、default 付きは left 側だけ) はシンボル抽出や
+/// shadow 判定と同じなので `visit_pattern_bindings` を使う。深い入れ子のパターンでも
+/// スタックを使い切らない。
 fn register_pattern_bindings<'a>(
     pattern: Node<'a>,
     source: &'a [u8],
     bindings: &mut HashMap<&'a str, BindingFact<'a>>,
 ) {
-    match pattern.kind() {
-        "identifier" | "shorthand_property_identifier_pattern" => {
-            if let Ok(name) = pattern.utf8_text(source) {
-                register_binding(bindings, name, BindingSpec::Unresolvable);
-            }
+    let _ = crate::engine::js_binding_pattern::visit_pattern_bindings(pattern, &mut |binding| {
+        if let Ok(name) = binding.utf8_text(source) {
+            register_binding(bindings, name, BindingSpec::Unresolvable);
         }
-        // `{ key: alias }` の key 側は binding ではないため value 側のみ辿る。
-        "pair_pattern" => {
-            if let Some(v) = pattern.child_by_field_name("value") {
-                register_pattern_bindings(v, source, bindings);
-            }
-        }
-        // default 値の右辺 (`{ a = expr }` / `(x = expr)`) は参照であって binding
-        // ではないため left のみ辿る。
-        "assignment_pattern" | "object_assignment_pattern" => {
-            if let Some(l) = pattern.child_by_field_name("left") {
-                register_pattern_bindings(l, source, bindings);
-            }
-        }
-        _ => {
-            let mut cursor = pattern.walk();
-            for child in pattern.named_children(&mut cursor) {
-                register_pattern_bindings(child, source, bindings);
-            }
-        }
-    }
+        ControlFlow::Continue(())
+    });
 }
 
 /// ローカル変数 / パラメータの束縛を集める。
@@ -1712,6 +1696,8 @@ mod tests {
             "import { Alpha } from \"./alpha\";\nconst { fmt } = Alpha;\nconst { other: label } = Alpha;\nAlpha.label();\nconst { parse = fallback } = holder;\n",
             // JS の bare パラメータ・catch・for-of・関数名・class 式の名前
             "import { Alpha } from \"./alpha\";\nexport function run(Alpha, { Beta }) {\n  Alpha.fmt();\n  Beta.fmt();\n}\ntry { x(); } catch (Gamma) { Gamma.fmt(); }\nfor (const B of []) { B.label(); }\nfunction Beta() {}\nBeta.label();\n",
+            // 入れ子の分割代入 (別名・default・rest) による shadow
+            "import { Alpha, Beta } from \"./ab\";\nconst { a: [Other, { b: Beta }] } = bag;\nBeta.fmt();\nconst [[Gamma = new Alpha()], ...rest] = xs;\nGamma.fmt();\nrest.label();\nfunction h({ p: { q: [Alpha] } }) { Alpha.fmt(); }\nAlpha.label();\n",
         ];
         let owner_sets: [&[&str]; 5] = [
             &["Alpha", "Beta"],

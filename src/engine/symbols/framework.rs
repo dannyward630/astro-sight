@@ -120,42 +120,50 @@ fn php_method_return_type_matches(method_node: Node, source: &[u8], names: &[&st
     false
 }
 
-/// PHP の型ノードを再帰的に走査し、末尾の `name` が `names` のいずれかにマッチするか判定する。
+/// PHP の型ノードを走査し、末尾の `name` が `names` のいずれかにマッチするか判定する。
 /// `named_type` / `qualified_name` / `union_type` / `nullable_type` / `disjunctive_normal_form_type`
 /// 等に対応する。
+///
+/// 構文エラーの回復で型の位置に任意の部分木が入りうるので、1 段ごとに再帰せず明示スタックで
+/// 辿る (子は逆順に積み、再帰と同じ順に調べる)。
 fn php_type_node_tail_name_matches(node: Node, source: &[u8], names: &[&str]) -> bool {
-    match node.kind() {
-        "name" => node
-            .utf8_text(source)
+    let name_matches = |n: Node| {
+        n.utf8_text(source)
             .ok()
-            .is_some_and(|t| names.contains(&t.trim())),
-        "qualified_name" => {
-            // qualified_name の最後の `name` 子を取る (FQN の末尾セグメント)。
-            let mut last_name: Option<Node> = None;
-            let mut cursor = node.walk();
-            for c in node.children(&mut cursor) {
-                if c.kind() == "name" {
-                    last_name = Some(c);
-                }
-            }
-            last_name.is_some_and(|n| {
-                n.utf8_text(source)
-                    .ok()
-                    .is_some_and(|t| names.contains(&t.trim()))
-            })
-        }
-        _ => {
-            // 型ラッパ (named_type / nullable_type / union_type / intersection_type 等) は
-            // 子を再帰的に走査する。
-            let mut cursor = node.walk();
-            for c in node.children(&mut cursor) {
-                if php_type_node_tail_name_matches(c, source, names) {
+            .is_some_and(|t| names.contains(&t.trim()))
+    };
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "name" => {
+                if name_matches(node) {
                     return true;
                 }
             }
-            false
+            "qualified_name" => {
+                // qualified_name の最後の `name` 子を取る (FQN の末尾セグメント)。
+                let mut last_name: Option<Node> = None;
+                let mut cursor = node.walk();
+                for c in node.children(&mut cursor) {
+                    if c.kind() == "name" {
+                        last_name = Some(c);
+                    }
+                }
+                if last_name.is_some_and(name_matches) {
+                    return true;
+                }
+            }
+            _ => {
+                // 型ラッパ (named_type / nullable_type / union_type / intersection_type 等) は
+                // 子を辿る。
+                let first = stack.len();
+                let mut cursor = node.walk();
+                stack.extend(node.children(&mut cursor));
+                stack[first..].reverse();
+            }
         }
     }
+    false
 }
 
 /// `method_declaration` のメソッド名と enclosing class の implements 句を突き合わせ、
@@ -387,30 +395,54 @@ fn java_type_node_matches(
     }
 }
 
-/// `scoped_type_identifier` を再帰的に辿り、各識別子セグメントを `segments` に push する。
+/// `scoped_type_identifier` を辿り、各識別子セグメントを `segments` に push する。
 /// scoped_type_identifier の構造: `[scoped_type_identifier|scope] "." type_identifier`。
 /// 識別子以外の text (`.` トークンや空白) を比較対象から除くために用いる。
+///
+/// 修飾名 `a.b.c....T` は任意に長くでき、セグメントごとに左へ入れ子になるので、1 段ごとに
+/// 再帰せず明示スタックで辿る。再帰版と同じく子を先頭から順に処理し、入れ子の各段を辿り
+/// 終えた時点でセグメントが 1 つも無ければ false を返す。
 fn java_collect_scoped_type_segments<'a>(
     node: Node<'a>,
     source: &'a [u8],
     segments: &mut Vec<&'a str>,
 ) -> bool {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "scoped_type_identifier" | "scope" => {
-                if !java_collect_scoped_type_segments(child, source, segments) {
-                    return false;
+    enum Frame<'a> {
+        /// 修飾名のノード。子を順に処理してから `Exit` に戻る。
+        Scoped(Node<'a>),
+        /// 識別子のセグメント。
+        Segment(Node<'a>),
+        /// `Scoped` の子を処理し終えた。
+        Exit,
+    }
+    let mut stack = vec![Frame::Scoped(node)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Scoped(node) => {
+                stack.push(Frame::Exit);
+                let first = stack.len();
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    match child.kind() {
+                        "scoped_type_identifier" | "scope" => stack.push(Frame::Scoped(child)),
+                        "type_identifier" | "identifier" => stack.push(Frame::Segment(child)),
+                        _ => {}
+                    }
                 }
+                stack[first..].reverse();
             }
-            "type_identifier" | "identifier" => match child.utf8_text(source) {
+            Frame::Segment(child) => match child.utf8_text(source) {
                 Ok(text) => segments.push(text),
                 Err(_) => return false,
             },
-            _ => {}
+            Frame::Exit => {
+                if segments.is_empty() {
+                    return false;
+                }
+            }
         }
     }
-    !segments.is_empty()
+    true
 }
 
 /// Python の関数 / メソッド / クラスがフレームワーク登録デコレータ
@@ -1377,37 +1409,34 @@ fn php_return_type_is_self_or_static(decl: Node<'_>, source: &[u8]) -> bool {
 
 /// 本体に `return new self('NAME')` または `return new static('NAME')` があり、
 /// 引数の文字列リテラル内容が `method_name` と一致するかを判定する。
+///
+/// ネストした control flow (try/match/if) の中も探す。入れ子は任意に深くできるので、
+/// 1 段ごとに再帰せず前順の反復で探す。本体のノード自身は調べない (子から調べる)。
 fn php_body_returns_new_self_with_name(body: Node<'_>, source: &[u8], method_name: &str) -> bool {
-    let mut cursor = body.walk();
-    for child in body.children(&mut cursor) {
-        if php_node_returns_new_self_with_name(child, source, method_name) {
-            return true;
+    use std::ops::ControlFlow;
+
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+
+    walk_preorder(body, Children::All, |node, depth| {
+        if depth > 0 && php_return_creates_self_with_name(node, source, method_name) {
+            return ControlFlow::Break(());
         }
-    }
-    false
+        ControlFlow::Continue(Walk::Descend)
+    })
+    .is_break()
 }
 
-fn php_node_returns_new_self_with_name(node: Node<'_>, source: &[u8], method_name: &str) -> bool {
-    // return_statement → object_creation_expression を探す
-    if node.kind() == "return_statement" {
-        // return の expression を取得
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "object_creation_expression"
-                && php_object_creation_matches_name(child, source, method_name)
-            {
-                return true;
-            }
-        }
+/// `node` が `return new self('NAME')` / `return new static('NAME')` (NAME が `method_name`) か。
+fn php_return_creates_self_with_name(node: Node<'_>, source: &[u8], method_name: &str) -> bool {
+    if node.kind() != "return_statement" {
+        return false;
     }
-    // 再帰: ネストした control flow (try/match/if) の中も探す
+    // return の expression を取得
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if php_node_returns_new_self_with_name(child, source, method_name) {
-            return true;
-        }
-    }
-    false
+    node.children(&mut cursor).any(|child| {
+        child.kind() == "object_creation_expression"
+            && php_object_creation_matches_name(child, source, method_name)
+    })
 }
 
 fn php_object_creation_matches_name(node: Node<'_>, source: &[u8], method_name: &str) -> bool {
@@ -1603,5 +1632,217 @@ mod tests {
             },
         );
         assert!(checked > 20 && found > 0, "checked={checked} found={found}");
+    }
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn php_type_node_tail_name_matches_recursive(
+        node: Node,
+        source: &[u8],
+        names: &[&str],
+    ) -> bool {
+        match node.kind() {
+            "name" => node
+                .utf8_text(source)
+                .ok()
+                .is_some_and(|t| names.contains(&t.trim())),
+            "qualified_name" => {
+                let mut last_name: Option<Node> = None;
+                let mut cursor = node.walk();
+                for c in node.children(&mut cursor) {
+                    if c.kind() == "name" {
+                        last_name = Some(c);
+                    }
+                }
+                last_name.is_some_and(|n| {
+                    n.utf8_text(source)
+                        .ok()
+                        .is_some_and(|t| names.contains(&t.trim()))
+                })
+            }
+            _ => {
+                let mut cursor = node.walk();
+                for c in node.children(&mut cursor) {
+                    if php_type_node_tail_name_matches_recursive(c, source, names) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn java_collect_scoped_type_segments_recursive<'a>(
+        node: Node<'a>,
+        source: &'a [u8],
+        segments: &mut Vec<&'a str>,
+    ) -> bool {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "scoped_type_identifier" | "scope" => {
+                    if !java_collect_scoped_type_segments_recursive(child, source, segments) {
+                        return false;
+                    }
+                }
+                "type_identifier" | "identifier" => match child.utf8_text(source) {
+                    Ok(text) => segments.push(text),
+                    Err(_) => return false,
+                },
+                _ => {}
+            }
+        }
+        !segments.is_empty()
+    }
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn php_node_returns_new_self_with_name_recursive(
+        node: Node<'_>,
+        source: &[u8],
+        method_name: &str,
+    ) -> bool {
+        if node.kind() == "return_statement" {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "object_creation_expression"
+                    && php_object_creation_matches_name(child, source, method_name)
+                {
+                    return true;
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if php_node_returns_new_self_with_name_recursive(child, source, method_name) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn php_body_returns_new_self_with_name_recursive(
+        body: Node<'_>,
+        source: &[u8],
+        method_name: &str,
+    ) -> bool {
+        let mut cursor = body.walk();
+        for child in body.children(&mut cursor) {
+            if php_node_returns_new_self_with_name_recursive(child, source, method_name) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `kinds` に当たるノードを前順にすべて集める (浅い入力用)。
+    fn nodes_of_kinds<'t>(root: Node<'t>, kinds: &[&str]) -> Vec<Node<'t>> {
+        let mut out = Vec::new();
+        let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+            root,
+            crate::engine::tree_walk::Children::All,
+            |node, _| {
+                if kinds.is_empty() || kinds.contains(&node.kind()) {
+                    out.push(node);
+                }
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+            },
+        );
+        out
+    }
+
+    /// PHP の型の末尾名の照合は、明示スタックの版と再帰版で一致する。どのノードを根にしても
+    /// 比べる (nullable / union / intersection / DNF / 完全修飾名 / 組み込み型)。
+    #[test]
+    fn php_type_node_tail_name_matches_recursive_version() {
+        let source = "<?php\nclass K {\n\
+                      \x20 public static function a(): self { return new self(); }\n\
+                      \x20 public static function b(): ?static { return null; }\n\
+                      \x20 public function c(): \\App\\Models\\Foo { return $x; }\n\
+                      \x20 public function d(): A|B|null { return null; }\n\
+                      \x20 public function e(): (A&B)|C { return $y; }\n\
+                      \x20 public function f(): int { return 1; }\n\
+                      }\n";
+        let tree = crate::engine::parser::parse_source(source.as_bytes(), LangId::Php).unwrap();
+        let mut matched = 0;
+        let mut compared = 0;
+        for node in nodes_of_kinds(tree.root_node(), &[]) {
+            for names in [
+                &["self", "static"][..],
+                &["Foo"],
+                &["B"],
+                &["C"],
+                &["missing"],
+            ] {
+                let expected =
+                    php_type_node_tail_name_matches_recursive(node, source.as_bytes(), names);
+                assert_eq!(
+                    php_type_node_tail_name_matches(node, source.as_bytes(), names),
+                    expected,
+                    "{names:?} under {}",
+                    node.kind()
+                );
+                matched += usize::from(expected);
+                compared += 1;
+            }
+        }
+        assert!(
+            compared > 100 && matched > 10,
+            "compared={compared} matched={matched}"
+        );
+    }
+
+    /// Java の修飾名のセグメント収集は、明示スタックの版と再帰版で同じ結果と順序になる。
+    #[test]
+    fn java_collect_scoped_type_segments_matches_recursive_version() {
+        let source = "public class V1 extends org.flywaydb.core.api.migration.BaseJavaMigration \
+                      implements java.util.function.Supplier<a.b.C>, Plain {\n\
+                      \x20 java.util.Map<k.K, v.V> field;\n\
+                      }\n";
+        let tree = crate::engine::parser::parse_source(source.as_bytes(), LangId::Java).unwrap();
+        let nodes = nodes_of_kinds(tree.root_node(), &["scoped_type_identifier"]);
+        assert!(nodes.len() >= 8, "{}", nodes.len());
+        for node in nodes {
+            let mut actual = Vec::new();
+            let actual_ok = java_collect_scoped_type_segments(node, source.as_bytes(), &mut actual);
+            let mut expected = Vec::new();
+            let expected_ok =
+                java_collect_scoped_type_segments_recursive(node, source.as_bytes(), &mut expected);
+            assert_eq!((actual_ok, &actual), (expected_ok, &expected));
+            assert!(actual_ok && actual.len() >= 2, "{actual:?}");
+        }
+    }
+
+    /// `return new self('NAME')` の探索は、前順の反復版と再帰版で一致する
+    /// (if / try / match の中、名前違い、self 以外の new、return の無い本体を含む)。
+    #[test]
+    fn php_body_returns_new_self_matches_recursive_version() {
+        let source = "<?php\nfinal class Status {\n\
+                      \x20 public static function A(): self { return new self('A'); }\n\
+                      \x20 public static function B(): static { if ($x) { try { return new static('B'); } catch (E $e) {} } return new self('Z'); }\n\
+                      \x20 public static function C(): self { return match ($v) { 1 => new self('C'), default => new Other('C') }; }\n\
+                      \x20 public static function D(): self { $n = new self('D'); return $n; }\n\
+                      \x20 public static function E(): self { }\n\
+                      }\n";
+        let tree = crate::engine::parser::parse_source(source.as_bytes(), LangId::Php).unwrap();
+        let bodies: Vec<Node> = nodes_of_kinds(tree.root_node(), &["method_declaration"])
+            .into_iter()
+            .filter_map(|m| m.child_by_field_name("body"))
+            .collect();
+        assert_eq!(bodies.len(), 5);
+        let mut found = 0;
+        for body in bodies {
+            for name in ["A", "B", "C", "D", "Z", "missing"] {
+                let expected =
+                    php_body_returns_new_self_with_name_recursive(body, source.as_bytes(), name);
+                assert_eq!(
+                    php_body_returns_new_self_with_name(body, source.as_bytes(), name),
+                    expected,
+                    "{name} in {:?}",
+                    body.utf8_text(source.as_bytes())
+                );
+                found += usize::from(expected);
+            }
+        }
+        assert!(found >= 3, "{found}");
     }
 }

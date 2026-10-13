@@ -984,3 +984,216 @@ fn api_bash_source_candidates_handle_deep_subshells() {
         );
     }
 }
+
+fn names_in(json: &serde_json::Value, key: &str) -> Vec<String> {
+    let mut names: Vec<String> = json[key]
+        .as_array()
+        .unwrap_or_else(|| panic!("{key} の配列が必要"))
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    names.sort();
+    names
+}
+
+/// symbols: 深い分割代入パターン (`export const [[[…x]]] = v;`) を束縛ごとのシンボルにする処理が
+/// 落ちず、深い宣言の後ろの関数まで抽出する。
+#[test]
+fn symbols_handles_deep_destructuring_pattern() {
+    let repo = TestRepo::new();
+    repo.write(
+        "deep.ts",
+        format!(
+            "export const {} = v;\nexport function after() {{ return 1; }}\n",
+            nested("[", "x", "]", 50_000)
+        ),
+    );
+    let mut command = cargo_bin();
+    command
+        .current_dir(repo.root())
+        .args(["symbols", "--no-cache", "--path", "deep.ts"]);
+    let stdout = assert_finished("symbols", &run_bounded(command, None));
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("symbols JSON");
+    assert_eq!(names_in(&json, "symbols"), ["after", "x"]);
+}
+
+/// refs: Rust の closure 引数のパターンが深く入れ子になっていても (`|((((y,),),),)| x`)、
+/// 検索名を束縛しているかの判定が落ちない。束縛していない名前 (`x`) は closure の本体でも
+/// 参照として数え、深い closure の後ろの呼び出しも数える。
+#[test]
+fn refs_handles_deep_closure_parameter_pattern() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "src/lib.rs",
+        format!(
+            "pub fn x() -> u32 {{ 1 }}\npub fn caller() -> u32 {{\n    let f = |{}| x;\n    let _ = f;\n    x()\n}}\n",
+            nested("(", "y", ",)", 50_000)
+        ),
+    );
+    let mut command = cargo_bin();
+    command
+        .args(["refs", "--name", "x", "--dir"])
+        .arg(repo.root());
+    let stdout = assert_finished("refs", &run_bounded(command, None));
+    let refs: Vec<(u64, String)> = parse_lines(&stdout)[0]["refs"]
+        .as_array()
+        .expect("refs")
+        .iter()
+        .map(|r| {
+            (
+                r["ln"].as_u64().unwrap_or_default(),
+                r["kind"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        refs,
+        vec![
+            (0, "def".to_string()),
+            (2, "ref".to_string()),
+            (4, "ref".to_string())
+        ]
+    );
+}
+
+/// lint: 深い式を持つファイルでもテキストパターンの照合が落ちず、深い式の中と後ろの
+/// 両方の一致を返す。
+#[test]
+fn lint_handles_deep_expressions() {
+    let repo = TestRepo::new();
+    repo.write(
+        "deep.js",
+        format!(
+            "export const v = {};\nexport const after = needle_after;\n",
+            nested("(", "needle", ")", 50_000)
+        ),
+    );
+    repo.write(
+        "rules.yaml",
+        "- id: needle\n  language: javascript\n  pattern: needle\n  severity: warning\n  message: found\n",
+    );
+    let mut command = cargo_bin();
+    command
+        .current_dir(repo.root())
+        .args(["lint", "--path", "deep.js", "--rules", "rules.yaml"]);
+    let stdout = assert_finished("lint", &run_bounded(command, None));
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("lint JSON");
+    let matches: Vec<(u64, &str)> = json["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .map(|m| {
+            (
+                m["line"].as_u64().unwrap_or_default(),
+                m["matched_text"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(matches, [(0, "needle"), (1, "needle_after")]);
+}
+
+/// calls: 宣言子が深く入れ子になった C の関数 (`int ****…f(void)`) でも、呼び出し元の名前の
+/// 取り出しが落ちない。深い関数と後ろの関数の呼び出しを両方返す。
+#[test]
+fn calls_handles_deep_pointer_declarator() {
+    let repo = TestRepo::new();
+    repo.write(
+        "deep.c",
+        format!(
+            "int g(void) {{ return 1; }}\nint {}f(void) {{ return g(); }}\nint after(void) {{ return g(); }}\n",
+            "*".repeat(50_000)
+        ),
+    );
+    let mut command = cargo_bin();
+    command
+        .current_dir(repo.root())
+        .args(["calls", "--path", "deep.c"]);
+    let stdout = assert_finished("calls", &run_bounded(command, None));
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("calls JSON");
+    let calls: Vec<(String, Vec<String>)> = json["calls"]
+        .as_array()
+        .expect("calls")
+        .iter()
+        .map(|c| {
+            (
+                c["caller"].as_str().unwrap_or_default().to_string(),
+                c["callees"]
+                    .as_array()
+                    .expect("callees")
+                    .iter()
+                    .filter_map(|callee| callee["name"].as_str().map(str::to_string))
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        vec![
+            ("f".to_string(), vec!["g".to_string()]),
+            ("after".to_string(), vec!["g".to_string()])
+        ]
+    );
+}
+
+/// dead-code: 深い入力で、Java の長い修飾名の照合 (Flyway の基底クラス判定)、PHP の深い
+/// 制御構造の中の `return new self('X')` (疑似 enum の判定)、JS/TS の引数の深い分割代入
+/// (同名メンバーの帰属で束縛を集める処理)、`**` が長く続く `.gitattributes` の照合が落ちず、
+/// それぞれの結論 (疑似 enum の値は dead にしない・帰属できた `Alpha.fmt` は live・
+/// 生成物は候補から外す) を変えない。
+#[test]
+fn dead_code_handles_deep_names_conditions_patterns_and_gitattributes() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "src/Deep.java",
+        format!(
+            "public class Deep extends {}Base {{ }}\n",
+            "a.".repeat(50_000)
+        ),
+    );
+    repo.write(
+        "src/Status.php",
+        format!(
+            "<?php\nfinal class Status {{\n    public static function ACTIVE(): self {{\n        {}return new self('ACTIVE');{}\n    }}\n}}\n",
+            "if (true) { ".repeat(20_000),
+            " }".repeat(20_000)
+        ),
+    );
+    repo.write(
+        "src/alpha.ts",
+        "export class Alpha {\n  fmt(): number { return 1; }\n}\n",
+    );
+    repo.write(
+        "src/beta.ts",
+        "export class Beta {\n  fmt(): number { return 2; }\n}\n",
+    );
+    repo.write(
+        "src/use.ts",
+        format!(
+            "import {{ Alpha }} from \"./alpha\";\nfunction g({}) {{ return deep; }}\nexport const out = new Alpha().fmt() + g([]);\n",
+            nested("[", "deep", "]", 200_000)
+        ),
+    );
+    repo.write(
+        ".gitattributes",
+        format!("{}gen.ts linguist-generated\n", "**/".repeat(200_000)),
+    );
+    repo.write(
+        "src/gen.ts",
+        "export function generatedHelper() { return 1; }\n",
+    );
+
+    let mut command = cargo_bin();
+    command.args(["dead-code", "--dir"]).arg(repo.root());
+    let stdout = assert_finished("dead-code", &run_bounded(command, None));
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("dead-code JSON");
+    assert_eq!(
+        names_in(&json, "dead_symbols"),
+        ["Beta", "Beta.fmt", "Deep", "Status", "out"]
+    );
+    assert_eq!(
+        json["generated_candidates_skipped"]["paths"],
+        serde_json::json!(["src/gen.ts"])
+    );
+}

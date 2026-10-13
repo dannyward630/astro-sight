@@ -223,6 +223,10 @@ pub(crate) fn is_rust_shadowable_value_identifier(node: Node<'_>) -> bool {
 /// 辿らない。未知のパターン種別は辿らず `false` を返す (= 参照として残す安全側。
 /// 束縛の取りこぼしは従来どおりの過大計上に戻るだけだが、逆に非束縛を束縛と誤れば
 /// 本物の参照を消してしまう)。
+///
+/// パターンは `((((x,),),),)` のように任意に深く入れ子にできるので、再帰ではなく明示スタックで
+/// 辿る (入れ子 1 段ごとに再帰するとスタックを使い切ってプロセスごと落ちる)。子は逆順に積み、
+/// 再帰で辿った場合と同じ順に調べて、最初に束縛が見つかった時点で終える。
 pub(crate) fn rust_pattern_binds_name(
     node: Node<'_>,
     name: &str,
@@ -230,45 +234,59 @@ pub(crate) fn rust_pattern_binds_name(
     cache: &RustPatternBindingCache,
 ) -> bool {
     let matches_name = |n: Node<'_>| n.utf8_text(source).is_ok_and(|text| text == name);
-    match node.kind() {
-        // `|tail|` / `|(_, tail)|` の束縛位置。
-        //
-        // パターン中の bare identifier は必ずしも束縛ではない — 単位構造体 (`|Unit| ()`)
-        // や定数 (`|MAX| ()`) との照合も同じノードになり、こちらは束縛ではなく参照。
-        "identifier" => {
-            matches_name(node) && rust_pattern_name_is_binding(node, name, source, cache)
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        let first = stack.len();
+        let binds = match node.kind() {
+            // `|tail|` / `|(_, tail)|` の束縛位置。
+            //
+            // パターン中の bare identifier は必ずしも束縛ではない — 単位構造体 (`|Unit| ()`)
+            // や定数 (`|MAX| ()`) との照合も同じノードになり、こちらは束縛ではなく参照。
+            "identifier" => {
+                matches_name(node) && rust_pattern_name_is_binding(node, name, source, cache)
+            }
+            // `Foo { tail }` の shorthand。フィールド名は常に束縛なので命名規約の制約は不要
+            "shorthand_field_identifier" => matches_name(node),
+            // `Foo(tail)` / `Foo { .. }` の `type:` は型参照なので飛ばす
+            "tuple_struct_pattern" | "struct_pattern" => {
+                let type_node = node.child_by_field_name("type");
+                let mut cursor = node.walk();
+                stack.extend(
+                    node.children(&mut cursor)
+                        .filter(|child| type_node.is_none_or(|t| t.id() != child.id())),
+                );
+                false
+            }
+            // `Foo { key: tail }` は `pattern:` 側だけが束縛。shorthand なら `name:` が束縛
+            "field_pattern" => match node.child_by_field_name("pattern") {
+                Some(pattern) => {
+                    stack.push(pattern);
+                    false
+                }
+                None => node
+                    .child_by_field_name("name")
+                    .is_some_and(|n| n.kind() == "shorthand_field_identifier" && matches_name(n)),
+            },
+            // `|tail: u8|` は `parameter pattern: (identifier) type: (primitive_type)`
+            "parameter" => {
+                stack.extend(node.child_by_field_name("pattern"));
+                false
+            }
+            // 束縛を包むだけのパターン。子をそのまま辿る
+            "closure_parameters" | "tuple_pattern" | "slice_pattern" | "reference_pattern"
+            | "ref_pattern" | "mut_pattern" | "captured_pattern" | "or_pattern" => {
+                let mut cursor = node.walk();
+                stack.extend(node.children(&mut cursor));
+                false
+            }
+            _ => false,
+        };
+        if binds {
+            return true;
         }
-        // `Foo { tail }` の shorthand。フィールド名は常に束縛なので命名規約の制約は不要
-        "shorthand_field_identifier" => matches_name(node),
-        // `Foo(tail)` / `Foo { .. }` の `type:` は型参照なので飛ばす
-        "tuple_struct_pattern" | "struct_pattern" => {
-            let type_node = node.child_by_field_name("type");
-            let mut cursor = node.walk();
-            node.children(&mut cursor).any(|child| {
-                type_node.is_none_or(|t| t.id() != child.id())
-                    && rust_pattern_binds_name(child, name, source, cache)
-            })
-        }
-        // `Foo { key: tail }` は `pattern:` 側だけが束縛。shorthand なら `name:` が束縛
-        "field_pattern" => match node.child_by_field_name("pattern") {
-            Some(pattern) => rust_pattern_binds_name(pattern, name, source, cache),
-            None => node
-                .child_by_field_name("name")
-                .is_some_and(|n| n.kind() == "shorthand_field_identifier" && matches_name(n)),
-        },
-        // `|tail: u8|` は `parameter pattern: (identifier) type: (primitive_type)`
-        "parameter" => node
-            .child_by_field_name("pattern")
-            .is_some_and(|pattern| rust_pattern_binds_name(pattern, name, source, cache)),
-        // 束縛を包むだけのパターン。子をそのまま辿る
-        "closure_parameters" | "tuple_pattern" | "slice_pattern" | "reference_pattern"
-        | "ref_pattern" | "mut_pattern" | "captured_pattern" | "or_pattern" => {
-            let mut cursor = node.walk();
-            node.children(&mut cursor)
-                .any(|child| rust_pattern_binds_name(child, name, source, cache))
-        }
-        _ => false,
+        stack[first..].reverse();
     }
+    false
 }
 
 /// パターン中の bare identifier が「束縛」か「定数・単位構造体パターン」かを判定する。

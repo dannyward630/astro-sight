@@ -183,12 +183,18 @@ fn extract_cpp_typedef_tag_aliases(
 }
 
 /// typedef の declarator から alias 名を取り出す (pointer/array declarator を剥がす)。
+///
+/// 宣言子は `typedef struct s ****p;` のように任意に深く入れ子にできるので、
+/// 1 段ごとに再帰せずループで剥がす。
 fn cpp_declarator_name(decl: Node<'_>, source: &[u8]) -> Option<String> {
-    match decl.kind() {
-        "type_identifier" | "identifier" => decl.utf8_text(source).ok().map(|s| s.to_string()),
-        _ => decl
-            .child_by_field_name("declarator")
-            .and_then(|d| cpp_declarator_name(d, source)),
+    let mut decl = decl;
+    loop {
+        match decl.kind() {
+            "type_identifier" | "identifier" => {
+                return decl.utf8_text(source).ok().map(|s| s.to_string());
+            }
+            _ => decl = decl.child_by_field_name("declarator")?,
+        }
     }
 }
 
@@ -259,4 +265,74 @@ pub(super) fn is_exported_cpp(node: Node<'_>, source: &[u8]) -> bool {
         sibling = s.prev_sibling();
     }
     default_public
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::parser;
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn cpp_declarator_name_recursive(decl: Node<'_>, source: &[u8]) -> Option<String> {
+        match decl.kind() {
+            "type_identifier" | "identifier" => decl.utf8_text(source).ok().map(|s| s.to_string()),
+            _ => decl
+                .child_by_field_name("declarator")
+                .and_then(|d| cpp_declarator_name_recursive(d, source)),
+        }
+    }
+
+    /// typedef の alias 名の取り出しは、ループ版と再帰版で一致する
+    /// (ポインタ・配列・関数ポインタ・括弧の宣言子を含む)。
+    #[test]
+    fn cpp_declarator_name_matches_recursive_version() {
+        let source = "typedef struct s { int v; } s_t, *s_p, **s_pp, s_arr[3], (*s_fn)(int), *(*s_nested)[2];\n\
+                      typedef enum { RED } color_t, *color_p;\n\
+                      typedef int (*cb_t)(void);\n";
+        for lang in [LangId::C, LangId::Cpp] {
+            let tree = parser::parse_source(source.as_bytes(), lang).unwrap();
+            let root = tree.root_node();
+            let mut cursor = root.walk();
+            let mut compared = 0;
+            for definition in root.named_children(&mut cursor) {
+                let mut inner = definition.walk();
+                for decl in definition.children_by_field_name("declarator", &mut inner) {
+                    assert_eq!(
+                        cpp_declarator_name(decl, source.as_bytes()),
+                        cpp_declarator_name_recursive(decl, source.as_bytes()),
+                        "{lang:?}: {:?}",
+                        decl.utf8_text(source.as_bytes())
+                    );
+                    compared += 1;
+                }
+            }
+            assert_eq!(compared, 9, "{lang:?}");
+        }
+    }
+
+    /// typedef の宣言子が深く入れ子になっていても (`typedef struct node {..} ****…p;`)、
+    /// alias 名の取り出しがスタックを使い切らない。子プロセスの 256 KiB のスタックで
+    /// 2 万段のポインタ宣言子を辿って alias を見つける (再帰版はここで溢れて子プロセスごと落ちる)。
+    #[test]
+    fn cpp_declarator_name_handles_deep_pointer_declarators() {
+        crate::engine::tree_walk::run_deep_test_isolated(
+            module_path!(),
+            "cpp_declarator_name_handles_deep_pointer_declarators",
+            || {
+                let source = format!(
+                    "typedef struct node {{ int v; }} {}node_p;\n",
+                    "*".repeat(20_000)
+                );
+                let tree = parser::parse_source(source.as_bytes(), LangId::C).unwrap();
+                assert_eq!(
+                    collect_cpp_dead_liveness_aliases(
+                        tree.root_node(),
+                        source.as_bytes(),
+                        LangId::C
+                    ),
+                    vec![("node".to_string(), vec!["node_p".to_string()])]
+                );
+            },
+        );
+    }
 }

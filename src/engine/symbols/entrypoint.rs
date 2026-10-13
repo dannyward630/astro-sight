@@ -353,22 +353,28 @@ fn java_is_string_type(ty: Node, source: &[u8]) -> bool {
 
 /// 型本体 (ネストした型を含む) に入口の `main` があるか。メソッド本体・フィールド初期化子
 /// (匿名クラス) の中は辿らない。
+///
+/// 型は任意に深く入れ子にできるので、1 段ごとに再帰せず明示スタックで辿る (C# / Kotlin も同じ)。
+/// メンバーは逆順に積み、再帰で辿った場合と同じ順に調べる。
 fn java_type_declares_main(type_node: Node, source: &[u8]) -> bool {
-    type_node
-        .child_by_field_name("body")
-        .is_some_and(|body| java_body_declares_main(body, source))
-}
-
-fn java_body_declares_main(body: Node, source: &[u8]) -> bool {
-    let mut cursor = body.walk();
-    body.named_children(&mut cursor)
-        .any(|member| match member.kind() {
-            "method_declaration" => is_java_main(member, source),
+    let mut members = Vec::new();
+    push_named_children_reversed(type_node.child_by_field_name("body"), &mut members);
+    while let Some(member) = members.pop() {
+        match member.kind() {
+            "method_declaration" => {
+                if is_java_main(member, source) {
+                    return true;
+                }
+            }
             // enum 定数の後ろのメンバー宣言は enum_body_declarations にまとまる。
-            "enum_body_declarations" => java_body_declares_main(member, source),
-            kind if JAVA_TYPE_KINDS.contains(&kind) => java_type_declares_main(member, source),
-            _ => false,
-        })
+            "enum_body_declarations" => push_named_children_reversed(Some(member), &mut members),
+            kind if JAVA_TYPE_KINDS.contains(&kind) => {
+                push_named_children_reversed(member.child_by_field_name("body"), &mut members);
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 // --- C# ---
@@ -439,16 +445,22 @@ fn csharp_type_may_be_string_array(ty: Node, source: &[u8]) -> bool {
 }
 
 fn csharp_type_declares_main(type_node: Node, source: &[u8]) -> bool {
-    let Some(body) = type_node.child_by_field_name("body") else {
-        return false;
-    };
-    let mut cursor = body.walk();
-    body.named_children(&mut cursor)
-        .any(|member| match member.kind() {
-            "method_declaration" => is_csharp_main(member, source),
-            kind if CSHARP_TYPE_KINDS.contains(&kind) => csharp_type_declares_main(member, source),
-            _ => false,
-        })
+    let mut members = Vec::new();
+    push_named_children_reversed(type_node.child_by_field_name("body"), &mut members);
+    while let Some(member) = members.pop() {
+        match member.kind() {
+            "method_declaration" => {
+                if is_csharp_main(member, source) {
+                    return true;
+                }
+            }
+            kind if CSHARP_TYPE_KINDS.contains(&kind) => {
+                push_named_children_reversed(member.child_by_field_name("body"), &mut members);
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 // --- Kotlin ---
@@ -515,24 +527,47 @@ fn kotlin_has_annotation(declaration: Node, name: &str, source: &[u8]) -> bool {
 }
 
 fn kotlin_type_declares_main(type_node: Node, source: &[u8]) -> bool {
+    let mut members = Vec::new();
+    push_named_children_reversed(kotlin_type_body(type_node), &mut members);
+    while let Some(member) = members.pop() {
+        match member.kind() {
+            "function_declaration" => {
+                if is_kotlin_main(member, source) {
+                    return true;
+                }
+            }
+            "companion_object" => {
+                push_named_children_reversed(kotlin_type_body(member), &mut members);
+            }
+            kind if KOTLIN_TYPE_KINDS.contains(&kind) => {
+                push_named_children_reversed(kotlin_type_body(member), &mut members);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Kotlin の型宣言の本体 (`class_body` / `enum_class_body`)。
+fn kotlin_type_body(type_node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = type_node.walk();
-    let Some(body) = type_node
+    type_node
         .named_children(&mut cursor)
         .find(|child| KOTLIN_BODY_KINDS.contains(&child.kind()))
-    else {
-        return false;
-    };
-    let mut inner = body.walk();
-    body.named_children(&mut inner)
-        .any(|member| match member.kind() {
-            "function_declaration" => is_kotlin_main(member, source),
-            "companion_object" => kotlin_type_declares_main(member, source),
-            kind if KOTLIN_TYPE_KINDS.contains(&kind) => kotlin_type_declares_main(member, source),
-            _ => false,
-        })
 }
 
 // --- 共通ヘルパー ---
+
+/// `node` の named children を、後ろから取り出すと先頭から順になるよう逆順に積む。
+fn push_named_children_reversed<'tree>(node: Option<Node<'tree>>, stack: &mut Vec<Node<'tree>>) {
+    let Some(node) = node else {
+        return;
+    };
+    let first = stack.len();
+    let mut cursor = node.walk();
+    stack.extend(node.named_children(&mut cursor));
+    stack[first..].reverse();
+}
 
 /// ファイル直下 (親がルートノード) の宣言か。
 fn is_top_level(node: Node) -> bool {
@@ -567,6 +602,7 @@ fn bracket_count(node: Node, source: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::parser;
 
     /// 各言語の判定が依存するノード名。`function_kinds` / `owner_type_kinds` と同じく
     /// `LangId` を catch-all なしで全列挙し、文法に実在することを検証する
@@ -860,5 +896,222 @@ fun main(a: Int, b: Int) {}
         assert_entrypoints(LangId::Go, "package main\n\nfunc Main() {}\n", &[]);
         assert_entrypoints(LangId::Python, "def main():\n    pass\n", &[]);
         assert_entrypoints(LangId::Typescript, "export function main() {}\n", &[]);
+    }
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。Java は型と本体の相互再帰だった。
+    fn java_type_declares_main_recursive(type_node: Node, source: &[u8]) -> bool {
+        type_node
+            .child_by_field_name("body")
+            .is_some_and(|body| java_body_declares_main_recursive(body, source))
+    }
+
+    fn java_body_declares_main_recursive(body: Node, source: &[u8]) -> bool {
+        let mut cursor = body.walk();
+        body.named_children(&mut cursor)
+            .any(|member| match member.kind() {
+                "method_declaration" => is_java_main(member, source),
+                "enum_body_declarations" => java_body_declares_main_recursive(member, source),
+                kind if JAVA_TYPE_KINDS.contains(&kind) => {
+                    java_type_declares_main_recursive(member, source)
+                }
+                _ => false,
+            })
+    }
+
+    fn csharp_type_declares_main_recursive(type_node: Node, source: &[u8]) -> bool {
+        let Some(body) = type_node.child_by_field_name("body") else {
+            return false;
+        };
+        let mut cursor = body.walk();
+        body.named_children(&mut cursor)
+            .any(|member| match member.kind() {
+                "method_declaration" => is_csharp_main(member, source),
+                kind if CSHARP_TYPE_KINDS.contains(&kind) => {
+                    csharp_type_declares_main_recursive(member, source)
+                }
+                _ => false,
+            })
+    }
+
+    fn kotlin_type_declares_main_recursive(type_node: Node, source: &[u8]) -> bool {
+        let mut cursor = type_node.walk();
+        let Some(body) = type_node
+            .named_children(&mut cursor)
+            .find(|child| KOTLIN_BODY_KINDS.contains(&child.kind()))
+        else {
+            return false;
+        };
+        let mut inner = body.walk();
+        body.named_children(&mut inner)
+            .any(|member| match member.kind() {
+                "function_declaration" => is_kotlin_main(member, source),
+                "companion_object" => kotlin_type_declares_main_recursive(member, source),
+                kind if KOTLIN_TYPE_KINDS.contains(&kind) => {
+                    kotlin_type_declares_main_recursive(member, source)
+                }
+                _ => false,
+            })
+    }
+
+    /// `kinds` に当たるノードをすべて集める (浅い入力用)。
+    fn nodes_of_kinds<'t>(root: Node<'t>, kinds: &[&str]) -> Vec<Node<'t>> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if kinds.contains(&node.kind()) {
+                out.push(node);
+            }
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            stack.extend(children.into_iter().rev());
+        }
+        out
+    }
+
+    /// 入れ子の型に入口があるかの判定は、明示スタックの版と再帰版で一致する。
+    /// 入口が外側・内側・enum の宣言部・companion object にある型と、入口が無い型を含む。
+    #[test]
+    fn type_declares_main_matches_recursive_version() {
+        let java = "class Outer {\n\
+                    \x20 class Mid { class Inner { public static void main(String[] a) {} } }\n\
+                    \x20 enum E { A; class InEnum { static void main(String... a) {} } }\n\
+                    \x20 interface I { record R(int x) { public static void main(String[] a) {} } }\n\
+                    \x20 class Empty { void run() {} }\n\
+                    }\n\
+                    enum Top { X; public static void main(String[] args) {} }\n";
+        let csharp = "class Outer {\n\
+                      \x20 class Mid { struct Inner { static void Main() {} } }\n\
+                      \x20 record R { static int Main(string[] a) { return 0; } }\n\
+                      \x20 interface I { void Run(); }\n\
+                      \x20 class Empty { void Run() {} }\n\
+                      }\n";
+        // tree-sitter-kotlin 0.3.5 は 1 行に詰めた入れ子の本体を ERROR にするので、改行して書く。
+        let kotlin = "class Outer {\n\
+                      \x20 class Mid {\n\
+                      \x20   object Inner {\n\
+                      \x20     @JvmStatic fun main(args: Array<String>) {}\n\
+                      \x20   }\n\
+                      \x20 }\n\
+                      \x20 companion object {\n\
+                      \x20   @JvmStatic fun main() {}\n\
+                      \x20 }\n\
+                      \x20 class Empty {\n\
+                      \x20   fun run() {}\n\
+                      \x20 }\n\
+                      }\n\
+                      enum class Color {\n\
+                      \x20 RED;\n\
+                      \x20 object Nested {\n\
+                      \x20   @JvmStatic fun main() {}\n\
+                      \x20 }\n\
+                      }\n";
+        type Search = fn(Node, &[u8]) -> bool;
+        let cases: [(LangId, &str, &[&str], Search, Search); 3] = [
+            (
+                LangId::Java,
+                java,
+                JAVA_TYPE_KINDS,
+                java_type_declares_main,
+                java_type_declares_main_recursive,
+            ),
+            (
+                LangId::CSharp,
+                csharp,
+                CSHARP_TYPE_KINDS,
+                csharp_type_declares_main,
+                csharp_type_declares_main_recursive,
+            ),
+            (
+                LangId::Kotlin,
+                kotlin,
+                &[
+                    "class_declaration",
+                    "object_declaration",
+                    "companion_object",
+                ],
+                kotlin_type_declares_main,
+                kotlin_type_declares_main_recursive,
+            ),
+        ];
+        for (lang, source, kinds, iterative, recursive) in cases {
+            let tree = parser::parse_source(source.as_bytes(), lang).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{lang:?}: 入力が正しく parse できる"
+            );
+            let types = nodes_of_kinds(tree.root_node(), kinds);
+            assert!(types.len() >= 5, "{lang:?}: {}", types.len());
+            let (mut found, mut missing) = (0, 0);
+            for node in types {
+                let actual = iterative(node, source.as_bytes());
+                assert_eq!(
+                    actual,
+                    recursive(node, source.as_bytes()),
+                    "{lang:?}: {:?}",
+                    node.utf8_text(source.as_bytes())
+                        .map(|t| t.lines().next().unwrap_or(""))
+                );
+                if actual {
+                    found += 1;
+                } else {
+                    missing += 1;
+                }
+            }
+            // 空振り防止: 入口がある型と無い型の両方を比べている
+            assert!(
+                found >= 2 && missing >= 1,
+                "{lang:?}: found={found} missing={missing}"
+            );
+        }
+    }
+
+    /// 型が深く入れ子になっていても、入口の探索がスタックを使い切らない。
+    /// 子プロセスの 256 KiB のスタックで 5,000 段の入れ子を辿り、最も内側の入口を見つける
+    /// (再帰版はここで溢れて子プロセスごと落ちる)。
+    #[test]
+    fn type_declares_main_handles_deeply_nested_types() {
+        crate::engine::tree_walk::run_deep_test_isolated(
+            module_path!(),
+            "type_declares_main_handles_deeply_nested_types",
+            || {
+                const DEPTH: usize = 5_000;
+                let nest = |open: &str, inner: &str| {
+                    let mut s = inner.to_string();
+                    for i in (0..DEPTH).rev() {
+                        s = format!("{}{s}}}\n", open.replace("{i}", &i.to_string()));
+                    }
+                    s
+                };
+                let cases = [
+                    (
+                        LangId::Java,
+                        nest("class C{i} {\n", "public static void main(String[] a) {}\n"),
+                    ),
+                    (
+                        LangId::CSharp,
+                        nest("class C{i} {\n", "static void Main() {}\n"),
+                    ),
+                    (
+                        LangId::Kotlin,
+                        nest(
+                            "class C{i} {\n",
+                            "companion object { @JvmStatic fun main() {} }\n",
+                        ),
+                    ),
+                ];
+                for (lang, source) in cases {
+                    let tree = parser::parse_source(source.as_bytes(), lang).unwrap();
+                    let root = tree.root_node();
+                    let mut cursor = root.walk();
+                    let outer = root
+                        .named_children(&mut cursor)
+                        .find(|n| n.kind() == "class_declaration")
+                        .expect("outer class");
+                    assert!(
+                        type_declares_entrypoint(outer, source.as_bytes(), lang),
+                        "{lang:?}: 最も内側の入口を見つける"
+                    );
+                }
+            },
+        );
     }
 }

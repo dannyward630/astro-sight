@@ -21,30 +21,31 @@ use tree_sitter::Node;
 ///   named child を再帰する
 ///
 /// `visit` が `Break` を返すと走査を打ち切り、`Break` を返す。
+///
+/// パターンは `[[[x]]]` のように任意に深く入れ子にできるので、再帰ではなく明示スタックで
+/// 辿る (入れ子 1 段ごとに再帰するとスタックを使い切ってプロセスごと落ちる)。子は逆順に
+/// 積み、再帰で辿った場合と同じ source 順に訪れる。
 pub(crate) fn visit_pattern_bindings<'a>(
     pattern: Node<'a>,
     visit: &mut impl FnMut(Node<'a>) -> ControlFlow<()>,
 ) -> ControlFlow<()> {
-    match pattern.kind() {
-        "identifier" | "shorthand_property_identifier_pattern" => visit(pattern),
-        "pair_pattern" => match pattern.child_by_field_name("value") {
-            Some(value) => visit_pattern_bindings(value, visit),
-            None => ControlFlow::Continue(()),
-        },
-        "assignment_pattern" | "object_assignment_pattern" => {
-            match pattern.child_by_field_name("left") {
-                Some(left) => visit_pattern_bindings(left, visit),
-                None => ControlFlow::Continue(()),
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => visit(node)?,
+            "pair_pattern" => stack.extend(node.child_by_field_name("value")),
+            "assignment_pattern" | "object_assignment_pattern" => {
+                stack.extend(node.child_by_field_name("left"));
             }
-        }
-        _ => {
-            let mut cursor = pattern.walk();
-            for child in pattern.named_children(&mut cursor) {
-                visit_pattern_bindings(child, visit)?;
+            _ => {
+                let first = stack.len();
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+                stack[first..].reverse();
             }
-            ControlFlow::Continue(())
         }
     }
+    ControlFlow::Continue(())
 }
 
 /// `node` (identifier) が変数宣言 (`const` / `let` / `var`) の分割代入パターン内の
@@ -148,5 +149,95 @@ mod tests {
         // パラメータ・loop 変数・代入式の識別子は対象外。shorthand (`{ c }`) は
         // identifier ではない別ノードなので、そもそも refs の判定対象に来ない。
         assert_eq!(binding, ["bb", "v", "rest", "x"]);
+    }
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn visit_pattern_bindings_recursive<'a>(
+        pattern: Node<'a>,
+        visit: &mut impl FnMut(Node<'a>) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        match pattern.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => visit(pattern),
+            "pair_pattern" => match pattern.child_by_field_name("value") {
+                Some(value) => visit_pattern_bindings_recursive(value, visit),
+                None => ControlFlow::Continue(()),
+            },
+            "assignment_pattern" | "object_assignment_pattern" => {
+                match pattern.child_by_field_name("left") {
+                    Some(left) => visit_pattern_bindings_recursive(left, visit),
+                    None => ControlFlow::Continue(()),
+                }
+            }
+            _ => {
+                let mut cursor = pattern.walk();
+                for child in pattern.named_children(&mut cursor) {
+                    visit_pattern_bindings_recursive(child, visit)?;
+                }
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    /// 明示スタックの版は、再帰版と同じ束縛を同じ順に訪れ、`Break` で同じ位置で止まる。
+    /// 宣言だけでなくパラメータ・catch・for-of・代入式のパターンも渡す。
+    #[test]
+    fn visit_pattern_bindings_matches_recursive_version() {
+        let src = "const { a, b: renamed, [key]: computed, c = fallback, d: { e: [f, { g = h }] }, ...rest } = obj;\n\
+                   const [x, , y = dflt, [z, [w = { q } = r]], ...zs] = arr;\n\
+                   function fn1({ p, s: [t] }, [u = v], ...others) {}\n\
+                   try {} catch ({ message, cause: { code } }) {}\n\
+                   for (const [k, { val }] of entries) {}\n\
+                   ({ m, n: [o] } = obj);";
+        for lang in [LangId::Typescript, LangId::Javascript] {
+            let tree = parser::parse_source(src.as_bytes(), lang).unwrap();
+            let mut patterns = Vec::new();
+            let mut stack = vec![tree.root_node()];
+            while let Some(n) = stack.pop() {
+                if matches!(
+                    n.kind(),
+                    "object_pattern" | "array_pattern" | "formal_parameters"
+                ) && !matches!(
+                    n.parent().map(|p| p.kind()),
+                    Some("object_pattern" | "array_pattern" | "pair_pattern" | "rest_pattern")
+                ) {
+                    patterns.push(n);
+                }
+                let mut cursor = n.walk();
+                let children: Vec<_> = n.named_children(&mut cursor).collect();
+                stack.extend(children.into_iter().rev());
+            }
+            assert!(patterns.len() >= 6, "{lang:?}: {}", patterns.len());
+            let mut total = 0;
+            for pattern in patterns {
+                let collect = |stop_after: Option<usize>, recursive: bool| {
+                    let mut seen = Vec::new();
+                    let mut visit = |b: Node<'_>| {
+                        seen.push(b.utf8_text(src.as_bytes()).unwrap().to_string());
+                        if Some(seen.len()) == stop_after {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    };
+                    let flow = if recursive {
+                        visit_pattern_bindings_recursive(pattern, &mut visit)
+                    } else {
+                        visit_pattern_bindings(pattern, &mut visit)
+                    };
+                    (seen, flow.is_break())
+                };
+                let (all, _) = collect(None, true);
+                assert_eq!(collect(None, false), (all.clone(), false), "{lang:?}");
+                for stop in 1..=all.len() {
+                    assert_eq!(
+                        collect(Some(stop), false),
+                        collect(Some(stop), true),
+                        "{lang:?}: stop={stop}"
+                    );
+                }
+                total += all.len();
+            }
+            assert!(total >= 25, "{lang:?}: {total}");
+        }
     }
 }

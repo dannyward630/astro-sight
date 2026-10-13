@@ -430,52 +430,56 @@ pub(crate) fn rust_node_has_unrestricted_pub_visibility(node: Node, source: &[u8
 
 /// use_tree の各 variant を歩いて、最終的に外部に露出される名前 (末端 identifier または
 /// `as alias` の alias 名) を集める。
+///
+/// `pub use a::{b::{c::{..}}};` は任意に深く入れ子にできるので、1 段ごとに再帰せず
+/// 明示スタックで辿る (子は逆順に積み、再帰と同じ順に訪れる)。
 fn collect_rust_use_tree_names(
     node: Node,
     source: &[u8],
     names: &mut std::collections::HashSet<String>,
 ) {
-    match node.kind() {
-        // `pub use foo::bar;` → bar が公開される
-        "scoped_identifier" => {
-            if let Some(name) = node.child_by_field_name("name")
-                && let Ok(text) = name.utf8_text(source)
-            {
-                names.insert(text.to_string());
-            }
-        }
-        // `pub use foo;` → foo が公開される
-        "identifier" => {
-            if let Ok(text) = node.utf8_text(source) {
-                names.insert(text.to_string());
-            }
-        }
-        // `pub use foo::bar as baz;` → baz (alias) が公開される
-        "use_as_clause" => {
-            if let Some(alias) = node.child_by_field_name("alias")
-                && let Ok(text) = alias.utf8_text(source)
-            {
-                names.insert(text.to_string());
-            }
-        }
-        // `pub use foo::{A, B as C};` — list 配下の各 item を再帰的に走査
-        "scoped_use_list" => {
-            if let Some(list) = node.child_by_field_name("list") {
-                let mut cursor = list.walk();
-                for child in list.children(&mut cursor) {
-                    collect_rust_use_tree_names(child, source, names);
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        let first = stack.len();
+        match node.kind() {
+            // `pub use foo::bar;` → bar が公開される
+            "scoped_identifier" => {
+                if let Some(name) = node.child_by_field_name("name")
+                    && let Ok(text) = name.utf8_text(source)
+                {
+                    names.insert(text.to_string());
                 }
             }
-        }
-        "use_list" => {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                collect_rust_use_tree_names(child, source, names);
+            // `pub use foo;` → foo が公開される
+            "identifier" => {
+                if let Ok(text) = node.utf8_text(source) {
+                    names.insert(text.to_string());
+                }
             }
+            // `pub use foo::bar as baz;` → baz (alias) が公開される
+            "use_as_clause" => {
+                if let Some(alias) = node.child_by_field_name("alias")
+                    && let Ok(text) = alias.utf8_text(source)
+                {
+                    names.insert(text.to_string());
+                }
+            }
+            // `pub use foo::{A, B as C};` — list 配下の各 item を辿る
+            "scoped_use_list" => {
+                if let Some(list) = node.child_by_field_name("list") {
+                    let mut cursor = list.walk();
+                    stack.extend(list.children(&mut cursor));
+                }
+            }
+            "use_list" => {
+                let mut cursor = node.walk();
+                stack.extend(node.children(&mut cursor));
+            }
+            // `pub use foo::*;` — 名前が静的に解決できないため fail-open を避けて対象外
+            "use_wildcard" => {}
+            _ => {}
         }
-        // `pub use foo::*;` — 名前が静的に解決できないため fail-open を避けて対象外
-        "use_wildcard" => {}
-        _ => {}
+        stack[first..].reverse();
     }
 }
 
@@ -953,4 +957,113 @@ pub fn is_rust_declaration_restricted_pub(
         }
     }
     Some(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::parser;
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn collect_rust_use_tree_names_recursive(
+        node: Node,
+        source: &[u8],
+        names: &mut std::collections::HashSet<String>,
+    ) {
+        match node.kind() {
+            "scoped_identifier" => {
+                if let Some(name) = node.child_by_field_name("name")
+                    && let Ok(text) = name.utf8_text(source)
+                {
+                    names.insert(text.to_string());
+                }
+            }
+            "identifier" => {
+                if let Ok(text) = node.utf8_text(source) {
+                    names.insert(text.to_string());
+                }
+            }
+            "use_as_clause" => {
+                if let Some(alias) = node.child_by_field_name("alias")
+                    && let Ok(text) = alias.utf8_text(source)
+                {
+                    names.insert(text.to_string());
+                }
+            }
+            "scoped_use_list" => {
+                if let Some(list) = node.child_by_field_name("list") {
+                    let mut cursor = list.walk();
+                    for child in list.children(&mut cursor) {
+                        collect_rust_use_tree_names_recursive(child, source, names);
+                    }
+                }
+            }
+            "use_list" => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    collect_rust_use_tree_names_recursive(child, source, names);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `pub use` の公開名の収集は、明示スタックの版と再帰版で一致する
+    /// (入れ子の list・alias・self・wildcard を含む)。
+    #[test]
+    fn collect_rust_use_tree_names_matches_recursive_version() {
+        let source = "pub use a::b;\n\
+                      pub use c;\n\
+                      pub use d::e as f;\n\
+                      pub use g::{h, i as j, k::{l, m::{n as o, p}}, self};\n\
+                      pub use q::*;\n\
+                      pub use r::{s::{t::{u::{v}}}, w::*};\n\
+                      pub use ::x::y;\n";
+        let tree = parser::parse_source(source.as_bytes(), LangId::Rust).unwrap();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let mut compared = 0;
+        for declaration in root.named_children(&mut cursor) {
+            let Some(argument) = declaration.child_by_field_name("argument") else {
+                continue;
+            };
+            let mut actual = std::collections::HashSet::new();
+            collect_rust_use_tree_names(argument, source.as_bytes(), &mut actual);
+            let mut expected = std::collections::HashSet::new();
+            collect_rust_use_tree_names_recursive(argument, source.as_bytes(), &mut expected);
+            assert_eq!(
+                actual,
+                expected,
+                "{:?}",
+                argument.utf8_text(source.as_bytes())
+            );
+            compared += 1;
+        }
+        assert_eq!(compared, 7);
+        let all = collect_rust_reexported_names(root, source.as_bytes());
+        for name in ["b", "c", "f", "h", "j", "l", "o", "p", "v", "y"] {
+            assert!(all.contains(name), "{name}: {all:?}");
+        }
+    }
+
+    /// `pub use` の list が深く入れ子になっていても、公開名の収集がスタックを使い切らない。
+    /// 子プロセスの 256 KiB のスタックで 2 万段の `m::{m::{…}}` を辿る
+    /// (再帰版はここで溢れて子プロセスごと落ちる)。
+    #[test]
+    fn collect_rust_use_tree_names_handles_deep_use_lists() {
+        crate::engine::tree_walk::run_deep_test_isolated(
+            module_path!(),
+            "collect_rust_use_tree_names_handles_deep_use_lists",
+            || {
+                let source = format!(
+                    "pub use {}leaf{};\npub fn after() {{}}\n",
+                    "m::{".repeat(20_000),
+                    "}".repeat(20_000)
+                );
+                let tree = parser::parse_source(source.as_bytes(), LangId::Rust).unwrap();
+                let names = collect_rust_reexported_names(tree.root_node(), source.as_bytes());
+                assert_eq!(names, std::collections::HashSet::from(["leaf".to_string()]));
+            },
+        );
+    }
 }

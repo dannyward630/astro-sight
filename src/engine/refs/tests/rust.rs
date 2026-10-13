@@ -1179,3 +1179,116 @@ pub trait Child: Parent {}
     let (prod, _test) = counts["Parent"];
     assert_eq!(prod, 1, "supertrait 位置が参照として数えられること");
 }
+
+/// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+fn rust_pattern_binds_name_recursive(
+    node: tree_sitter::Node<'_>,
+    name: &str,
+    source: &[u8],
+    cache: &crate::engine::refs::definition::rust::RustPatternBindingCache,
+) -> bool {
+    let matches_name =
+        |n: tree_sitter::Node<'_>| n.utf8_text(source).is_ok_and(|text| text == name);
+    match node.kind() {
+        "identifier" => {
+            matches_name(node)
+                && crate::engine::refs::definition::rust::rust_pattern_binds_name(
+                    node, name, source, cache,
+                )
+        }
+        "shorthand_field_identifier" => matches_name(node),
+        "tuple_struct_pattern" | "struct_pattern" => {
+            let type_node = node.child_by_field_name("type");
+            let mut cursor = node.walk();
+            node.children(&mut cursor).any(|child| {
+                type_node.is_none_or(|t| t.id() != child.id())
+                    && rust_pattern_binds_name_recursive(child, name, source, cache)
+            })
+        }
+        "field_pattern" => match node.child_by_field_name("pattern") {
+            Some(pattern) => rust_pattern_binds_name_recursive(pattern, name, source, cache),
+            None => node
+                .child_by_field_name("name")
+                .is_some_and(|n| n.kind() == "shorthand_field_identifier" && matches_name(n)),
+        },
+        "parameter" => node
+            .child_by_field_name("pattern")
+            .is_some_and(|pattern| rust_pattern_binds_name_recursive(pattern, name, source, cache)),
+        "closure_parameters" | "tuple_pattern" | "slice_pattern" | "reference_pattern"
+        | "ref_pattern" | "mut_pattern" | "captured_pattern" | "or_pattern" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor)
+                .any(|child| rust_pattern_binds_name_recursive(child, name, source, cache))
+        }
+        _ => false,
+    }
+}
+
+/// closure 引数のパターンが名前を束縛するかの判定は、明示スタックの版と再帰版で一致する。
+/// identifier の葉の判定 (命名規約と同名の const / 単位構造体) は共通の処理なので、
+/// 参照実装からは本体を identifier 1 個に対して呼ぶ。
+#[test]
+fn rust_pattern_binds_name_matches_recursive_version() {
+    let source = "const MAX: u32 = 1;\n\
+                  struct Unit;\n\
+                  struct P(u32, u32);\n\
+                  struct S { a: u32, b: u32 }\n\
+                  fn f() {\n\
+                  \x20   let c1 = |x| x;\n\
+                  \x20   let c2 = |(a, (b, [c, ..]))| a;\n\
+                  \x20   let c3 = |P(m, n), S { a, b: bb }| m;\n\
+                  \x20   let c4 = |&mut (ref r, mut q @ 1..=3)| r;\n\
+                  \x20   let c5 = |Unit, MAX, k: u32| k;\n\
+                  \x20   let c6 = |S { a: (aa | aa), .. }, [first, .., last]| aa;\n\
+                  \x20   let c7 = |((((deep,),),),)| deep;\n\
+                  }\n";
+    let tree = crate::engine::parser::parse_source(source.as_bytes(), LangId::Rust).unwrap();
+    let mut params = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "closure_parameters" {
+            params.push(n);
+        }
+        let mut cursor = n.walk();
+        let children: Vec<_> = n.children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
+    }
+    assert_eq!(params.len(), 7);
+    let names = [
+        "x", "a", "b", "c", "bb", "m", "n", "r", "q", "k", "Unit", "MAX", "aa", "first", "last",
+        "deep", "zz",
+    ];
+    let (mut bound, mut unbound) = (0, 0);
+    for param in params {
+        for name in names {
+            let iterative = crate::engine::refs::definition::rust::rust_pattern_binds_name(
+                param,
+                name,
+                source.as_bytes(),
+                &Default::default(),
+            );
+            let recursive = rust_pattern_binds_name_recursive(
+                param,
+                name,
+                source.as_bytes(),
+                &Default::default(),
+            );
+            assert_eq!(
+                iterative,
+                recursive,
+                "{name} in {:?}",
+                param.utf8_text(source.as_bytes())
+            );
+            if iterative {
+                bound += 1;
+            } else {
+                unbound += 1;
+            }
+        }
+    }
+    // 空振り防止: 束縛になる組とならない組がどちらもある (Unit / MAX / zz は束縛にならない)
+    assert!(
+        bound >= 15 && unbound >= 50,
+        "bound={bound} unbound={unbound}"
+    );
+}
