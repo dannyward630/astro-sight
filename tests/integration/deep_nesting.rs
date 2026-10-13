@@ -1197,3 +1197,48 @@ fn dead_code_handles_deep_names_conditions_patterns_and_gitattributes() {
         serde_json::json!(["src/gen.ts"])
     );
 }
+
+/// calls: 入れ子の呼び出し (`wrap(wrap(…(() => inner())…))`) の呼び出し元の解決が、深さの
+/// 2 乗以上の時間にならない。旧実装は呼び出しごとに `Node::parent` (根から降りる) で祖先を
+/// たどっていたため、release でも 1,000 段で約 30 秒、2,000 段で 2 分を超えた。トップレベルの
+/// 2 万段と関数の中の 5,000 段を期限内に解析し、関数の中の呼び出しは匿名 callback の中も含めて
+/// すべてその関数を呼び出し元にする (トップレベルの呼び出しは呼び出し元が無いので出さない)。
+///
+/// 2 万段にとどめるのは、tree-sitter のクエリ自体が約 3.2 万段より深いノードの一致を返さず
+/// (5 万段で 32,767 件)、その付近から急に遅くなるため (この関数の外の制約)。
+#[test]
+fn calls_resolves_callers_of_deeply_nested_calls_in_time() {
+    let repo = TestRepo::new();
+    repo.write(
+        "deep.ts",
+        format!(
+            "export const top = {};\nexport function outer() {{ return {}; }}\nexport function after() {{ return g(); }}\n",
+            nested("wrap(", "() => 1", ")", 20_000),
+            nested("wrap(", "() => inner()", ")", 5_000)
+        ),
+    );
+    let mut command = cargo_bin();
+    command
+        .current_dir(repo.root())
+        .args(["calls", "--path", "deep.ts"]);
+    let stdout = assert_finished("calls", &run_bounded(command, None));
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("calls JSON");
+    let groups: Vec<(String, usize, usize)> = json["calls"]
+        .as_array()
+        .expect("calls")
+        .iter()
+        .map(|group| {
+            let callees = group["callees"].as_array().expect("callees");
+            let count = |name: &str| callees.iter().filter(|c| c["name"] == name).count();
+            (
+                group["caller"].as_str().unwrap_or_default().to_string(),
+                count("wrap"),
+                callees.len() - count("wrap"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        groups,
+        vec![("outer".to_string(), 5_000, 1), ("after".to_string(), 0, 1)]
+    );
+}

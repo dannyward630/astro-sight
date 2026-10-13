@@ -24,52 +24,142 @@ pub fn extract_calls(
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, root, source);
 
-    let mut edges = Vec::new();
+    // callee の capture を、match の順・capture の順のまま集める (出力の順序)。
+    let mut callees = Vec::new();
     while let Some(m) = matches.next() {
         for capture in m.captures() {
-            let node = capture.node;
             let capture_name = &query.capture_names()[capture.index as usize];
-            if !capture_name.ends_with("callee") {
-                continue;
+            if capture_name.ends_with("callee") {
+                callees.push(capture.node);
             }
-
-            let callee_name = node.utf8_text(source).unwrap_or("").to_string();
-            if callee_name.is_empty() {
-                continue;
-            }
-
-            // Find the enclosing function (caller)
-            let caller = find_enclosing_function(node, source, lang_id);
-            let caller = match caller {
-                Some(c) => c,
-                None => continue, // top-level call, skip
-            };
-
-            if let Some(filter) = filter_function
-                && caller.name != filter
-            {
-                continue;
-            }
-
-            // call_expression node is the parent of the callee identifier
-            let call_node = node.parent().unwrap_or(node);
-            let callee_range = Range::from(call_node.range());
-
-            edges.push(CallEdge {
-                caller,
-                callee: CallEndpoint {
-                    name: callee_name,
-                    range: callee_range,
-                },
-                call_site: CallSite {
-                    line: node.start_position().row,
-                    column: node.start_position().column,
-                },
-            });
         }
+    }
+    let contexts = CallerContexts::collect(root, &callees, source, lang_id);
+
+    let mut edges = Vec::new();
+    for node in callees {
+        let callee_name = node.utf8_text(source).unwrap_or("").to_string();
+        if callee_name.is_empty() {
+            continue;
+        }
+
+        // Find the enclosing function (caller) and the call_expression (the parent of the
+        // callee identifier)
+        let (caller, call_node) = contexts.caller_and_call_node(node, source, lang_id);
+        let caller = match caller {
+            Some(c) => c,
+            None => continue, // top-level call, skip
+        };
+
+        if let Some(filter) = filter_function
+            && caller.name != filter
+        {
+            continue;
+        }
+
+        let callee_range = Range::from(call_node.range());
+
+        edges.push(CallEdge {
+            caller,
+            callee: CallEndpoint {
+                name: callee_name,
+                range: callee_range,
+            },
+            call_site: CallSite {
+                line: node.start_position().row,
+                column: node.start_position().column,
+            },
+        });
     }
 
     Ok(edges)
+}
+
+/// 呼び出し (callee の capture) ごとの、呼び出し元 (最も近い名前を解決できる関数の祖先) と
+/// 呼び出し式のノード (callee の親)。
+///
+/// `Node::parent` は根から降りて親を探すので、呼び出しごとに祖先を `parent` でたどると
+/// 入れ子の呼び出し (`wrap(wrap(…(() => 1)…))`) では深さの 2 乗以上の時間がかかり、
+/// 5 万段で終わらなかった。木を 1 回だけ前順にたどり、祖先の列と「その位置で最も近い
+/// 名前付きの関数」を持ち回して求める。結果は `find_enclosing_function` で祖先をたどった
+/// 場合と同じ。
+struct CallerContexts<'tree> {
+    /// 名前を解決できた関数 (出現順)。
+    callers: Vec<CallEndpoint>,
+    /// callee のノード id → (呼び出し元の `callers` の添字、呼び出し式のノード)。
+    by_callee: std::collections::HashMap<usize, (Option<usize>, Node<'tree>)>,
+}
+
+impl<'tree> CallerContexts<'tree> {
+    fn collect(root: Node<'tree>, callees: &[Node<'tree>], source: &[u8], lang_id: LangId) -> Self {
+        use std::ops::ControlFlow;
+
+        use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+
+        let mut contexts = Self {
+            callers: Vec::new(),
+            by_callee: std::collections::HashMap::with_capacity(callees.len()),
+        };
+        if callees.is_empty() {
+            return contexts;
+        }
+        let wanted: HashSet<usize> = callees.iter().map(|node| node.id()).collect();
+        let func_kinds = function_node_kinds(lang_id);
+        // 深さごとの祖先 (`path[d]` は深さ d の祖先)。
+        let mut path: Vec<Node<'tree>> = Vec::new();
+        // 祖先の関数ノードの (深さ, その関数の内側で最も近い名前付きの関数)。
+        let mut frames: Vec<(usize, Option<usize>)> = Vec::new();
+        let _: ControlFlow<()> = walk_preorder(root, Children::All, |node, depth| {
+            path.truncate(depth);
+            while frames
+                .last()
+                .is_some_and(|&(frame_depth, _)| frame_depth >= depth)
+            {
+                frames.pop();
+            }
+            let nearest = frames.last().and_then(|&(_, named)| named);
+            let parent = depth.checked_sub(1).map(|d| path[d]);
+            if wanted.contains(&node.id()) {
+                contexts
+                    .by_callee
+                    .insert(node.id(), (nearest, parent.unwrap_or(node)));
+            }
+            if func_kinds.contains(&node.kind()) {
+                // 名前を解決できない関数 (匿名 callback) は飛ばし、外側の名前付きの関数を使う。
+                let named = match find_function_name(node, parent, source, lang_id) {
+                    Some(name) => {
+                        contexts.callers.push(CallEndpoint {
+                            name,
+                            range: Range::from(node.range()),
+                        });
+                        Some(contexts.callers.len() - 1)
+                    }
+                    None => nearest,
+                };
+                frames.push((depth, named));
+            }
+            path.push(node);
+            ControlFlow::Continue(Walk::Descend)
+        });
+        contexts
+    }
+
+    /// `callee` の呼び出し元と呼び出し式のノード。走査で見つからなかった場合 (query の
+    /// capture は root の部分木にあるので起きない) は祖先をたどって求める。
+    fn caller_and_call_node(
+        &self,
+        callee: Node<'tree>,
+        source: &[u8],
+        lang_id: LangId,
+    ) -> (Option<CallEndpoint>, Node<'tree>) {
+        match self.by_callee.get(&callee.id()) {
+            Some(&(caller, call_node)) => (caller.map(|ix| self.callers[ix].clone()), call_node),
+            None => (
+                find_enclosing_function(callee, source, lang_id),
+                callee.parent().unwrap_or(callee),
+            ),
+        }
+    }
 }
 
 /// ファイル全体の呼び出し先名 (callee) の集合を抽出する。
@@ -119,7 +209,7 @@ fn find_enclosing_function(node: Node<'_>, source: &[u8], lang_id: LangId) -> Op
 
     while let Some(n) = current {
         if func_kinds.contains(&n.kind())
-            && let Some(name) = find_function_name(n, source, lang_id)
+            && let Some(name) = find_function_name(n, n.parent(), source, lang_id)
         {
             return Some(CallEndpoint {
                 name,
@@ -176,8 +266,14 @@ fn function_node_kinds(lang_id: LangId) -> &'static [&'static str] {
     }
 }
 
-/// 関数ノードの名前を抽出する。
-fn find_function_name(node: Node<'_>, source: &[u8], lang_id: LangId) -> Option<String> {
+/// 関数ノードの名前を抽出する。`parent` は `node` の親 (JS/TS の束縛名の解決に使う。
+/// 走査中の呼び出し元は祖先の列から渡し、`Node::parent` を呼ばずに済ませる)。
+fn find_function_name(
+    node: Node<'_>,
+    parent: Option<Node<'_>>,
+    source: &[u8],
+    lang_id: LangId,
+) -> Option<String> {
     // JS/TS の arrow/function expression は自身の "name" では外部から参照できない
     // (named function expression の name は内部スコープ専用)。親の binding 名を
     // caller 名とし、binding が無い匿名 callback では偽名 (最初の identifier 子 =
@@ -189,7 +285,7 @@ fn find_function_name(node: Node<'_>, source: &[u8], lang_id: LangId) -> Option<
         node.kind(),
         "arrow_function" | "function_expression" | "generator_function"
     ) {
-        return js_ts_binding_name_for_function(node, source);
+        return js_ts_binding_name_for_function(node, parent, source);
     }
 
     // まず "name" フィールドを試行（多くの言語で共通）
@@ -234,8 +330,13 @@ fn find_function_name(node: Node<'_>, source: &[u8], lang_id: LangId) -> Option<
 /// `const f = () => {}` → f / `{ handler: () => {} }` → handler /
 /// `class C { f = () => {} }` → f / `obj.f = () => {}` → f。
 /// binding が無い場合のみ named function expression 自身の name (IIFE 等) に fallback。
-fn js_ts_binding_name_for_function(node: Node<'_>, source: &[u8]) -> Option<String> {
-    let from_parent = node.parent().and_then(|parent| match parent.kind() {
+/// `parent` は `node` の親。
+fn js_ts_binding_name_for_function(
+    node: Node<'_>,
+    parent: Option<Node<'_>>,
+    source: &[u8],
+) -> Option<String> {
+    let from_parent = parent.and_then(|parent| match parent.kind() {
         "variable_declarator" => parent.child_by_field_name("name"),
         "pair" => parent.child_by_field_name("key"),
         "public_field_definition" | "field_definition" => parent
@@ -848,5 +949,135 @@ mod tests {
                 "{lang:?} generator 式は binding 名に帰属する: {callers:?}"
             );
         }
+    }
+
+    /// 修正前の実装 (呼び出しごとに `Node::parent` で祖先をたどる)。浅い入力でだけ使う。
+    fn extract_calls_climbing(
+        root: Node<'_>,
+        source: &[u8],
+        lang_id: LangId,
+        filter_function: Option<&str>,
+    ) -> Vec<CallEdge> {
+        let query = crate::engine::query_cache::cached_query(lang_id, call_query(lang_id)).unwrap();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, root, source);
+        let mut edges = Vec::new();
+        while let Some(m) = matches.next() {
+            for capture in m.captures() {
+                let node = capture.node;
+                let capture_name = &query.capture_names()[capture.index as usize];
+                if !capture_name.ends_with("callee") {
+                    continue;
+                }
+                let callee_name = node.utf8_text(source).unwrap_or("").to_string();
+                if callee_name.is_empty() {
+                    continue;
+                }
+                let Some(caller) = find_enclosing_function(node, source, lang_id) else {
+                    continue;
+                };
+                if let Some(filter) = filter_function
+                    && caller.name != filter
+                {
+                    continue;
+                }
+                let call_node = node.parent().unwrap_or(node);
+                edges.push(CallEdge {
+                    caller,
+                    callee: CallEndpoint {
+                        name: callee_name,
+                        range: Range::from(call_node.range()),
+                    },
+                    call_site: CallSite {
+                        line: node.start_position().row,
+                        column: node.start_position().column,
+                    },
+                });
+            }
+        }
+        edges
+    }
+
+    /// 1 回の走査で呼び出し元を求める版は、祖先をたどっていた修正前の実装と同じ edge を
+    /// 同じ順に返す。tests/fixtures の全言語のサンプルに、JS/TS の束縛名の解決
+    /// (変数・object の key・class field・代入先・IIFE・generator・匿名 callback の飛ばし)、
+    /// 入れ子の関数、トップレベルの呼び出しを足し、caller での絞り込みも比べる。
+    #[test]
+    fn extract_calls_matches_climbing_version() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut cases: Vec<(LangId, String)> = Vec::new();
+        for entry in std::fs::read_dir(&fixtures).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.is_file() {
+                continue;
+            }
+            let utf8 = camino::Utf8Path::new(path.to_str().unwrap());
+            let source = std::fs::read_to_string(&path).unwrap();
+            if let Ok(lang) = parser::detect_lang(utf8, source.as_bytes())
+                && !lang.is_lexer_only()
+            {
+                cases.push((lang, source));
+            }
+        }
+        let js = "const a = () => { b(); };\n\
+                  const obj = { handler: () => { c(); }, method() { d(); } };\n\
+                  class K { field = () => { e(); }; m() { [1].map(x => f(x)); } }\n\
+                  module.exports.run = function () { g(); };\n\
+                  this.h = () => { i(); };\n\
+                  (function iife() { j(); })();\n\
+                  function* gen() { yield k(); }\n\
+                  const nested = () => () => () => l();\n\
+                  setTimeout(() => m(), 0);\n\
+                  top();\n";
+        // 参照実装は深さの 3 乗の時間がかかるので浅くする (深い入力は統合テストで確かめる)。
+        let (open, close) = ("wrap(".repeat(40), ")".repeat(40));
+        let deep = format!(
+            "function outer() {{ return {open}() => inner(){close}; }}\nconst top = {open}1{close};\n"
+        );
+        for lang in [LangId::Javascript, LangId::Typescript, LangId::Tsx] {
+            cases.push((lang, js.to_string()));
+            cases.push((lang, deep.clone()));
+        }
+        cases.push((
+            LangId::Cpp,
+            "int *ptr(void) { return g(); }\nint &ref() { static int v; h(); return v; }\nvoid Outer::Inner::method() { k(); }\nnamespace n { void free_fn() { l(); } }\n".to_string(),
+        ));
+        cases.push((
+            LangId::Rust,
+            "fn outer() { let f = |x| inner(x); f(1); helper::<u8>(); }\nimpl S { fn m(&self) { self.n(); } }\n".to_string(),
+        ));
+
+        let (mut compared, mut edges_total) = (0, 0);
+        for (lang, source) in &cases {
+            let tree = parser::parse_source(source.as_bytes(), *lang).unwrap();
+            let root = tree.root_node();
+            let expected = extract_calls_climbing(root, source.as_bytes(), *lang, None);
+            let actual = extract_calls(root, source.as_bytes(), *lang, None).unwrap();
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "{lang:?}");
+            edges_total += expected.len();
+            let mut callers: Vec<&str> = expected.iter().map(|e| e.caller.name.as_str()).collect();
+            callers.sort_unstable();
+            callers.dedup();
+            callers.push("no_such_caller");
+            for caller in callers {
+                assert_eq!(
+                    format!(
+                        "{:?}",
+                        extract_calls(root, source.as_bytes(), *lang, Some(caller)).unwrap()
+                    ),
+                    format!(
+                        "{:?}",
+                        extract_calls_climbing(root, source.as_bytes(), *lang, Some(caller))
+                    ),
+                    "{lang:?} / {caller}"
+                );
+            }
+            compared += 1;
+        }
+        // 空振り防止: 全言語のサンプルと追加の入力を比べ、edge が実際にある
+        assert!(
+            compared >= 20 && edges_total >= 200,
+            "compared={compared} edges={edges_total}"
+        );
     }
 }
