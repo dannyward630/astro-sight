@@ -110,14 +110,27 @@ impl LangId {
     /// 同じ振る舞いを必要とするため、共通ヘルパーとして公開する。
     pub fn detect(path: &Utf8Path, source: &[u8]) -> Result<Self, AstroError> {
         Self::from_path(path).or_else(|_| {
-            let first_line = std::str::from_utf8(source)
-                .ok()
-                .and_then(|s| s.lines().next())
-                .unwrap_or("");
-            Self::from_shebang(first_line).ok_or_else(|| {
+            Self::from_shebang_source(source).ok_or_else(|| {
                 AstroError::unsupported_language(path.extension().unwrap_or("<none>"))
             })
         })
+    }
+
+    /// ソースの先頭行の shebang から言語を判定する。
+    ///
+    /// UTF-8 として検証するのは先頭行 (最初の `\n` まで) だけにする。ファイル全体を検証すると、
+    /// 2 行目以降に Shift_JIS などのコメントがあるだけで shebang が読めず、走査対象には選ばれた
+    /// (先頭行だけを見る) スクリプトを解析で落とし、そこからの参照が黙って消えていた。
+    /// tree-sitter はバイト列を解析できるので、必要なのは先頭行の判定だけ。
+    pub fn from_shebang_source(source: &[u8]) -> Option<Self> {
+        if !source.starts_with(b"#!") {
+            return None;
+        }
+        let line_end = memchr::memchr(b'\n', source).unwrap_or(source.len());
+        let line = &source[..line_end];
+        // `str::lines` と同じく行末の `\r` を落とす。
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        Self::from_shebang(std::str::from_utf8(line).ok()?)
     }
 
     /// Detect language from shebang line.
@@ -472,10 +485,24 @@ impl std::fmt::Display for DetectedLang {
     }
 }
 
-/// case-insensitive な言語では識別子を Unicode-aware に小文字化する。
-/// 非 CI 言語ではゼロコピーで `Cow::Borrowed` を返し、既存の挙動を変えない。
+/// 識別子を照合用に正規化する。
+///
+/// - case-insensitive な言語 (Xojo) は Unicode-aware に小文字化する。
+/// - Rust の raw identifier (`r#gen`) は `r#` を外す。`r#gen` と `gen` は同じ識別子で、
+///   Rust 2024 で予約語になった `gen` を edition 2021 のクレートから呼ぶときは `a::r#gen()`
+///   と書く。外さないと、この呼び出しを refs / impact / dead-code の件数がどれも数えない。
+/// - Swift / Kotlin の囲みの backtick (`` `default` ``) を外す。backtick は予約語などを名前に
+///   するための書き方で、名前の一部ではない (Swift の `Registry.default()` のように、
+///   参照側は書かないことがある)。
+///
+/// 該当しなければゼロコピーで `Cow::Borrowed` を返す。
 pub fn normalize_identifier(lang: LangId, name: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
+    let name = match lang {
+        LangId::Rust => name.strip_prefix("r#").unwrap_or(name),
+        LangId::Swift | LangId::Kotlin => strip_identifier_backticks(name),
+        _ => name,
+    };
     if !lang.is_case_insensitive() {
         return Cow::Borrowed(name);
     }
@@ -484,6 +511,23 @@ pub fn normalize_identifier(lang: LangId, name: &str) -> std::borrow::Cow<'_, st
     } else {
         Cow::Owned(name.chars().flat_map(|c| c.to_lowercase()).collect())
     }
+}
+
+/// 囲みの backtick (`` `name` ``) を外す。囲まれていなければそのまま返す。
+fn strip_identifier_backticks(name: &str) -> &str {
+    name.strip_prefix('`')
+        .and_then(|inner| inner.strip_suffix('`'))
+        .unwrap_or(name)
+}
+
+/// 名前のテキスト事前フィルタ (memmem / Aho-Corasick) に使うパターン。
+///
+/// 言語に依らず、名前の一部ではない書き方 (Rust の `r#`、Swift / Kotlin の囲みの backtick)
+/// を外す。外した形は元の書き方の部分文字列なので、どの言語のファイルに対しても超集合の
+/// フィルタになる (`r#gen` を含むファイルは必ず `gen` を含む)。外さないと、
+/// `refs --name 'r#gen'` が `gen()` だけを書いたファイルを照合の前に読み飛ばす。
+pub fn identifier_prefilter_pattern(name: &str) -> &str {
+    strip_identifier_backticks(name.strip_prefix("r#").unwrap_or(name))
 }
 
 #[cfg(test)]
@@ -629,6 +673,73 @@ mod tests {
         let v = normalize_identifier(LangId::Rust, "MyVar");
         assert!(matches!(v, std::borrow::Cow::Borrowed(_)));
         assert_eq!(&*v, "MyVar");
+    }
+
+    /// Rust の raw identifier (`r#gen`) と Swift / Kotlin の囲みの backtick (`` `default` ``) は
+    /// 名前の一部ではないので、照合用の正規化で外す。
+    /// 対照: ほかの言語・囲みの片側だけ・中の `r#` は外さない。
+    #[test]
+    fn normalize_identifier_strips_raw_and_backtick_markers() {
+        assert_eq!(&*normalize_identifier(LangId::Rust, "r#gen"), "gen");
+        assert_eq!(&*normalize_identifier(LangId::Rust, "gen"), "gen");
+        assert_eq!(
+            &*normalize_identifier(LangId::Swift, "`default`"),
+            "default"
+        );
+        assert_eq!(&*normalize_identifier(LangId::Kotlin, "`is`"), "is");
+        assert_eq!(
+            &*normalize_identifier(LangId::Kotlin, "`my test`"),
+            "my test"
+        );
+        // 対照
+        assert_eq!(&*normalize_identifier(LangId::Python, "r#gen"), "r#gen");
+        assert_eq!(
+            &*normalize_identifier(LangId::Rust, "`default`"),
+            "`default`"
+        );
+        assert_eq!(&*normalize_identifier(LangId::Swift, "r#gen"), "r#gen");
+        assert_eq!(&*normalize_identifier(LangId::Swift, "`open"), "`open");
+        assert!(matches!(
+            normalize_identifier(LangId::Rust, "r#gen"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// 事前フィルタのパターンは言語に依らず印を外した形 (元の書き方の部分文字列)。
+    #[test]
+    fn identifier_prefilter_pattern_is_substring_of_every_spelling() {
+        for (name, pattern) in [
+            ("r#gen", "gen"),
+            ("`default`", "default"),
+            ("gen", "gen"),
+            ("Foo.bar", "Foo.bar"),
+        ] {
+            assert_eq!(identifier_prefilter_pattern(name), pattern);
+            assert!(name.contains(pattern));
+        }
+    }
+
+    /// shebang の判定は先頭行だけを UTF-8 として検証する。2 行目以降に Shift_JIS の
+    /// コメントがあっても判定でき、先頭行が UTF-8 でなければ判定しない。
+    #[test]
+    fn shebang_detection_validates_only_the_first_line() {
+        let mut sjis = b"#!/bin/bash\n. ./lib.sh\n# ".to_vec();
+        sjis.extend_from_slice(&[0x83, 0x66, 0x83, 0x76, 0x83, 0x8d, 0x83, 0x43]);
+        sjis.extend_from_slice(b"\ndeploy_app\n");
+        assert!(std::str::from_utf8(&sjis).is_err());
+        assert_eq!(LangId::from_shebang_source(&sjis), Some(LangId::Bash));
+        assert_eq!(
+            LangId::detect(Utf8Path::new("bin/deploy"), &sjis).unwrap(),
+            LangId::Bash
+        );
+        // CRLF の先頭行も従来どおり判定する
+        assert_eq!(
+            LangId::from_shebang_source(b"#!/usr/bin/env python3\r\nprint(1)\n"),
+            Some(LangId::Python)
+        );
+        // 対照: 先頭行が UTF-8 でない・shebang が無い
+        assert_eq!(LangId::from_shebang_source(b"#!/bin/ba\xffsh\n"), None);
+        assert_eq!(LangId::from_shebang_source(b"echo hi\n#!/bin/bash\n"), None);
     }
 
     #[test]

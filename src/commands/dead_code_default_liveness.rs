@@ -160,7 +160,9 @@ fn collect_file_uses(
     let Ok(tree) = parser::parse_source(&source, lang) else {
         return;
     };
-    let is_test = super::dead_code::is_test_path(path);
+    // テストからの参照かは `dir` 相対で判定する (親ディレクトリ名に `test` があっても
+    // 全参照をテスト扱いにしない)。
+    let is_test = super::dead_code::is_test_path(Path::new(&relative));
     let queries = [
         Some(DEFAULT_USE_QUERY),
         matches!(lang, LangId::Typescript | LangId::Tsx).then_some(TS_IMPORT_REQUIRE_QUERY),

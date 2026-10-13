@@ -447,11 +447,19 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
         // PHP の runtime annotation (`@TypeItem`, `@Route`, `@DataProvider`, `@dataProvider` 等) が
         // docstring に付いているメソッド / クラスは reflection 経由で動的に呼ばれるため
         // dead-code 候補から除外する。
+        // PHP 8 の属性 (`#[Route]` / `#[Test]`) も docblock と同じ規則で判定する。
         if self.exclude_framework_entrypoints
             && self.lang_id == crate::language::LangId::Php
             && matches!(sym.kind, SymbolKind::Method | SymbolKind::Class)
-            && let Some(doc) = sym.doc.as_deref()
-            && crate::engine::symbols::php_doc_has_runtime_annotation(doc)
+            && (sym
+                .doc
+                .as_deref()
+                .is_some_and(crate::engine::symbols::php_doc_has_runtime_annotation)
+                || crate::engine::symbols::php_declaration_has_runtime_attribute(
+                    self.root,
+                    self.source,
+                    &sym.range,
+                ))
         {
             return true;
         }
@@ -649,6 +657,21 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
                 self.source,
                 self.lang_id,
                 sym.kind,
+                &sym.range,
+            )
+        {
+            return true;
+        }
+        // 言語の構文から暗黙に呼ばれるメソッド (Kotlin の `operator fun`、Swift の
+        // `callAsFunction`)。呼び出し側に名前が現れないので参照は 0 件が正常。
+        // エントリポイントと同じく dead-code 経路だけで除外し、API 差分には残す。
+        if self.exclude_framework_entrypoints
+            && crate::engine::symbols::is_syntax_invoked_method(
+                self.root,
+                self.source,
+                self.lang_id,
+                sym.kind,
+                &sym.name,
                 &sym.range,
             )
         {

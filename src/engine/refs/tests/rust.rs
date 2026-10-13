@@ -248,6 +248,80 @@ if value {
     );
 }
 
+/// 構造体パターンの省略形 (`let Cfg { zeta, .. } = c` / `Cfg { zeta, other } =>`) の
+/// フィールド名も `refs` の出現として返す。
+///
+/// 旧実装は `shorthand_field_identifier` を識別子として扱わず、非省略形
+/// (`let Cfg { zeta: z, .. }`) のフィールド名は返すのに省略形だけを落としていた。
+/// フィールド名を変えるときは省略形も書き換えが要るので、出現一覧から落ちると修正漏れになる。
+///
+/// **対照ケースを内蔵する**: 判定面 (dead-code の件数) は省略形のパターンを数えない
+/// (フィールド名でありローカルへの束縛で、同名の関数への参照ではない)。単一検索と
+/// `--names` のバッチ検索は同じ位置を返す。
+#[test]
+fn rust_shorthand_field_pattern_is_returned_by_refs_but_not_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "pub struct Cfg { pub zeta: u8, pub other: u8 }\n\
+                  pub fn make() -> Cfg { let zeta = 1; Cfg { zeta, other: 2 } }\n\
+                  pub fn read(c: &Cfg) -> u8 { let Cfg { zeta, .. } = c; *zeta }\n\
+                  pub fn read2(c: &Cfg) -> u8 { match c { Cfg { zeta, other } => *zeta + *other } }\n\
+                  pub fn read3(c: &Cfg) -> u8 { let Cfg { zeta: z, .. } = c; *z + c.zeta }\n\
+                  pub fn zeta() -> u8 { 0 }\n";
+    std::fs::write(dir.path().join("lib.rs"), source).unwrap();
+
+    let positions = |refs: &[SymbolReference]| -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = refs.iter().map(|r| (r.line, r.column)).collect();
+        out.sort();
+        out
+    };
+    let zeta = find_references("zeta", dir.path(), Some("**/*.rs")).unwrap();
+    let zeta_positions = positions(&zeta);
+    for shorthand in [(2, 39), (3, 46)] {
+        assert!(
+            zeta_positions.contains(&shorthand),
+            "省略形のパターンのフィールド名 {shorthand:?} を返す: {zeta_positions:?}"
+        );
+    }
+    // 対照: 非省略形のフィールド名 (read3) は従来どおり返す
+    assert!(zeta_positions.contains(&(4, 40)), "{zeta_positions:?}");
+
+    let batch = find_references_batch(
+        &["zeta".to_string(), "other".to_string()],
+        dir.path(),
+        Some("**/*.rs"),
+    )
+    .unwrap();
+    assert_eq!(
+        positions(&batch["zeta"]),
+        zeta_positions,
+        "単一とバッチが一致"
+    );
+    assert!(
+        positions(&batch["other"]).contains(&(3, 52)),
+        "`Cfg {{ zeta, other }}` の other も返す: {:?}",
+        positions(&batch["other"])
+    );
+
+    // 判定面: 省略形のパターンは関数 `zeta` への参照として数えない。数えるのは
+    // パターンが束縛したローカルの読み出し `*zeta` の 1 件だけ (識別子の種別に加えても、
+    // `is_rust_struct_field_non_callable` で判定面から外す)。
+    let count_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        count_dir.path().join("lib.rs"),
+        "pub struct Cfg { pub zeta: u8 }\npub fn zeta() -> u8 { 0 }\npub fn read(c: &Cfg) -> u8 { let Cfg { zeta, .. } = c; *zeta }\n",
+    )
+    .unwrap();
+    let counts = count_non_definition_refs_split_with_extra_files(
+        &["zeta".to_string()],
+        count_dir.path(),
+        Some("**/*.rs"),
+        &[],
+        |_| false,
+    )
+    .unwrap();
+    assert_eq!(counts["zeta"].0, 1, "`*zeta` の 1 件だけを数える");
+}
+
 /// メソッド呼び出し `obj.method()` の `method` 部は関数参照として残ることを検証
 #[test]
 fn find_references_rust_method_call_field_identifier_is_kept() {
@@ -433,6 +507,54 @@ time: i64,
     assert_eq!(counts[0], 1, "attribute string ref must lift dead-code");
 }
 
+/// serde の `default = "fn"` の関数名も参照として数える (単一検索と件数の両方)。
+///
+/// 旧実装はキーに `default` が無く、`#[serde(default = "default_port")]` からしか使われない
+/// `pub fn default_port()` を refs が 0 件と返し、dead-code が dead と報告していた
+/// (serde の derive が呼ぶので、消すとコンパイルできない)。
+/// 対照: 値の無い `#[serde(default)]` は文字列を持たず、何も数えない。
+#[test]
+fn rust_attr_string_ref_detected_for_serde_default() {
+    let source = r#"
+#[derive(Deserialize)]
+pub struct Config {
+#[serde(default = "default_port")]
+pub port: u16,
+#[serde(default)]
+pub host: String,
+}
+pub fn default_port() -> u16 { 8080 }
+"#;
+    let tree = parse_rust(source);
+    let defs = definition_node_kinds(LangId::Rust);
+    let refs = collect_single_refs_for_test(
+        tree.root_node(),
+        source.as_bytes(),
+        "default_port",
+        "test.rs",
+        defs,
+        LangId::Rust,
+    );
+    let count_kind = |kind: RefKind| refs.iter().filter(|r| r.kind == Some(kind)).count();
+    assert_eq!(
+        (
+            count_kind(RefKind::Definition),
+            count_kind(RefKind::Reference)
+        ),
+        (1, 1),
+        "定義と属性の文字列の参照: {refs:?}"
+    );
+    let counts = count_refs_for_test(
+        tree.root_node(),
+        source.as_bytes(),
+        &["default_port".to_string()],
+        defs,
+        LangId::Rust,
+        1,
+    );
+    assert_eq!(counts[0], 1, "dead-code の件数にも数える");
+}
+
 /// `Option::is_none` のようなパス文字列では最終セグメントもカウントされることを検証
 #[test]
 fn rust_attr_string_ref_path_segments() {
@@ -562,8 +684,9 @@ fn rust_closure_bound_identifiers_are_not_references() {
             "struct shorthand pattern",
             "pub fn tail() -> u8 { 0 }\npub struct P { tail: u8 }\npub fn run(p: P) -> u8 { Some(p).map(|P { tail }| tail).unwrap_or(0) }\n",
             1,
-            // `pub struct P { tail: u8 }` のフィールド宣言は識別子の出現として `refs` に出る
-            1,
+            // `pub struct P { tail: u8 }` のフィールド宣言と、パターンの省略形 `P { tail }` の
+            // フィールド名は識別子の出現として `refs` に出る (closure 本体の `tail` は出ない)
+            2,
             0,
         ),
         (

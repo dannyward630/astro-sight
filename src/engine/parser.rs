@@ -20,12 +20,8 @@ pub fn parse_file(path: &Utf8Path, source: &[u8]) -> Result<(Tree, LangId)> {
 /// ため、拡張子だけではなく parser の実結果で判定する。
 pub fn detect_lang(path: &Utf8Path, source: &[u8]) -> Result<LangId> {
     let lang_id = LangId::from_path(path).or_else(|_| {
-        // shebang で言語検出を試行
-        let first_line = std::str::from_utf8(source)
-            .ok()
-            .and_then(|s| s.lines().next())
-            .unwrap_or("");
-        LangId::from_shebang(first_line)
+        // shebang で言語検出を試行 (先頭行だけを UTF-8 として検証する)
+        LangId::from_shebang_source(source)
             .ok_or_else(|| AstroError::unsupported_language(path.extension().unwrap_or("<none>")))
     })?;
 

@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use lru::LruCache;
 
 use crate::engine::{imports, parser};
-use crate::language::LangId;
+use crate::language::{LangId, normalize_identifier};
 
 /// ref file から抽出した「直接 import している specifier 末尾 basename 集合」と言語情報。
 /// 1 ファイル分の事実を per-worker LRU cache に保持する。
@@ -266,6 +266,10 @@ fn collect_qualified_path_names(source: &[u8], names: &mut HashSet<String>) {
             while j < n && (source[j] == b' ' || source[j] == b'\t') {
                 j += 1;
             }
+            // raw identifier (`a::r#gen`) の `r#` は名前の一部ではない。
+            if source[j..].starts_with(b"r#") {
+                j += 2;
+            }
             let start = j;
             while j < n && (source[j].is_ascii_alphanumeric() || source[j] == b'_') {
                 j += 1;
@@ -301,11 +305,12 @@ fn collect_rust_evidence(
 ) {
     match node.kind() {
         // qualified path (`render::json`) / use 経由 (`crate::render::json`) の末尾セグメント名。
+        // raw identifier (`a::r#gen`) は `r#` を外した名前で記録する (`normalize_identifier`)。
         "scoped_identifier" | "scoped_type_identifier" => {
             if let Some(name_node) = node.child_by_field_name("name")
                 && let Ok(text) = name_node.utf8_text(source)
             {
-                names.insert(text.to_string());
+                names.insert(normalize_identifier(LangId::Rust, text).into_owned());
             }
         }
         // glob import (`use crate::render::*;`) は名前解決不能 → 証拠ありとして high 側に倒す。
@@ -319,14 +324,14 @@ fn collect_rust_evidence(
                 match child.kind() {
                     "identifier" | "type_identifier" => {
                         if let Ok(text) = child.utf8_text(source) {
-                            names.insert(text.to_string());
+                            names.insert(normalize_identifier(LangId::Rust, text).into_owned());
                         }
                     }
                     "use_as_clause" => {
                         if let Some(alias) = child.child_by_field_name("alias")
                             && let Ok(text) = alias.utf8_text(source)
                         {
-                            names.insert(text.to_string());
+                            names.insert(normalize_identifier(LangId::Rust, text).into_owned());
                         }
                     }
                     _ => {}
@@ -338,7 +343,7 @@ fn collect_rust_evidence(
             if let Some(alias) = node.child_by_field_name("alias")
                 && let Ok(text) = alias.utf8_text(source)
             {
-                names.insert(text.to_string());
+                names.insert(normalize_identifier(LangId::Rust, text).into_owned());
             }
         }
         _ => {}
@@ -863,6 +868,30 @@ pub fn discover() -> i32 {
         );
         assert!(names.contains("read_to_string"));
         assert!(!glob);
+    }
+
+    /// raw identifier (`a::r#gen` / `use a::{r#gen}` / `use a::r#gen as r#g`) は `r#` を外した
+    /// 名前を証拠として記録する。旧実装は `r#gen` (AST) / `r` (テキストの走査) のまま記録し、
+    /// `gen` の証拠なしとして呼び出し元を low_confidence に回していた。
+    /// 対照: 修飾されていない `gen()` だけの行は従来どおり証拠にならない。
+    #[test]
+    fn extract_rust_ref_facts_strips_raw_identifier_prefix() {
+        for src in [
+            "pub fn run() -> u8 { a::r#gen() }\n",
+            "use a::{r#gen};\npub fn run() -> u8 { r#gen() }\n",
+            "macro_rules! m { () => { a::r#gen() }; }\n",
+        ] {
+            let (names, _) = extract_rust_ref_facts(src.as_bytes()).expect("parse ok");
+            assert!(names.contains("gen"), "{src}: {names:?}");
+            assert!(
+                !names.contains("r#gen") && !names.contains("r"),
+                "{src}: {names:?}"
+            );
+        }
+        let (names, _) = extract_rust_ref_facts(b"use a::r#gen as r#g;\n").expect("parse ok");
+        assert!(names.contains("g"), "{names:?}");
+        let (names, _) = extract_rust_ref_facts(b"pub fn run() -> u8 { gen() }\n").expect("ok");
+        assert!(!names.contains("gen"), "{names:?}");
     }
 
     #[test]

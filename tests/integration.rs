@@ -15,9 +15,11 @@ mod integration {
     mod dead_code;
     mod dead_code_conventions;
     mod dead_code_languages;
+    mod dead_code_locations;
     mod deep_nesting;
     mod git_non_ascii;
     mod hidden_and_angular_liveness;
+    mod identifier_spellings;
     mod impact;
     mod impact_diff_input;
     mod impact_object_members;
@@ -33,6 +35,7 @@ mod integration {
     mod refs;
     mod review;
     mod review_dead_scope;
+    mod runtime_invoked_symbols;
     mod sandbox;
     mod session;
     mod static_const_values;

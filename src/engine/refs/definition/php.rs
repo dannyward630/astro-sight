@@ -7,6 +7,7 @@
 use tree_sitter::Node;
 
 use crate::language::LangId;
+use crate::models::reference::RefConfidence;
 
 /// PHP: 識別子が「宣言の `name` フィールド」であるときだけ `Definition` とみなす。
 ///
@@ -116,8 +117,24 @@ fn php_ref_context_is_case_insensitive(parent: Node<'_>, effective: Node<'_>) ->
         "named_type" => true,
         // trait adaptation の trait 名 / 別名 (`use A, B { B::foo insteadof A; A::bar as baz; }`)
         "use_instead_of_clause" | "use_as_clause" => true,
+        // `$a instanceof Widget` の右辺のクラス名。`$a + FOO` の右辺 (定数、case-sensitive) と
+        // 同じ binary_expression なので、演算子が instanceof のときだけ case-fold する。
+        "binary_expression" => is_field("right") && php_binary_is_instanceof(parent),
+        // 属性 `#[Tracked]` / `#[\App\Tracked(1)]` のクラス名 (attribute の先頭の名前)。
+        // 引数の名前付き引数 (`name: 'x'`) は parent が argument なので巻き込まない。
+        "attribute" => parent
+            .named_child(0)
+            .is_some_and(|n| n.id() == effective.id()),
         _ => false,
     }
+}
+
+/// `binary_expression` の演算子が `instanceof` か。
+fn php_binary_is_instanceof(binary: Node<'_>) -> bool {
+    let mut cursor = binary.walk();
+    binary
+        .children(&mut cursor)
+        .any(|child| !child.is_named() && child.kind().eq_ignore_ascii_case("instanceof"))
 }
 
 /// PHP の名前空間 use 文が `use const ...` (定数 import) かを判定する。
@@ -157,20 +174,29 @@ fn php_namespace_use_is_const(clause: Node<'_>) -> bool {
     false
 }
 
-/// PHP の callable array `[<Class>::class, '<method>']` パターンから
+/// PHP の callable array `[<target>, '<method>']` パターンから
 /// `<method>` の文字列を method reference として返す (N3)。
 ///
 /// Laravel 7+ 推奨の Route 記法 `Route::get('/path', [Foo::class, 'bar'])` や
-/// `[Foo::class, 'method']` で `'method'` 部分が string literal となるため、
-/// tree-sitter の identifier ノードでは捕捉できない。誤検出を避けるため、
-/// 第1要素が `Foo::class` (= `class_constant_access_expression` の右辺が
-/// `class` キーワード) であり、第2要素が単独の string literal で
-/// 中身が PHP 識別子文法に合致する場合のみ ref として認める。
+/// `add_action('init', [$this, 'init'])` / `array_map([$this, 'x'], ...)` /
+/// `['Plugin', 'm']` / `[new Plugin(), 'm']` では `'method'` 部分が string literal と
+/// なるため、tree-sitter の identifier ノードでは捕捉できない。
+///
+/// 旧実装は第1要素が `X::class` の配列だけを受け付けていたため、`[$this, 'm']` などで
+/// しか渡さないメソッドが参照 0 件 = dead になっていた (同名メソッドが別クラスにあると
+/// member liveness が文字列を見て報告しないので、無関係なクラスの有無で結果が入れ替わる)。
+/// キーの無い 2 要素の配列で第2要素が PHP 識別子の形の文字列なら、第1要素が明らかに
+/// callable の対象になれないリテラルのときを除いて ref とする (名前の一致だけで数える
+/// 方針どおり、過大に数える側 = dead と断定しない側)。
+///
+/// 返す確信度は、同じ受け手での直接呼び出しにそろえる (`php_callable_target_confidence`)。
+/// 受け手の型が分からない `[$x, 'save']` を `$x->save()` より強い ExactOwner にすると、
+/// impact で汎用名の呼び出し元を blocking にしてしまう。
 pub(crate) fn php_callable_array_method_segment<'a>(
     node: Node<'_>,
     source: &'a [u8],
     lang_id: LangId,
-) -> Option<(&'a str, usize, usize)> {
+) -> Option<(&'a str, usize, usize, RefConfidence)> {
     if lang_id != LangId::Php || node.kind() != "array_creation_expression" {
         return None;
     }
@@ -182,28 +208,14 @@ pub(crate) fn php_callable_array_method_segment<'a>(
     if elements.len() != 2 {
         return None;
     }
-
-    // 第1要素: class_constant_access_expression で右辺が `class` キーワード
-    let first = elements[0];
-    let mut fc = first.walk();
-    let first_inner = first.children(&mut fc).next()?;
-    if first_inner.kind() != "class_constant_access_expression" {
-        return None;
-    }
-    let mut cc = first_inner.walk();
-    let has_class_kw = first_inner
-        .children(&mut cc)
-        .any(|c| c.kind() == "name" && c.utf8_text(source) == Ok("class"));
-    if !has_class_kw {
-        return None;
-    }
+    let target = php_array_element_value(elements[0])?;
+    let confidence = php_callable_target_confidence(target, source)?;
 
     // 第2要素: string / encapsed_string literal
-    let second = elements[1];
-    let mut sc = second.walk();
-    let str_node = second
-        .children(&mut sc)
-        .find(|c| c.kind() == "string" || c.kind() == "encapsed_string")?;
+    let str_node = php_array_element_value(elements[1])?;
+    if !matches!(str_node.kind(), "string" | "encapsed_string") {
+        return None;
+    }
     let raw = str_node.utf8_text(source).ok()?;
     let trimmed = raw.trim_matches(|c: char| c == '\'' || c == '"');
     if !is_php_identifier(trimmed) {
@@ -211,7 +223,53 @@ pub(crate) fn php_callable_array_method_segment<'a>(
     }
     let pos = str_node.start_position();
     // 引用符の次の文字を method 名の開始位置として登録する
-    Some((trimmed, pos.row, pos.column.saturating_add(1)))
+    Some((trimmed, pos.row, pos.column.saturating_add(1), confidence))
+}
+
+/// キーの無い配列要素 (`[$a, 'b']` の各要素) の値。キー付き (`'k' => $v`)・展開
+/// (`...$xs`)・参照 (`&$x`) の要素は callable の形ではないので None。
+fn php_array_element_value(element: Node<'_>) -> Option<Node<'_>> {
+    if element.named_child_count() != 1 || element.child_count() != 1 {
+        return None;
+    }
+    element.named_child(0)
+}
+
+/// callable 配列の第1要素 (対象) から、メソッド参照の確信度を決める。
+/// 対象になり得ないものは None。
+///
+/// - 数値・真偽値・null・配列は callable の対象にならない (None)。
+/// - 文字列はクラス名の形 (`'Plugin'` / `'\\App\\Plugin'`、各セグメントが大文字始まり) の
+///   ときだけ対象とし、クラスを名指ししているので ExactOwner。`['required', 'email']` の
+///   ような値の並びは数えない。
+/// - `X::class` (`self::class` / `static::class` を含む) はクラスを名指ししているので ExactOwner。
+///   `X::CONST` は定数の値が指すクラスが分からないので BareNameOnly。
+/// - それ以外の式は `$x->m()` の受け手と同じ判定 (`$this` は InferredOwner、型の手掛かりの
+///   ある変数は InferredOwner、ほかは BareNameOnly)。
+fn php_callable_target_confidence(target: Node<'_>, source: &[u8]) -> Option<RefConfidence> {
+    match target.kind() {
+        "integer" | "float" | "boolean" | "null" | "array_creation_expression" => None,
+        "string" | "encapsed_string" => target
+            .utf8_text(source)
+            .is_ok_and(|raw| {
+                is_php_class_path_strict(raw.trim_matches(|c: char| c == '\'' || c == '"'))
+            })
+            .then_some(RefConfidence::ExactOwner),
+        "class_constant_access_expression" => {
+            let mut cursor = target.walk();
+            let names_class = target
+                .children(&mut cursor)
+                .any(|c| c.kind() == "name" && c.utf8_text(source) == Ok("class"));
+            Some(if names_class {
+                RefConfidence::ExactOwner
+            } else {
+                RefConfidence::BareNameOnly
+            })
+        }
+        _ => Some(crate::engine::refs::role::php_receiver_confidence(
+            target, source,
+        )),
+    }
 }
 
 /// PHP の識別子文法 `[A-Za-z_][A-Za-z0-9_]*` に合致するかを判定する。
@@ -227,11 +285,13 @@ fn is_php_identifier(s: &str) -> bool {
 }
 
 /// PHP string literal が Laravel 互換の callable 表記 `Class@method` / `@method`
-/// (concat 連結の右辺) を含んでいれば、`method` 部分を ref として返す (N4)。
+/// (concat 連結の右辺)、または PHP 標準の静的 callable `'Class::method'` を含んでいれば、
+/// `method` 部分を ref として返す (N4)。
 ///
 /// 対象構文:
 /// 1. 純粋文字列 `'ClassName@handler'` / `'\\Fully\\Qualified\\Name@handler'`
 /// 2. 連結 `ClassName::class . '@handler'` の右辺 string (class_part が空)
+/// 3. 純粋文字列 `'ClassName::handler'` (`call_user_func('Plugin::boot')` など)
 ///
 /// 誤検出対策:
 /// - method 部分は PHP 識別子 (2 文字以上、英小文字または `_` で始まる)
@@ -260,9 +320,18 @@ pub(crate) fn php_string_callable_method_segment<'a>(
     }
     let body = &raw[1..raw.len() - 1];
 
-    let at_pos = body.find('@')?;
-    let class_part = &body[..at_pos];
-    let method_part = &body[at_pos + 1..];
+    // `Class@method` を優先し、無ければ `Class::method` (区切りは 2 byte)。
+    // `::` の形は class_part が空の連結を取らない (`X::class . '::m'` は callable ではない)。
+    let (class_part, separator_len, method_part) = match body.find('@') {
+        Some(at_pos) => (&body[..at_pos], 1, &body[at_pos + 1..]),
+        None => {
+            let sep = body.find("::")?;
+            if sep == 0 {
+                return None;
+            }
+            (&body[..sep], 2, &body[sep + 2..])
+        }
+    };
 
     if !is_php_method_name(method_part) {
         return None;
@@ -277,9 +346,9 @@ pub(crate) fn php_string_callable_method_segment<'a>(
     }
 
     let start = node.start_position();
-    // quote 1 byte + class_part bytes + '@' 1 byte。column は tree-sitter の仕様上
-    // byte offset 相当なので、method 先頭の byte 位置として足し合わせる。
-    let byte_offset = 1 + class_part.len() + 1;
+    // quote 1 byte + class_part bytes + 区切り ('@' 1 byte / '::' 2 byte)。column は
+    // tree-sitter の仕様上 byte offset 相当なので、method 先頭の byte 位置として足し合わせる。
+    let byte_offset = 1 + class_part.len() + separator_len;
     Some((
         method_part,
         start.row,

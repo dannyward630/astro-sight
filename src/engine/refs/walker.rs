@@ -211,10 +211,11 @@ impl MatchSet<'_> {
 
 /// hit の発生源。identifier ノード由来か、文字列セグメント由来 (synthetic) か。
 /// VisitorAdapter が confidence / usage role / macro callee 判定を行うため、
-/// identifier のときだけ元ノードを保持する。
+/// identifier のときだけ元ノードを保持する。synthetic は参照源が決めた確信度を持つ
+/// (PHP の callable 配列 `[$x, 'm']` は受け手に応じて `$x->m()` と同じ確信度にする)。
 pub(crate) enum HitOrigin<'tree> {
     Identifier(Node<'tree>),
-    Synthetic,
+    Synthetic(RefConfidence),
 }
 
 /// walk_refs が sink に渡す最小 hit 情報。context 抽出や列補正は sink 側で
@@ -430,14 +431,14 @@ impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
             _ => crate::engine::lexical_binding::LexicalBinding::Unknown,
         };
         // identifier 由来のときだけ receiver-aware 分類 / macro callee / usage role を計算。
-        // synthetic (文字列セグメント) は従来どおり ExactOwner / false / Other 固定。
+        // synthetic (文字列セグメント) は参照源が決めた確信度 / false / Other。
         let (confidence, rust_macro_callee, usage) = match hit.origin {
             HitOrigin::Identifier(node) => (
                 classify_method_ref_confidence(node, env.source, env.lang_id, hit.is_def),
                 is_rust_macro_invocation_callee(node, env.lang_id),
                 classify_ref_usage_role(node, env.lang_id),
             ),
-            HitOrigin::Synthetic => (RefConfidence::ExactOwner, false, RefUsageRole::Other),
+            HitOrigin::Synthetic(confidence) => (confidence, false, RefUsageRole::Other),
         };
         hit.matches.for_each_index(|ix| {
             self.visitor.on_ref(RefVisitEvent {
@@ -453,7 +454,7 @@ impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
                 lexical_binding,
                 node: match hit.origin {
                     HitOrigin::Identifier(node) => Some(node),
-                    HitOrigin::Synthetic => None,
+                    HitOrigin::Synthetic(_) => None,
                 },
                 source: env.source,
             });
@@ -494,11 +495,13 @@ const _: () = assert!(<SymbolReferenceSink<'static> as RawRefSink>::NEEDS_LINE_I
 /// synthetic 参照源 (文字列セグメント由来) 共通の hit 送出。segment が対象シンボルに
 /// 一致すれば `HitOrigin::Synthetic` の hit を sink に流す。各 source のループは
 /// walk_refs 内にそのまま残し、この 1 関数で送出処理だけを共有する。
+/// 確信度は参照源が決める (受け手の分からない参照源以外は ExactOwner)。
 #[inline]
 fn emit_synthetic_hit<M: RefMatcher, S: RawRefSink>(
     segment: &str,
     row: usize,
     column: usize,
+    confidence: RefConfidence,
     matcher: &M,
     sink: &mut S,
     env: &RefEnvironment<'_>,
@@ -507,7 +510,7 @@ fn emit_synthetic_hit<M: RefMatcher, S: RawRefSink>(
         sink.on_hit(
             RawRefHit {
                 matches,
-                origin: HitOrigin::Synthetic,
+                origin: HitOrigin::Synthetic(confidence),
                 line: row,
                 column,
                 is_def: false,
@@ -579,40 +582,45 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
         );
     }
 
+    let exact = RefConfidence::ExactOwner;
+
     // (2) Rust serde 属性文字列値
     for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
-        emit_synthetic_hit(seg, row, col, matcher, sink, env);
+        emit_synthetic_hit(seg, row, col, exact, matcher, sink, env);
     }
 
     // (3) bash `trap '<handler>' SIG` の handler 文字列
     for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
-        emit_synthetic_hit(&seg, row, col, matcher, sink, env);
+        emit_synthetic_hit(&seg, row, col, exact, matcher, sink, env);
     }
 
     // (4) PHPUnit DocBlock / attribute metadata
     for (seg, row, col) in phpunit_metadata_ref_segments(node, source, lang_id) {
-        emit_synthetic_hit(&seg, row, col, matcher, sink, env);
+        emit_synthetic_hit(&seg, row, col, exact, matcher, sink, env);
     }
 
-    // (5) PHP callable array `[Foo::class, 'method']`
-    if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id) {
-        emit_synthetic_hit(method, row, col, matcher, sink, env);
+    // (5) PHP callable array `[Foo::class, 'method']` / `[$this, 'method']` など。
+    //     確信度は第1要素 (受け手) に応じて直接呼び出しと同じにする。
+    if let Some((method, row, col, confidence)) =
+        php_callable_array_method_segment(node, source, lang_id)
+    {
+        emit_synthetic_hit(method, row, col, confidence, matcher, sink, env);
     }
 
-    // (6) PHP 文字列 callable `'Class@method'`
+    // (6) PHP 文字列 callable `'Class@method'` / `'Class::method'`
     if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id) {
-        emit_synthetic_hit(method, row, col, matcher, sink, env);
+        emit_synthetic_hit(method, row, col, exact, matcher, sink, env);
     }
 
     // (7) Ruby のシンボルリテラル `:name` / `%i[name]` / `:"name"`
     //     (`before_action :set_user` のようなメソッドの名指し) と値省略キー `{ name: }`
     if let Some((name, row, col)) = ruby_symbol_ref_segment(node, source, lang_id) {
-        emit_synthetic_hit(name, row, col, matcher, sink, env);
+        emit_synthetic_hit(name, row, col, exact, matcher, sink, env);
     }
 
     // (8) C/C++ のマクロ定義本体 (`#define CLAMP(v) clamp_impl(v)` の不透明テキスト)
     for (seg, row, col) in cpp_macro_body_ref_segments(node, source, lang_id) {
-        emit_synthetic_hit(seg, row, col, matcher, sink, env);
+        emit_synthetic_hit(seg, row, col, exact, matcher, sink, env);
     }
 }
 

@@ -572,12 +572,9 @@ pub(crate) fn detect_source_lang(path: &Path) -> Option<LangId> {
 /// 最初の 2 byte が `#!` でなければ即時 None。実行ビット等は判定せず、
 /// shebang の有無だけで言語推定可能かを決める。
 fn detect_lang_from_shebang_head(head: &[u8]) -> Option<LangId> {
-    if head.len() < 2 || &head[..2] != b"#!" {
-        return None;
-    }
-    let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
-    let first_line = std::str::from_utf8(&head[..line_end]).ok()?;
-    LangId::from_shebang(first_line)
+    // 解析側 (`parser::detect_lang` / `LangId::detect`) と同じ判定を使う。食い違うと、
+    // 走査対象に選んだファイルを解析で読めず、そこからの参照が黙って消える。
+    LangId::from_shebang_source(head)
 }
 
 /// パスのいずれかの中間ディレクトリ名が除外対象と完全一致するかを判定する。

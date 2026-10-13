@@ -88,6 +88,7 @@ pub(crate) fn is_rust_cfg_condition_identifier(node: Node<'_>, source: &[u8]) ->
 /// - `field_declaration` の field_identifier (struct のフィールド宣言)
 /// - `field_initializer` の field 側 field_identifier (`Config { redact: ... }`)
 /// - `field_pattern` の field_identifier (destructuring `let Cfg { redact: v } = ...`)
+/// - 省略形のパターンの `shorthand_field_identifier` (`let Cfg { redact, .. } = ...`)
 /// - `field_expression` の field_identifier で、祖先 `call_expression.function` でないもの
 ///   (純粋なフィールドアクセス `obj.redact`)
 ///
@@ -145,6 +146,9 @@ pub(crate) fn is_rust_struct_field_non_callable(node: Node<'_>) -> bool {
                 _ => false,
             }
         }
+        // `let Cfg { redact, .. } = c` / `Cfg { redact } =>` の省略形のパターン。
+        // フィールド名であると同時にローカルへの束縛で、同名の関数への参照ではない。
+        "shorthand_field_identifier" => true,
         _ => false,
     }
 }
@@ -407,6 +411,10 @@ const RUST_ATTR_STRING_REF_KEYS: &[&str] = &[
     "try_from",
     "from",
     "into",
+    // `#[serde(default = "default_port")]` の関数は serde の derive が呼ぶ。数えないと
+    // 属性からしか使われない関数を dead と報告する (消すとコンパイルできない)。
+    // 値の無い `#[serde(default)]` は文字列を持たないので影響しない。
+    "default",
 ];
 
 /// `string_content` ノードが Rust の serde 系属性値として現れるかを判定する。
@@ -440,7 +448,9 @@ fn is_rust_attribute_ref_string(node: Node<'_>, source: &[u8]) -> bool {
             let Some(key) = prev_prev else {
                 return false;
             };
-            if key.kind() != "identifier" {
+            // `default` は Rust の文脈依存キーワードで、token tree の中では `identifier` では
+            // なく無名のキーワードトークンになる。無名のトークンもテキストで照合する。
+            if key.kind() != "identifier" && key.is_named() {
                 return false;
             }
             let Ok(key_text) = key.utf8_text(source) else {

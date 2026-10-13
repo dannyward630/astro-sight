@@ -20,7 +20,7 @@ use rayon::prelude::*;
 use std::path::Path;
 
 use crate::engine::parser;
-use crate::language::{LangId, normalize_identifier};
+use crate::language::{LangId, identifier_prefilter_pattern, normalize_identifier};
 use crate::models::reference::{RefKind, SymbolReference};
 use crate::models::skip::SkippedFiles;
 use crate::models::truncation::TruncationInfo;
@@ -101,9 +101,11 @@ fn build_batch_acs(symbol_names: &[String]) -> Result<Vec<(usize, aho_corasick::
         // AC は ASCII CI で構築: CI 言語 (Xojo/PHP) で case 違いを事前フィルタで
         // 取りこぼさないため。非 CI 言語では多少の false positive (大文字小文字違い)
         // が発生するが、AST 比較で弾く。
+        // パターンは名前の一部でない書き方 (`r#` / 囲みの backtick) を外した形
+        // (`identifier_prefilter_pattern`)。外した形は元の部分文字列なので超集合のまま。
         let ac = aho_corasick::AhoCorasick::builder()
             .ascii_case_insensitive(true)
-            .build(chunk)
+            .build(chunk.iter().map(|name| identifier_prefilter_pattern(name)))
             .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?;
         acs.push((chunk_ix * split, ac));
     }
@@ -158,11 +160,14 @@ struct SingleNamePrefilter<'n> {
 
 impl<'n> SingleNamePrefilter<'n> {
     fn new(symbol_name: &'n str) -> Result<Self> {
+        // `r#gen` / `` `default` `` で検索しても、`gen()` / `.default()` とだけ書いた
+        // ファイルを読み飛ばさないよう、名前の一部でない書き方を外した形で探す。
+        let pattern = identifier_prefilter_pattern(symbol_name);
         Ok(Self {
-            exact: memchr::memmem::Finder::new(symbol_name.as_bytes()),
+            exact: memchr::memmem::Finder::new(pattern.as_bytes()),
             ci: aho_corasick::AhoCorasick::builder()
                 .ascii_case_insensitive(true)
-                .build([symbol_name])
+                .build([pattern])
                 .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?,
         })
     }
@@ -592,7 +597,11 @@ pub(crate) fn build_ac_case_insensitive(
 ) -> Result<aho_corasick::AhoCorasick> {
     aho_corasick::AhoCorasick::builder()
         .ascii_case_insensitive(true)
-        .build(symbol_names)
+        .build(
+            symbol_names
+                .iter()
+                .map(|name| identifier_prefilter_pattern(name)),
+        )
         .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))
 }
 

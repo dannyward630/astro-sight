@@ -29,11 +29,15 @@ fn php_callable_array_method_segment_extracts_method_string() {
         seg.is_some(),
         "[C::class, 'foo'] should yield a method segment, got None"
     );
-    let (m, _row, _col) = seg.unwrap();
+    let (m, _row, _col, confidence) = seg.unwrap();
+    assert_eq!(
+        confidence,
+        crate::models::reference::RefConfidence::ExactOwner
+    );
     assert_eq!(m, "foo");
 }
 
-/// 第1要素が `Class::class` でない場合は ref として認めない (誤検出防止)
+/// 第1要素が callable の対象になれないリテラルの場合は ref として認めない (誤検出防止)
 #[test]
 fn php_callable_array_method_segment_rejects_non_class_const() {
     // [1, 'foo'] や ['foo', 'bar'] は callable array ではない
@@ -509,6 +513,54 @@ echo foo();\n";
     );
 }
 
+/// `instanceof` の右辺と属性 `#[...]` のクラス名も、ほかのクラス名の文脈 (型ヒント・`new`・
+/// `catch`) と同じく大文字小文字を無視して照合する。
+///
+/// 旧実装は許可リストにこの 2 つの文脈が無く完全一致に落ちていたため、`$a instanceof widget`
+/// や `#[TRACKED]` を `refs --name Widget` / `Tracked` が返さず、`instanceof gadget` からだけ
+/// 使う `class Gadget` を dead と報告していた。
+///
+/// **対照ケースを内蔵する**: `$a + WIDGET` の右辺 (定数、case-sensitive) と、属性の名前付き
+/// 引数 (`name: 'x'`) は完全一致のまま。単一検索とバッチ検索は同じ結果を返す。
+#[test]
+fn php_instanceof_and_attribute_class_names_are_case_insensitive() {
+    let source: &[u8] = b"<?php\n\
+class Widget {}\n\
+#[\\Attribute] class Tracked {}\n\
+$d1 = $a instanceof Widget;\n\
+$d2 = $a instanceof widget;\n\
+$d3 = $a instanceof \\App\\WIDGET;\n\
+$c = $a + WIDGET;\n\
+#[TRACKED]\n\
+class UsesAttr {}\n\
+#[\\App\\tracked(name: 'widget')]\n\
+class UsesAttr2 {}\n";
+    let lang_id = LangId::Php;
+    let tree = parser::parse_source(source, lang_id).unwrap();
+    let root = tree.root_node();
+    let defs = definition_node_kinds(lang_id);
+    let names = vec!["Widget".to_string(), "Tracked".to_string()];
+    let batch = collect_batch_refs_for_test(root, source, &names, "t.php", defs, lang_id);
+    for (ix, name) in names.iter().enumerate() {
+        let single = collect_single_refs_for_test(root, source, name, "t.php", defs, lang_id);
+        assert_eq!(
+            ref_fingerprints(&single),
+            ref_fingerprints(&batch[ix]),
+            "single と batch は同じ結果 (name={name})"
+        );
+    }
+    let lines = |refs: &[SymbolReference]| -> Vec<usize> {
+        let mut out: Vec<usize> = refs.iter().map(|r| r.line).collect();
+        out.sort_unstable();
+        out
+    };
+    // Widget: 定義 (1)・instanceof の 3 形 (3, 4, 5)。`$a + WIDGET` (6) の定数と
+    // 名前付き引数の値 'widget' (9) は数えない。
+    assert_eq!(lines(&batch[0]), vec![1, 3, 4, 5], "{:?}", batch[0]);
+    // Tracked: 定義 (2)・`#[TRACKED]` (7)・`#[\App\tracked(...)]` (9)。
+    assert_eq!(lines(&batch[1]), vec![2, 7, 9], "{:?}", batch[1]);
+}
+
 /// PHP 8 の nullsafe 呼び出し `$g?->Fmtx()` のメソッド名も case-insensitive に照合する。
 ///
 /// `php_ref_context_is_case_insensitive` が `member_call_expression` しか見ておらず、
@@ -608,6 +660,105 @@ fn shebang_php_file_single_and_batch_agree_on_case_insensitive_call() {
     );
 }
 
+/// `$x->save()` の名前ノードを前順で `nth` 番目から取り出す。
+fn php_member_call_name_nodes<'t>(
+    root: tree_sitter::Node<'t>,
+    source: &[u8],
+    method: &str,
+) -> Vec<tree_sitter::Node<'t>> {
+    let mut out = Vec::new();
+    let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+        root,
+        crate::engine::tree_walk::Children::All,
+        |node, _| {
+            if node.kind() == "member_call_expression"
+                && let Some(name) = node.child_by_field_name("name")
+                && name.utf8_text(source) == Ok(method)
+            {
+                out.push(name);
+            }
+            std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+        },
+    );
+    out
+}
+
+/// 関数自身の型付き引数で受けた `$repo->save()` は InferredOwner になる。
+///
+/// 型の手掛かりを関数の本体の中だけで探していたため、本体の外にある引数リストを見ず、
+/// `function f(Repo $repo) { $repo->save(); }` が常に BareNameOnly になっていた。
+/// impact は BareNameOnly かつ汎用名 (`save` / `find` など) の参照を低確信度に回すので、
+/// 呼び出し元が hook の blocking から外れていた。
+///
+/// **対照ケースを内蔵する**: 型の無い引数・別名の型付き引数は従来どおり BareNameOnly、
+/// `new` の代入と `@var` コメントは従来どおり InferredOwner。
+#[test]
+fn php_typed_parameter_receiver_is_inferred_owner() {
+    use crate::models::reference::RefConfidence;
+    let cases: &[(&str, &str, RefConfidence)] = &[
+        (
+            "typed function parameter",
+            "<?php\nfunction persistParam(Repo $repo) { return $repo->save([]); }\n",
+            RefConfidence::InferredOwner,
+        ),
+        (
+            "typed method parameter",
+            "<?php\nclass S { public function m(Repo $repo) { return $repo->save([]); } }\n",
+            RefConfidence::InferredOwner,
+        ),
+        (
+            "typed arrow function parameter",
+            "<?php\n$f = fn(Repo $repo) => $repo->save([]);\n",
+            RefConfidence::InferredOwner,
+        ),
+        (
+            "typed closure parameter",
+            "<?php\n$g = function (Repo $repo) use ($x) { return $repo->save([]); };\n",
+            RefConfidence::InferredOwner,
+        ),
+        (
+            "promoted constructor parameter",
+            "<?php\nclass S { public function __construct(private Repo $repo) { $repo->save([]); } }\n",
+            RefConfidence::InferredOwner,
+        ),
+        (
+            "untyped parameter (control)",
+            "<?php\nfunction persist($repo) { return $repo->save([]); }\n",
+            RefConfidence::BareNameOnly,
+        ),
+        (
+            "typed parameter with another name (control)",
+            "<?php\nfunction persist(Repo $other, $repo) { return $repo->save([]); }\n",
+            RefConfidence::BareNameOnly,
+        ),
+        (
+            "outer typed parameter is not the closure's (control)",
+            "<?php\nfunction outer(Repo $repo) { return function () use ($repo) { return $repo->save([]); }; }\n",
+            RefConfidence::BareNameOnly,
+        ),
+        (
+            "new assignment (control)",
+            "<?php\nfunction persist() { $repo = new Repo(); return $repo->save([]); }\n",
+            RefConfidence::InferredOwner,
+        ),
+        (
+            "@var comment (control)",
+            "<?php\nfunction persist($repo) {\n  /** @var Repo $repo */\n  return $repo->save([]);\n}\n",
+            RefConfidence::InferredOwner,
+        ),
+    ];
+    for (label, source, expected) in cases {
+        let tree = parser::parse_source(source.as_bytes(), LangId::Php).unwrap();
+        let names = php_member_call_name_nodes(tree.root_node(), source.as_bytes(), "save");
+        assert_eq!(names.len(), 1, "{label}");
+        assert_eq!(
+            classify_method_ref_confidence(names[0], source.as_bytes(), LangId::Php, false),
+            *expected,
+            "{label}"
+        );
+    }
+}
+
 /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
 fn php_scope_has_inferable_var_type_recursive(
     node: tree_sitter::Node<'_>,
@@ -684,4 +835,145 @@ fn php_scope_has_inferable_var_type_matches_recursive_version() {
         },
     );
     assert!(checked > 30 && found > 0, "checked={checked} found={found}");
+}
+
+/// callable 配列 `[<target>, 'method']` と静的 callable 文字列 `'Class::method'` の
+/// `method` を参照として返す。
+///
+/// 旧実装は第1要素が `X::class` の配列と `Class@method` の文字列しか受け付けず、
+/// `add_action('init', [$this, 'init'])` / `usort($a, ['Plugin', 'cmp'])` /
+/// `[new Plugin(), 'm']` / `call_user_func('Plugin::m')` でしか渡さないメソッドを
+/// dead と報告していた。
+///
+/// **対照ケースを内蔵する**: 数値・真偽値・null・配列を第1要素に持つ配列、クラス名の形で
+/// ない文字列 (`['required', 'email']`)、キー付き・3 要素の配列、識別子の形でない第2要素は
+/// 従来どおり参照にしない。
+#[test]
+fn php_callable_forms_are_method_refs() {
+    use crate::models::reference::RefConfidence::{BareNameOnly, ExactOwner, InferredOwner};
+    // 確信度は同じ受け手での直接呼び出し (`$x->m()`) と同じ: クラスを名指しすれば ExactOwner、
+    // `$this` と型の手掛かりのある変数は InferredOwner、受け手の型が分からなければ BareNameOnly。
+    let cases: &[(
+        &str,
+        Option<(&str, crate::models::reference::RefConfidence)>,
+    )] = &[
+        ("[$this, 'viaThis']", Some(("viaThis", InferredOwner))),
+        (
+            "['Plugin', 'viaClassString']",
+            Some(("viaClassString", ExactOwner)),
+        ),
+        (
+            "['\\App\\Plugin', 'viaQualifiedString']",
+            Some(("viaQualifiedString", ExactOwner)),
+        ),
+        ("[new Plugin(), 'viaNew']", Some(("viaNew", BareNameOnly))),
+        (
+            "[$this->handler, 'viaMember']",
+            Some(("viaMember", BareNameOnly)),
+        ),
+        ("[$obj, 'viaVariable']", Some(("viaVariable", BareNameOnly))),
+        (
+            "[self::class, 'viaSelfClass']",
+            Some(("viaSelfClass", ExactOwner)),
+        ),
+        (
+            "[Plugin::class, 'viaClassConst']",
+            Some(("viaClassConst", ExactOwner)),
+        ),
+        (
+            "[Plugin::HANDLER, 'viaConst']",
+            Some(("viaConst", BareNameOnly)),
+        ),
+        (
+            "[$this, \"viaDoubleQuoted\"]",
+            Some(("viaDoubleQuoted", InferredOwner)),
+        ),
+        // 対照: callable の対象になれない第1要素
+        ("[1, 'foo']", None),
+        ("[true, 'foo']", None),
+        ("[null, 'foo']", None),
+        ("[['x'], 'foo']", None),
+        ("['required', 'email']", None),
+        // 対照: callable の形ではない配列
+        ("['k' => $this, 'm' => 'foo']", None),
+        ("[$this, 'foo', 'bar']", None),
+        ("[$this, 'not an identifier']", None),
+    ];
+    for (array, expected) in cases {
+        let source = format!("<?php\nfunction f($obj) {{ return {array}; }}\n");
+        let tree = parser::parse_source(source.as_bytes(), LangId::Php).unwrap();
+        let mut found = None;
+        let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+            tree.root_node(),
+            crate::engine::tree_walk::Children::All,
+            |node, _| {
+                if found.is_none() && node.kind() == "array_creation_expression" {
+                    found = Some(node);
+                }
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+            },
+        );
+        let array_node = found.expect("array_creation_expression");
+        let segment = php_callable_array_method_segment(array_node, source.as_bytes(), LangId::Php)
+            .map(|(name, _, _, confidence)| (name, confidence));
+        assert_eq!(segment, *expected, "{array}");
+    }
+    // 型付き引数の変数は `$x->m()` と同じく InferredOwner
+    let typed = "<?php\nfunction f(Repo $repo) { return [$repo, 'save']; }\n";
+    let tree = parser::parse_source(typed.as_bytes(), LangId::Php).unwrap();
+    let mut typed_array = None;
+    let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+        tree.root_node(),
+        crate::engine::tree_walk::Children::All,
+        |node, _| {
+            if typed_array.is_none() && node.kind() == "array_creation_expression" {
+                typed_array = Some(node);
+            }
+            std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+        },
+    );
+    assert_eq!(
+        php_callable_array_method_segment(
+            typed_array.expect("array"),
+            typed.as_bytes(),
+            LangId::Php
+        )
+        .map(|(name, _, _, confidence)| (name, confidence)),
+        Some(("save", InferredOwner))
+    );
+
+    let strings: &[(&str, Option<&str>)] = &[
+        ("'Plugin::viaStaticString'", Some("viaStaticString")),
+        ("'\\App\\Plugin::boot'", Some("boot")),
+        ("'Plugin@handle'", Some("handle")),
+        // 対照: クラス名の形でない・メソッド名の形でない・クラス名の無い `::`
+        ("'http://example.com'", None),
+        ("'a::b'", None),
+        ("'Plugin::'", None),
+        ("'::boot'", None),
+        ("'Plugin::Boot'", None),
+    ];
+    for (literal, expected) in strings {
+        let source = format!("<?php\ncall_user_func({literal});\n");
+        let tree = parser::parse_source(source.as_bytes(), LangId::Php).unwrap();
+        let mut found = None;
+        let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+            tree.root_node(),
+            crate::engine::tree_walk::Children::All,
+            |node, _| {
+                if found.is_none() && node.kind() == "string" {
+                    found = Some(node);
+                }
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+            },
+        );
+        let string_node = found.expect("string");
+        let segment =
+            php_string_callable_method_segment(string_node, source.as_bytes(), LangId::Php);
+        assert_eq!(segment.map(|(name, _, _)| name), *expected, "{literal}");
+        if let Some((name, row, column)) = segment {
+            let line = source.lines().nth(row).unwrap();
+            assert!(line[column..].starts_with(name), "{literal}: 位置 {column}");
+        }
+    }
 }

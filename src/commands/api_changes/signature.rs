@@ -3,42 +3,6 @@
 use super::signature_tokens::{SigTokens, signature_tokens_in_range};
 use super::*;
 
-/// dead_symbols のうち、宣言行が今回の diff の追加行 (`+` 行) と重なるもののみを残す。
-///
-/// `--dead-scope touched-symbols` の実装。`review --hook` のデフォルトとして使われ、
-/// 「changed file 内に元からあった dead」がレビューノイズとして毎回出る UX 問題を
-/// 解消する。
-///
-/// 注意: `HunkInfo` の `new_start` / `new_count` は context 行も含むため
-/// hunk 範囲全体を「touched」と扱うと既存 dead まで残してしまう。ここでは
-/// `extract_changed_new_lines` で **実際に追加された行** だけを set 化して照合する。
-pub(crate) fn extract_symbol_lines(
-    dir: &str,
-    file_path: &str,
-) -> Option<std::collections::HashMap<String, usize>> {
-    use std::collections::HashMap;
-    let full = std::path::Path::new(dir).join(file_path);
-    let utf8 = camino::Utf8Path::new(full.to_str()?);
-    let source = parser::read_file(utf8).ok()?;
-    let lang_id = parser::detect_lang(utf8, &source).ok()?;
-
-    let symbols = if let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {
-        crate::engine::lexer::extract_symbols(&source, lexer_lang)
-    } else {
-        let tree = parser::parse_source(&source, lang_id).ok()?;
-        crate::engine::symbols::extract_symbols(tree.root_node(), &source, lang_id).ok()?
-    };
-
-    let mut map = HashMap::new();
-    for s in symbols {
-        // 同名シンボルが複数ある場合、最初に出現した行を保持する。
-        // 宣言を共有する分割代入の束縛は、宣言の先頭ではなく名前の行を使う。
-        let line = s.name_line();
-        map.entry(s.name).or_insert(line);
-    }
-    Some(map)
-}
-
 /// シンボルの種類に応じた API シグネチャを抽出する。
 /// 関数/メソッド → 宣言行、struct/enum/trait/interface/class → 宣言行のみ。
 ///

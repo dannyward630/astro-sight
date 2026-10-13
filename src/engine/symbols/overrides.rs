@@ -54,10 +54,15 @@ fn find_method_declaration_for_override(node: Node) -> Option<Node> {
 
 /// `modifiers` 子ノードのテキストに `override` キーワードが含まれるかをチェックする。
 /// 単純な部分文字列マッチだと `overrider` のような名前にも反応するため、トークン境界を確認する。
+///
+/// tree-sitter-c-sharp は修飾子をコンテナに入れず、1 つずつ `modifier` (単数) ノードとして
+/// 宣言の直下に並べる。`modifiers` だけを見ていると C# の `protected override void OnStart()`
+/// を override と認識できず、フレームワークが呼ぶ `OnModelCreating` / `ToString` などを
+/// dead と報告していた。
 fn declaration_has_override_modifier(decl: Node, source: &[u8]) -> bool {
     let mut cursor = decl.walk();
     for child in decl.children(&mut cursor) {
-        if child.kind() != "modifiers" {
+        if !matches!(child.kind(), "modifiers" | "modifier") {
             continue;
         }
         let Ok(text) = child.utf8_text(source) else {

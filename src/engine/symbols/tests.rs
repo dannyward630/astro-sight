@@ -1358,6 +1358,26 @@ fn tsx_override_method_is_detected() {
     assert!(check_override(src, LangId::Tsx, "render"));
 }
 
+/// C# の `override` は `modifier` (単数) ノードとして宣言の直下に並ぶ。
+/// 旧実装は `modifiers` コンテナだけを探していたため C# の override を認識できず、
+/// `OnModelCreating` / `ToString` / `OnStart` などを dead と報告していた。
+/// 対照: `virtual` / `new` / 修飾子なしのメソッドは override ではない。
+#[test]
+fn csharp_override_modifier_is_detected() {
+    let src = r#"public class AppDb : DbContext {
+    protected override void OnModelCreating(ModelBuilder mb) {}
+    public override string ToString() { return "db"; }
+    protected virtual void Configure() {}
+    public new void Hide() {}
+    public void Plain() {}
+}"#;
+    assert!(check_override(src, LangId::CSharp, "OnModelCreating"));
+    assert!(check_override(src, LangId::CSharp, "ToString"));
+    assert!(!check_override(src, LangId::CSharp, "Configure"));
+    assert!(!check_override(src, LangId::CSharp, "Hide"));
+    assert!(!check_override(src, LangId::CSharp, "Plain"));
+}
+
 #[test]
 fn contains_keyword_respects_word_boundaries() {
     // `overrider` は `override` キーワードに誤マッチしないこと
@@ -1555,6 +1575,66 @@ fn python_generic_registration_decorators_detected() {
         assert!(
             check_python_framework_decorator(src, name),
             "登録デコレータとして扱うべき: {src}"
+        );
+    }
+}
+
+/// Celery の `@shared_task` と、Django のテンプレートタグ・フィルタ / admin の登録は
+/// runtime entrypoint。旧実装の表は `@app.task` (末尾名 `task`) だけで、同じ Celery の
+/// タスクでも書き方で結果が分かれ、テンプレートや admin からしか使われない関数・クラスを
+/// dead と報告していた。
+///
+/// 対照: 末尾名 `register` / `filter` / `tag` を広く登録扱いにはしない
+/// (`@cache.register` や `@query.filter` のような無関係なデコレータは登録入口ではない)。
+#[test]
+fn python_celery_shared_task_and_django_registrations_detected() {
+    for (src, name) in [
+        (
+            "from celery import shared_task\n\n@shared_task\ndef rebuild_index():\n    pass\n",
+            "rebuild_index",
+        ),
+        (
+            "@celery.shared_task(bind=True)\ndef retry_me(self):\n    pass\n",
+            "retry_me",
+        ),
+        (
+            "@register.filter\ndef currency(v):\n    return v\n",
+            "currency",
+        ),
+        (
+            "@register.filter(name=\"cut\")\ndef cut(v, arg):\n    return v\n",
+            "cut",
+        ),
+        (
+            "@register.simple_tag\ndef site_name():\n    return \"x\"\n",
+            "site_name",
+        ),
+        (
+            "@register.inclusion_tag(\"cart.html\")\ndef cart_summary(c):\n    return {}\n",
+            "cart_summary",
+        ),
+        (
+            "@register.tag\ndef upper(parser, token):\n    pass\n",
+            "upper",
+        ),
+        (
+            "@admin.register(Product)\nclass ProductAdmin(admin.ModelAdmin):\n    pass\n",
+            "ProductAdmin",
+        ),
+    ] {
+        assert!(
+            check_python_framework_decorator(src, name),
+            "登録デコレータとして扱うべき: {src}"
+        );
+    }
+    for (src, name) in [
+        ("@cache.register\ndef cached():\n    pass\n", "cached"),
+        ("@query.filter\ndef narrowed():\n    pass\n", "narrowed"),
+        ("@html.tag\ndef span():\n    pass\n", "span"),
+    ] {
+        assert!(
+            !check_python_framework_decorator(src, name),
+            "登録入口として扱ってはならない: {src}"
         );
     }
 }

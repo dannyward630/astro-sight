@@ -518,6 +518,11 @@ pub(crate) fn is_identifier_kind(kind: &str) -> bool {
             // テキストは `#` を含むので `refs --name '#load'` だけに一致し、公開名 `load`
             // とは取り違えない。ここに無いと定義も呼び出しもあるのに 0 件を返していた。
             | "private_property_identifier"
+            // Rust の構造体パターンの省略形 (`let Cfg { zeta, .. } = c` / `Cfg { zeta } =>`)
+            // のフィールド名。非省略形 (`Cfg { zeta: z }`) の `field_identifier` と同じく
+            // `refs` の出現として返す (フィールド名を変えるときは省略形も書き換えが要る)。
+            // impact / dead-code の判定面では `is_rust_struct_field_non_callable` が外す。
+            | "shorthand_field_identifier"
             | "simple_identifier"
             | "namespace_identifier"
             | "package_identifier"

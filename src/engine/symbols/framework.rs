@@ -1098,6 +1098,21 @@ fn decorator_matches_framework_pattern_python(decorator: Node, source: &[u8]) ->
         return true;
     }
 
+    // Django のテンプレートタグ・フィルタ (`register = template.Library()` への登録。
+    // テンプレートからしか呼ばれない) と admin の登録 (`@admin.register(Model)` の ModelAdmin)。
+    // 末尾名 `register` / `filter` / `tag` を広く足すと無関係なデコレータまで拾うので、
+    // Django が名前を決めている `register.<種類>` と `admin.register` の形だけに絞る。
+    const QUALIFIED_DECORATORS: &[&str] = &[
+        "register.filter",
+        "register.simple_tag",
+        "register.inclusion_tag",
+        "register.tag",
+        "admin.register",
+    ];
+    if QUALIFIED_DECORATORS.contains(&head) {
+        return true;
+    }
+
     let last = head.rsplit('.').next().unwrap_or(head);
     const TAIL_DECORATORS: &[&str] = &[
         // Typer / Click / Discord.py / aiogram
@@ -1127,8 +1142,9 @@ fn decorator_matches_framework_pattern_python(decorator: Node, source: &[u8]) ->
         "context_processor",
         "shell_context_processor",
         "before_first_request",
-        // Celery / RQ
+        // Celery / RQ (`@app.task` と、アプリを持たない再利用タスクの `@shared_task`)
         "task",
+        "shared_task",
         // pytest
         "fixture",
         "parametrize",
@@ -1465,39 +1481,76 @@ pub fn php_doc_has_runtime_annotation(doc: &str) -> bool {
     // `@\App\Annotations\TypeItem(...)` のような fully qualified 形式と
     // `@TypeItem(...)` のような short 形式の両方に対応するため、`@<Identifier>` を
     // 走査する。識別子の頭文字が大文字 (PHP の attribute / annotation 慣習) を要件にする。
-    for token in doc.split('@').skip(1) {
+    doc.split('@').skip(1).any(|token| {
         // token の先頭から識別子部分だけ取り出す
         let name: String = token
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '\\')
             .collect();
-        let last = name.rsplit('\\').next().unwrap_or(name.as_str());
-        // 大文字始まりの annotation (PSR / Doctrine 慣習) を検出
-        if last.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-            // `@TypeItem`, `@DataProvider`, `@Route`, `@Listen`, `@Bean` 等
-            return true;
-        }
-        // 小文字始まりでも reflection 経由でよく使われるものは別途列挙
-        const RUNTIME_LOWER_ANNOTATIONS: &[&str] = &[
-            "dataProvider",
-            "depends",
-            "test",
-            "before",
-            "after",
-            "beforeClass",
-            "afterClass",
-            "covers",
-            "uses",
-            "group",
-            "ticket",
-            "preserveGlobalState",
-            "runInSeparateProcess",
-        ];
-        if RUNTIME_LOWER_ANNOTATIONS.contains(&last) {
-            return true;
-        }
+        php_annotation_name_is_runtime(name.rsplit('\\').next().unwrap_or(name.as_str()))
+    })
+}
+
+/// PHP のメソッド / クラス宣言に、PHP 8 の属性で runtime annotation が付いているか
+/// (`#[Route('/products')]` / `#[Test]` / `#[\PHPUnit\Framework\Attributes\Before]`)。
+///
+/// 属性は docblock のアノテーション (`/** @Route */` / `/** @test */`) の後継で、Symfony 6
+/// 以降のルーティングや PHPUnit 10 以降のテストでは属性が標準になっている (PHPUnit 12 は
+/// docblock のメタデータを廃止)。docblock だけを見ていると、同じ意味のメソッドを属性で
+/// 書いたときだけ dead と報告していた。属性名 (名前空間の末尾) は docblock と同じ規則で判定する。
+pub fn php_declaration_has_runtime_attribute(
+    root: Node,
+    source: &[u8],
+    symbol_range: &Range,
+) -> bool {
+    let Some(declaration) = node_for_symbol_range(root, symbol_range)
+        .and_then(|node| enclosing_of_kind(node, &["method_declaration", "class_declaration"]))
+    else {
+        return false;
+    };
+    let Some(list) = declaration.child_by_field_name("attributes") else {
+        return false;
+    };
+    // attribute_list > attribute_group > attribute > (name | qualified_name)
+    let mut groups = list.walk();
+    list.named_children(&mut groups).any(|group| {
+        let mut attributes = group.walk();
+        group.named_children(&mut attributes).any(|attribute| {
+            attribute.kind() == "attribute"
+                && attribute
+                    .named_child(0)
+                    .and_then(|name| name.utf8_text(source).ok())
+                    .is_some_and(|name| {
+                        php_annotation_name_is_runtime(name.rsplit('\\').next().unwrap_or(name))
+                    })
+        })
+    })
+}
+
+/// PHP のアノテーション / 属性の名前 (名前空間の末尾) が runtime annotation か。
+fn php_annotation_name_is_runtime(last: &str) -> bool {
+    // 大文字始まりの annotation (PSR / Doctrine 慣習。`@TypeItem`, `@DataProvider`,
+    // `@Route`, `@Listen`, `@Bean` 等)
+    if last.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        return true;
     }
-    false
+    // 小文字始まりでも reflection 経由でよく使われるものは別途列挙
+    const RUNTIME_LOWER_ANNOTATIONS: &[&str] = &[
+        "dataProvider",
+        "depends",
+        "test",
+        "before",
+        "after",
+        "beforeClass",
+        "afterClass",
+        "covers",
+        "uses",
+        "group",
+        "ticket",
+        "preserveGlobalState",
+        "runInSeparateProcess",
+    ];
+    RUNTIME_LOWER_ANNOTATIONS.contains(&last)
 }
 
 #[cfg(test)]

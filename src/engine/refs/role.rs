@@ -191,22 +191,27 @@ fn classify_php_method_ref(node: Node<'_>, source: &[u8]) -> RefConfidence {
     }
 }
 
-/// `$x->bar()` の receiver `$x` の型を簡易判定する。
+/// `$x->bar()` の receiver `$x` の型を簡易判定する (`php_receiver_confidence`)。
+fn php_member_call_inferred_or_bare(call_expr: Node<'_>, source: &[u8]) -> RefConfidence {
+    // receiver ノードを取得 (member_call_expression の object フィールド)
+    match call_expr.child_by_field_name("object") {
+        Some(receiver) => php_receiver_confidence(receiver, source),
+        None => RefConfidence::BareNameOnly,
+    }
+}
+
+/// PHP の receiver 式 (`$x->bar()` の `$x`、callable 配列 `[$x, 'bar']` の `$x`) の型を
+/// 簡易判定する。
 ///
-/// 同一関数本体内で以下のいずれかが見つかれば InferredOwner、なければ BareNameOnly:
+/// 同一関数 (引数リストと本体) 内で以下のいずれかが見つかれば InferredOwner、なければ
+/// BareNameOnly:
 /// - `Foo $x` パラメータ型注釈 (parameter declaration with type)
 /// - `@var Foo $x` PHPDoc コメント (簡易テキスト検索)
 /// - `$x = new Foo(...)` 代入
 ///
 /// 詳細な型推論は行わず、見つかったら InferredOwner にする保守的判定。
-/// `$this->bar()` は InferredOwner (enclosing class が判明している)。
-fn php_member_call_inferred_or_bare(call_expr: Node<'_>, source: &[u8]) -> RefConfidence {
-    // receiver ノードを取得 (member_call_expression の object フィールド)
-    let receiver = call_expr.child_by_field_name("object");
-    let Some(receiver) = receiver else {
-        return RefConfidence::BareNameOnly;
-    };
-
+/// `$this` は InferredOwner (enclosing class が判明している)。
+pub(crate) fn php_receiver_confidence(receiver: Node<'_>, source: &[u8]) -> RefConfidence {
     // $this->bar(): enclosing class が型として推論可能
     if let Ok(rcv_text) = receiver.utf8_text(source)
         && rcv_text == "$this"
@@ -221,21 +226,28 @@ fn php_member_call_inferred_or_bare(call_expr: Node<'_>, source: &[u8]) -> RefCo
     };
 
     // 同一関数スコープを上方向に探索
-    let Some(func_body) = enclosing_function_body(call_expr) else {
+    let Some(function) = enclosing_function(receiver) else {
         return RefConfidence::BareNameOnly;
     };
 
-    // (1) パラメータ型注釈 / (2) `@var` コメント / (3) `new ClassName()` 代入を探す
+    // (1) パラメータ型注釈 / (2) `@var` コメント / (3) `new ClassName()` 代入を探す。
+    // 関数自身の引数リストは本体の外にある。本体だけを見ると `function f(Repo $repo)` の
+    // `$repo->save()` が常に BareNameOnly になり、汎用名のメソッドの呼び出し元が impact の
+    // blocking から外れていた。
     let var_marker = format!("${var_name}");
-    if php_scope_has_inferable_var_type(func_body, source, &var_marker) {
+    let inferable = ["parameters", "body"]
+        .into_iter()
+        .filter_map(|field| function.child_by_field_name(field))
+        .any(|scope| php_scope_has_inferable_var_type(scope, source, &var_marker));
+    if inferable {
         RefConfidence::InferredOwner
     } else {
         RefConfidence::BareNameOnly
     }
 }
 
-/// 与えられたノードを内包する関数 / メソッド本体ノードを返す。
-fn enclosing_function_body<'a>(node: Node<'a>) -> Option<Node<'a>> {
+/// 与えられたノードを内包する関数 / メソッドのノードを返す。
+fn enclosing_function<'a>(node: Node<'a>) -> Option<Node<'a>> {
     let mut current = node.parent();
     while let Some(n) = current {
         match n.kind() {
@@ -249,7 +261,7 @@ fn enclosing_function_body<'a>(node: Node<'a>) -> Option<Node<'a>> {
             | "anonymous_function"
             | "anonymous_function_creation_expression"
             | "arrow_function" => {
-                return n.child_by_field_name("body");
+                return Some(n);
             }
             _ => current = n.parent(),
         }
@@ -257,7 +269,7 @@ fn enclosing_function_body<'a>(node: Node<'a>) -> Option<Node<'a>> {
     None
 }
 
-/// 関数本体に変数 `var_marker` (`$x`) の型推論材料があるか。
+/// 部分木 (関数の引数リスト・本体) に変数 `var_marker` (`$x`) の型推論材料があるか。
 ///
 /// 本体は任意の式を含むので、子 1 段ごとに再帰すると深い配列・式を持つ関数 1 つで
 /// impact / context ごと落ちていた。反復で辿る。

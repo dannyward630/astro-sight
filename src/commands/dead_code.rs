@@ -10,9 +10,7 @@ use crate::models::review::DeadSymbol;
 
 #[cfg(test)]
 use super::api_changes::extract_exported_symbols_from_file_inner;
-use super::api_changes::{
-    bare_name, extract_exported_symbols_from_file_inner_with_lang, extract_symbol_lines,
-};
+use super::api_changes::{bare_name, extract_exported_symbols_from_file_inner_with_lang};
 use super::dead_code_default_liveness::DefaultExportLiveness;
 use super::dead_code_member_liveness::{
     JsTsMemberLiveness, MemberStatus, PhpMemberLiveness, RustMemberLiveness,
@@ -91,14 +89,19 @@ pub(crate) fn detect_dead_symbols(
     };
     let unanalyzable = scan.unanalyzable_truncations(&canonical_dir);
 
-    let index = build_dead_code_name_index(&candidates, &canonical_dir, files);
+    // テストからの参照かは `dir` からの相対パスで判定する。走査したファイルは絶対パスなので、
+    // そのまま渡すとリポジトリの親ディレクトリ名 (`~/test/myrepo` の `test`) まで照合し、
+    // 全参照をテストからの参照と数えていた (本番で使うシンボルが test_only になる)。
+    let is_test = |path: &std::path::Path| is_workspace_test_path(&canonical_dir, path);
+
+    let index = build_dead_code_name_index(&candidates, &canonical_dir, files, &is_test);
 
     // production / test 別に refs カウント。test/ 配下のみで参照されるシンボルは
     // dead_symbols ではなく test_only_symbols として分離する (F5)。
     let counts = match crate::engine::refs::count_non_definition_refs_split_in_files(
         &index.unique_names,
         &scan.files,
-        is_test_path,
+        is_test,
     ) {
         Ok(v) => v,
         Err(_) => return DeadCodeDetection::without_dead(generated_candidates_skipped),
@@ -107,12 +110,8 @@ pub(crate) fn detect_dead_symbols(
     let asset_refs = collect_framework_asset_refs(&canonical_dir);
     let default_liveness =
         DefaultExportLiveness::build(&candidates.all_syms, &canonical_dir, &scan.files);
-    let rust_member_liveness = RustMemberLiveness::build(
-        &candidates.all_syms,
-        &canonical_dir,
-        &scan.files,
-        is_test_path,
-    );
+    let rust_member_liveness =
+        RustMemberLiveness::build(&candidates.all_syms, &canonical_dir, &scan.files, is_test);
 
     let (mut dead, mut test_only) = classify_dead_symbols(
         &candidates,
@@ -152,23 +151,73 @@ pub(crate) fn collect_reference_scan(
 /// 検出済み dead / test-only シンボルに宣言行を付与する。
 ///
 /// `file` だけの報告は結局利用者が対象を探し直すことになるため行まで返す。
-/// `extract_symbol_lines` は per-file で 1 度だけ呼び、対象ファイル数ぶんの parse に
-/// 抑える (dead が 0 件のファイルは parse しない)。
+/// 行の表は per-file で 1 度だけ作り、対象ファイル数ぶんの parse に抑える
+/// (dead が 0 件のファイルは parse しない)。
 fn attach_declaration_lines(dir: &str, dead: &mut [DeadSymbol], test_only: &mut [DeadSymbol]) {
     use std::collections::HashMap;
-    let mut cache: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    let mut cache: HashMap<String, DeclarationLines> = HashMap::new();
     for sym in dead.iter_mut().chain(test_only.iter_mut()) {
-        let line_map = cache
+        let lines = cache
             .entry(sym.file.clone())
-            .or_insert_with(|| extract_symbol_lines(dir, &sym.file).unwrap_or_default());
-        // class member の name は qualname (`Container.method`) だが
-        // `extract_symbol_lines` のキーは bare name なので末尾セグメントでも引く
-        // (`filter_dead_by_touched_symbols` と同じ fallback)。
-        sym.line = line_map
-            .get(&sym.name)
-            .or_else(|| line_map.get(bare_name(&sym.name)))
-            .copied();
+            .or_insert_with(|| DeclarationLines::load(dir, &sym.file));
+        sym.line = lines.line_of(&sym.name);
     }
+}
+
+/// ファイル内のシンボルの宣言行 (0 始まり) の表。
+///
+/// dead / test-only の名前は class member だと qualname (`Container.member`) になる。
+/// 末尾の名前だけをキーにした表では同じファイルの同名メソッド (`Alpha.fmt` と `Beta.fmt`)
+/// が 1 つに潰れ、別のメソッドの行を報告していた。`--dead-scope touched-symbols` の判定も
+/// その行で行うため、触った dead を落とし、触っていない dead で hook を止める逆向きになる。
+#[derive(Default)]
+struct DeclarationLines {
+    /// container を持つシンボルは `Container.name`、持たないものは `name` → 宣言行 (先勝ち)。
+    by_qualname: std::collections::HashMap<String, usize>,
+    /// 末尾の名前 → (最初の宣言行, 同名の件数)。
+    by_bare: std::collections::HashMap<String, (usize, usize)>,
+}
+
+impl DeclarationLines {
+    fn load(dir: &str, file_path: &str) -> Self {
+        let mut lines = Self::default();
+        for symbol in extract_file_symbols(dir, file_path).unwrap_or_default() {
+            // 宣言を共有する分割代入の束縛は、宣言の先頭ではなく名前の行を使う。
+            let line = symbol.name_line();
+            let qualname = match &symbol.container {
+                Some(container) => format!("{container}.{}", symbol.name),
+                None => symbol.name.clone(),
+            };
+            lines.by_qualname.entry(qualname).or_insert(line);
+            lines.by_bare.entry(symbol.name).or_insert((line, 0)).1 += 1;
+        }
+        lines
+    }
+
+    /// `name` (qualname または bare name) の宣言行。qualname で引けないときは、同名が
+    /// ファイルに 1 つだけの場合に限り末尾の名前で引く (複数あると別のシンボルの行になる)。
+    fn line_of(&self, name: &str) -> Option<usize> {
+        self.by_qualname
+            .get(name)
+            .copied()
+            .or_else(|| match self.by_bare.get(bare_name(name)) {
+                Some(&(line, 1)) => Some(line),
+                _ => None,
+            })
+    }
+}
+
+/// `dir` 相対の `file_path` からシンボルを抽出する (container 付き)。
+fn extract_file_symbols(dir: &str, file_path: &str) -> Option<Vec<crate::models::symbol::Symbol>> {
+    let full = std::path::Path::new(dir).join(file_path);
+    let utf8 = camino::Utf8Path::new(full.to_str()?);
+    let source = parser::read_file(utf8).ok()?;
+    let lang_id = parser::detect_lang(utf8, &source).ok()?;
+    if let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {
+        return Some(crate::engine::lexer::extract_symbols(&source, lexer_lang));
+    }
+    let tree = parser::parse_source(&source, lang_id).ok()?;
+    crate::engine::symbols::extract_symbols(tree.root_node(), &source, lang_id).ok()
 }
 
 /// 候補収集の中間状態。dead-code 候補シンボルと C/C++ liveness 補助情報を保持する。
@@ -273,18 +322,31 @@ struct DeadCodeNameIndex {
 /// refs 検索は AST 上の identifier ノードに対してマッチするため、
 /// `Container.method` 形式の qualname ではマッチせず常に 0 件となってしまう。
 /// そのため検索キーは末尾セグメント（bare name）に統一する。
+///
+/// Bash は qualname を作らない一方、関数名に `.` を使える (`utils.log() { … }`)。
+/// 末尾で畳むと呼び出し `utils.log` を `log` で探して 0 件になり、呼ばれている関数を
+/// dead と報告していたので、名前全体を検索キーにする (API 差分の参照索引と同じ扱い)。
 fn normalized_bare_name(lang: crate::language::LangId, name: &str) -> String {
-    crate::language::normalize_identifier(lang, bare_name(name)).into_owned()
+    let key = if lang == crate::language::LangId::Bash {
+        name
+    } else {
+        bare_name(name)
+    };
+    crate::language::normalize_identifier(lang, key).into_owned()
 }
 
 /// 候補シンボルから同名カウント / liveness alias / refs 検索対象名のインデックスを構築する。
 /// `candidate_files` は diff 由来の候補ファイル (hidden 配下含む)。member liveness の
 /// 走査集合は count 経路と同じ `collect_reference_scan` で作る。
-fn build_dead_code_name_index(
+fn build_dead_code_name_index<F>(
     candidates: &DeadCodeCandidates,
     canonical_dir: &std::path::Path,
     candidate_files: &[std::path::PathBuf],
-) -> DeadCodeNameIndex {
+    is_test: &F,
+) -> DeadCodeNameIndex
+where
+    F: Fn(&std::path::Path) -> bool + Sync,
+{
     // 同名 export が複数ファイル/複数コンテナに存在する場合は保守的にスキップ（誤判定防止）。
     // キーは bare name を言語別に正規化したもの (Xojo では `Foo` と `FOO` を同一視)。
     let mut name_counts: std::collections::HashMap<String, usize> =
@@ -340,13 +402,13 @@ fn build_dead_code_name_index(
         &candidates.all_syms,
         canonical_dir,
         candidate_files,
-        is_test_path,
+        is_test,
     );
     let php_member_liveness = PhpMemberLiveness::build(
         &candidates.all_syms,
         canonical_dir,
         candidate_files,
-        is_test_path,
+        is_test,
     );
 
     DeadCodeNameIndex {
@@ -599,13 +661,26 @@ pub(crate) const TEST_DIRECTORY_SEGMENTS: &[&str] = &[
     "integrationTest",
 ];
 
+/// `canonical_dir` 配下の絶対パスについて、`dir` からの相対パスでテストのファイルか判定する。
+///
+/// 親ディレクトリの名前 (`/builds/test/<project>` の `test`) はリポジトリ内のファイルが
+/// テストかどうかと関係ない。ディレクトリ除外 (`refs/files.rs`) と
+/// `filter_diff_files_for_dead_code` も同じ理由で `dir` 相対にしている。
+/// `canonical_dir` の外のパスは従来どおりそのまま判定する。
+pub(crate) fn is_workspace_test_path(
+    canonical_dir: &std::path::Path,
+    path: &std::path::Path,
+) -> bool {
+    is_test_path(path.strip_prefix(canonical_dir).unwrap_or(path))
+}
+
 /// refs カウントを production / test に振り分けるための判定関数。
 ///
 /// - ファイル名規約 (`*_test.go`, `*Test.php`, `*_spec.rb` 等) は既存の
 ///   `is_test_file_path` に委譲する。
 /// - ディレクトリセグメント規約は `TEST_DIRECTORY_SEGMENTS` に一元化。
 ///
-/// 引数はファイルシステム上の絶対パスなので、区切り文字はプラットフォーム依存
+/// 引数はファイルシステム上のパス (`dir` 相対、または絶対パス) なので、区切り文字はプラットフォーム依存
 /// (Windows では `\`)。文字列を `/` 前提で分解すると Windows でどちらの規約にも
 /// マッチせず、テストからの参照が production 参照として数えられてしまう
 /// (`test_only_symbols` が常に空になり、テスト専用シンボルが live 扱いになる)。
@@ -659,7 +734,7 @@ pub(crate) fn filter_dead_by_touched_symbols(
 
     // 「ファイル → 追加行 set (0-indexed)」「ファイル → シンボル名→宣言行」を per-file キャッシュ。
     let mut changed_lines_cache: HashMap<String, HashSet<usize>> = HashMap::new();
-    let mut sym_lines_cache: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    let mut sym_lines_cache: HashMap<String, DeclarationLines> = HashMap::new();
 
     dead.into_iter()
         .filter(|ds| {
@@ -672,17 +747,14 @@ pub(crate) fn filter_dead_by_touched_symbols(
                 .or_insert_with(|| {
                     crate::engine::diff::extract_changed_new_lines(diff_input, &ds.file)
                 });
-            let line_map = sym_lines_cache
+            let lines = sym_lines_cache
                 .entry(ds.file.clone())
-                .or_insert_with(|| extract_symbol_lines(dir, &ds.file).unwrap_or_default());
-            // DeadSymbol.name は class member だと qualname (`Container.method`) だが、
-            // `extract_symbol_lines` のキーは bare name。qualname で引けない場合は
-            // 末尾セグメントで再 lookup しないと member が常に「宣言行不明 → touched 扱い」
-            // に落ち、touched-symbols フィルタが no-op になる。
-            let line_lookup = line_map
-                .get(&ds.name)
-                .or_else(|| line_map.get(bare_name(&ds.name)));
-            let Some(&line) = line_lookup else {
+                .or_insert_with(|| DeclarationLines::load(dir, &ds.file));
+            // DeadSymbol.name は class member だと qualname (`Container.method`)。
+            // qualname で引き、同名が 1 つだけのときに限り末尾の名前でも引く
+            // (`DeclarationLines::line_of`)。同名の別メソッドの行で判定すると、
+            // 触った dead を落とし、触っていない dead を残す逆向きになる。
+            let Some(line) = lines.line_of(&ds.name) else {
                 // 宣言行が引けない (lexer-only で取り漏れ等) は保守的に touched 扱いで残す。
                 return true;
             };

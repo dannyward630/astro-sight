@@ -24,7 +24,9 @@ use super::definition::rust::{
 use super::definition::{is_identifier_kind, is_ignored_identifier_context};
 use super::files::is_generated_file;
 use super::line_index::{extract_line_context_bytes_indexed, extract_line_context_indexed};
-use super::role::{classify_ref_usage_role, php_scope_has_inferable_var_type};
+use super::role::{
+    classify_method_ref_confidence, classify_ref_usage_role, php_scope_has_inferable_var_type,
+};
 use super::walker::SymbolReferenceSink;
 
 /// テスト用: 単一名の in-memory 参照収集 (SingleMatcher + SymbolReferenceSink)。
