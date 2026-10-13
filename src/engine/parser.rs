@@ -76,12 +76,18 @@ fn header_has_cpp_marker(source: &[u8]) -> bool {
         .any(|marker| memchr::memmem::find(source, marker).is_some())
 }
 
-fn parse_error_score(node: tree_sitter::Node<'_>) -> usize {
-    let mut score = usize::from(node.is_error() || node.is_missing());
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        score += parse_error_score(child);
-    }
+/// 木全体の ERROR / MISSING ノードの数。
+///
+/// `.h` に C++ の目印 (コメント中の `::` でもよい) があるとほぼすべての解析の入口
+/// (`parse_file`) から呼ばれる。子 1 段ごとに再帰すると、深い入れ子の初期化子や長い
+/// `||` の連鎖を持つヘッダ 1 つで refs / dead-code ごと落ちていたため、反復で数える。
+fn parse_error_score(root: tree_sitter::Node<'_>) -> usize {
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    let mut score = 0;
+    let _: std::ops::ControlFlow<()> = walk_preorder(root, Children::All, |node, _| {
+        score += usize::from(node.is_error() || node.is_missing());
+        std::ops::ControlFlow::Continue(Walk::Descend)
+    });
     score
 }
 
@@ -324,6 +330,42 @@ mod tests {
         let source = b"struct plain_c_header { int value; };\n";
         let lang = detect_lang(camino::Utf8Path::new("plain.h"), source).unwrap();
         assert_eq!(lang, LangId::C);
+    }
+
+    /// 修正前の再帰版。反復版と数が一致することを確かめる参照実装 (浅い入力でだけ使う)。
+    fn parse_error_score_recursive(node: tree_sitter::Node<'_>) -> usize {
+        let mut score = usize::from(node.is_error() || node.is_missing());
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            score += parse_error_score_recursive(child);
+        }
+        score
+    }
+
+    /// 反復版の ERROR / MISSING の数は、C と C++ の両方の木で再帰版と一致する
+    /// (C++ 判定は 2 つの数の大小で決まるので、両方の木で確かめる)。
+    #[test]
+    fn parse_error_score_matches_recursive_version() {
+        let sources: &[&[u8]] = &[
+            b"template <typename T> struct Base {};\nstruct E : public Base<E> {};\n",
+            b"class A { public: int f(int x) { return x::y; } };\nint g( { return ;\n",
+            b"namespace n { int x = (1 + ; }\nstruct S { int a; };\n",
+            b"struct plain_c_header { int value; };\n",
+        ];
+        for source in sources {
+            for lang_id in [LangId::C, LangId::Cpp] {
+                let tree = parse_source(source, lang_id).unwrap();
+                assert_eq!(
+                    parse_error_score(tree.root_node()),
+                    parse_error_score_recursive(tree.root_node()),
+                    "{lang_id}: {}",
+                    String::from_utf8_lossy(source)
+                );
+            }
+        }
+        // 対照: エラーを含む入力では 0 でない数を数えている
+        let tree = parse_source(sources[1], LangId::C).unwrap();
+        assert!(parse_error_score(tree.root_node()) > 0);
     }
 
     /// SourceBuf::Vec の Deref が正しくバイト列を返す

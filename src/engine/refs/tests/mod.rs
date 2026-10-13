@@ -18,11 +18,13 @@ use super::definition::cpp::cpp_macro_body_ref_segments;
 use super::definition::php::{
     php_callable_array_method_segment, php_string_callable_method_segment,
 };
-use super::definition::rust::{rust_attr_string_ref_segments, split_path_segments};
+use super::definition::rust::{
+    rust_attr_string_ref_segments, rust_file_declares_non_binding_name, split_path_segments,
+};
 use super::definition::{is_identifier_kind, is_ignored_identifier_context};
 use super::files::is_generated_file;
 use super::line_index::{extract_line_context_bytes_indexed, extract_line_context_indexed};
-use super::role::classify_ref_usage_role;
+use super::role::{classify_ref_usage_role, php_scope_has_inferable_var_type};
 use super::walker::SymbolReferenceSink;
 
 /// テスト用: 単一名の in-memory 参照収集 (SingleMatcher + SymbolReferenceSink)。

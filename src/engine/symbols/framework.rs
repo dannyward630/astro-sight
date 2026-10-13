@@ -900,21 +900,14 @@ fn class_has_ng_value_accessor_provider(class_node: Node, source: &[u8]) -> bool
     false
 }
 
-/// `node` 配下の任意の identifier ノードが `target` と一致するかを再帰的に探す。
+/// `node` 配下の任意の identifier ノードが `target` と一致するかを探す。
+///
+/// decorator の引数は任意の式なので、子 1 段ごとに再帰すると深い入れ子の配列・式を
+/// 持つ decorator 1 つで dead-code ごと落ちていた。反復で辿る。
 fn node_contains_identifier(node: Node, source: &[u8], target: &str) -> bool {
-    if node.kind() == "identifier"
-        && let Ok(t) = node.utf8_text(source)
-        && t == target
-    {
-        return true;
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if node_contains_identifier(child, source, target) {
-            return true;
-        }
-    }
-    false
+    crate::engine::tree_walk::any_node(node, crate::engine::tree_walk::Children::All, |n| {
+        n.kind() == "identifier" && n.utf8_text(source).is_ok_and(|t| t == target)
+    })
 }
 
 const ANGULAR_PROVIDER_CALLBACK_TOKENS: &[&str] = &["RECAPTCHA_LOADER_OPTIONS"];
@@ -1505,4 +1498,57 @@ pub fn php_doc_has_runtime_annotation(doc: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language::LangId;
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn node_contains_identifier_recursive(node: Node, source: &[u8], target: &str) -> bool {
+        if node.kind() == "identifier"
+            && let Ok(t) = node.utf8_text(source)
+            && t == target
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if node_contains_identifier_recursive(child, source, target) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 反復版は、どのノードを根にしても再帰版と同じ判定を返す。
+    #[test]
+    fn node_contains_identifier_matches_recursive_version() {
+        let source = "@Component({ providers: [{ provide: NG_VALUE_ACCESSOR, useExisting: forwardRef(() => C), multi: true }], meta: [[\"NG_VALUE_ACCESSOR\"]] })\nexport class C { writeValue(v: unknown) { return v; } }\n";
+        let tree = crate::engine::parser::parse_source(source.as_bytes(), LangId::Typescript)
+            .expect("parse");
+        let mut checked = 0;
+        let mut found = 0;
+        let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+            tree.root_node(),
+            crate::engine::tree_walk::Children::All,
+            |node, _| {
+                for target in ["NG_VALUE_ACCESSOR", "forwardRef", "C", "missing"] {
+                    let expected =
+                        node_contains_identifier_recursive(node, source.as_bytes(), target);
+                    assert_eq!(
+                        node_contains_identifier(node, source.as_bytes(), target),
+                        expected,
+                        "{target} under {}",
+                        node.kind()
+                    );
+                    found += usize::from(expected);
+                }
+                checked += 1;
+                std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+            },
+        );
+        assert!(checked > 20 && found > 0, "checked={checked} found={found}");
+    }
 }

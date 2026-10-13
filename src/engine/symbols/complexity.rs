@@ -1,5 +1,8 @@
+use std::ops::ControlFlow;
+
 use tree_sitter::Node;
 
+use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 use crate::language::LangId;
 
 /// 関数/メソッドノードの循環的複雑度を算出する（ベース1 + 分岐ノード数）。
@@ -7,35 +10,36 @@ use crate::language::LangId;
 pub fn calculate_complexity(node: Node, lang_id: LangId) -> usize {
     let branch_kinds = branch_node_kinds(lang_id);
     let func_kinds = function_boundary_kinds(lang_id);
-    let mut count = 1; // ベース複雑度
-    count_branch_nodes(node, branch_kinds, func_kinds, true, &mut count);
-    count
+    1 + count_branch_nodes(node, branch_kinds, func_kinds) // ベース複雑度 1
 }
 
-/// 再帰的に分岐ノードをカウントする。
-/// ネストした関数境界（クロージャ・内部関数）で走査を停止する。
+/// 関数本体の分岐ノードを数える。
+/// ネストした関数境界（クロージャ・内部関数）の中には降りない。
+///
+/// 子 1 段ごとに再帰すると、関数の中の深い括弧や長い `else if` / `||` の連鎖
+/// (構文として正しい) でスタックが溢れ、symbols / MCP がプロセスごと落ちていた。
+/// 1 つの TreeCursor で前順に辿る。
 fn count_branch_nodes(
     node: Node,
     branch_kinds: &'static [&'static str],
     func_kinds: &[&str],
-    is_root: bool,
-    count: &mut usize,
-) {
-    let kind = node.kind();
-    // ルート以外の関数境界で停止（ネスト関数の分岐を除外）
-    if !is_root && func_kinds.contains(&kind) {
-        return;
-    }
-    // named ノードのみ計上する。tree-sitter-ruby では `if` 文ノードと
-    // キーワードトークン `if` が同じ kind 名を持つため、named 制約が無いと
-    // 分岐が二重計上される（他言語の分岐ノードは全て named なので無影響）。
-    if node.is_named() && branch_kinds.contains(&kind) {
-        *count += 1;
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        count_branch_nodes(child, branch_kinds, func_kinds, false, count);
-    }
+) -> usize {
+    let mut count = 0;
+    let _: ControlFlow<()> = walk_preorder(node, Children::All, |n, depth| {
+        let kind = n.kind();
+        // ルート以外の関数境界で停止（ネスト関数の分岐を除外）
+        if depth != 0 && func_kinds.contains(&kind) {
+            return ControlFlow::Continue(Walk::Skip);
+        }
+        // named ノードのみ計上する。tree-sitter-ruby では `if` 文ノードと
+        // キーワードトークン `if` が同じ kind 名を持つため、named 制約が無いと
+        // 分岐が二重計上される（他言語の分岐ノードは全て named なので無影響）。
+        if n.is_named() && branch_kinds.contains(&kind) {
+            count += 1;
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
+    count
 }
 
 /// 関数境界を示すノード種別を返す（ネスト関数検出用）。
@@ -369,6 +373,76 @@ mod tests {
                 lang_id,
                 "function_boundary_kinds",
                 function_boundary_kinds(lang_id),
+            );
+        }
+    }
+
+    /// 修正前の再帰版。反復版と数が一致することを確かめる参照実装 (浅い入力でだけ使う)。
+    fn count_branch_nodes_recursive(
+        node: Node,
+        branch_kinds: &[&str],
+        func_kinds: &[&str],
+        is_root: bool,
+        count: &mut usize,
+    ) {
+        let kind = node.kind();
+        if !is_root && func_kinds.contains(&kind) {
+            return;
+        }
+        if node.is_named() && branch_kinds.contains(&kind) {
+            *count += 1;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            count_branch_nodes_recursive(child, branch_kinds, func_kinds, false, count);
+        }
+    }
+
+    /// 反復版は、どのノードを根にしても再帰版と同じ数を返す。根が関数境界のとき
+    /// (関数自身) は降り、根より下の境界 (closure・入れ子の関数) には降りないことを含む。
+    #[test]
+    fn count_branch_nodes_matches_recursive_version() {
+        let cases: &[(LangId, &str)] = &[
+            (
+                LangId::Javascript,
+                "function f(a) {\n  if (a) { return () => (a ? 1 : 2); } else if (b) { for (;;) {} }\n  return a || (b && c);\n}\n",
+            ),
+            (
+                LangId::Ruby,
+                "def f(a)\n  if a\n    1\n  elsif b\n    2\n  end\n  x = a ? 1 : 2\n  y = lambda { |v| v if v }\n  return 3 unless a\nend\n",
+            ),
+            (
+                LangId::Rust,
+                "fn f(a: u8) -> u8 {\n  let g = |x: u8| if x > 0 { 1 } else { 2 };\n  let _h = async move { if a > 1 { 3 } else { 4 } };\n  match a { 0 => 1, 1 if a > 0 => 2, _ => g(a) }\n}\n",
+            ),
+            (
+                LangId::Python,
+                "def f(a):\n    if a:\n        return 1\n    elif a > 2:\n        return 2\n    g = lambda v: 1 if v else 2\n    def inner(b):\n        while b:\n            b -= 1\n    return [x for x in a if x]\n",
+            ),
+        ];
+        for &(lang_id, source) in cases {
+            let tree = crate::engine::parser::parse_source(source.as_bytes(), lang_id).unwrap();
+            let branch_kinds = branch_node_kinds(lang_id);
+            let func_kinds = function_boundary_kinds(lang_id);
+            let mut roots = 0;
+            let mut non_zero = 0;
+            let _: ControlFlow<()> = walk_preorder(tree.root_node(), Children::All, |node, _| {
+                let mut expected = 0;
+                count_branch_nodes_recursive(node, branch_kinds, func_kinds, true, &mut expected);
+                assert_eq!(
+                    count_branch_nodes(node, branch_kinds, func_kinds),
+                    expected,
+                    "{lang_id}: root {} at {:?}",
+                    node.kind(),
+                    node.start_position()
+                );
+                roots += 1;
+                non_zero += usize::from(expected > 0);
+                ControlFlow::Continue(Walk::Descend)
+            });
+            assert!(
+                roots > 10 && non_zero > 3,
+                "{lang_id}: roots={roots} non_zero={non_zero}"
             );
         }
     }

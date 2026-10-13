@@ -757,7 +757,12 @@ pub fn cmd_session(output: OutputOptions) -> Result<()> {
 
 pub fn cmd_mcp(output: OutputOptions) -> Result<()> {
     use rmcp::ServiceExt;
-    let rt = tokio::runtime::Runtime::new()?;
+    // ツールの処理は tokio のワーカースレッドで走る。スタックは既定 (2 MiB) ではなく
+    // main・rayon のワーカーと同じ 8 MiB にそろえる (`Runtime::new()` と同じ構成)。
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(crate::engine::WORKER_STACK_SIZE)
+        .build()?;
     rt.block_on(async {
         // JSON-RPC transport 自体は常に JSON。`output` はツール結果の
         // text content をどちらで返すかだけを決める。

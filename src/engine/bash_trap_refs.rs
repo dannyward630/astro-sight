@@ -127,37 +127,39 @@ enum HandlerArg<'a> {
     DoubleString(Node<'a>),
 }
 
-/// 内側 AST を再帰走査し、`command_name` を再帰的に拾う。
+/// 内側 AST を前順に辿り、`command_name` を拾う。
 ///
 /// `command_name` の子が `word` 等で静的に名前が取れる場合のみ採用する。
 /// `${var}` のような動的コマンド名は skip (utf8_text が取れても変数展開ノードを
 /// 含むため、ここでは「子が word 単一」のみを採用)。
+///
+/// handler 文字列は任意のシェルコードなので、子 1 段ごとに再帰すると深い入れ子の
+/// サブシェルを持つ trap 1 つで refs ごと落ちていた。反復で辿る。
 fn collect_command_names(
-    node: Node<'_>,
+    root: Node<'_>,
     inner_bytes: &[u8],
     out: &mut Vec<(String, usize, usize)>,
     outer_row: usize,
     outer_col: usize,
 ) {
-    if node.kind() == "command_name" {
-        // command_name の子を確認: 静的な word が単独で存在する場合のみ採用
-        let mut child_cursor = node.walk();
-        let children: Vec<Node<'_>> = node.children(&mut child_cursor).collect();
-        if children.len() == 1
-            && children[0].kind() == "word"
-            && let Ok(name_text) = children[0].utf8_text(inner_bytes)
-        {
-            let inner_pos = children[0].start_position();
-            let (row, col) =
-                translate_position(inner_pos.row, inner_pos.column, outer_row, outer_col);
-            out.push((name_text.to_string(), row, col));
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    let _: std::ops::ControlFlow<()> = walk_preorder(root, Children::All, |node, _| {
+        if node.kind() == "command_name" {
+            // command_name の子を確認: 静的な word が単独で存在する場合のみ採用
+            let mut child_cursor = node.walk();
+            let children: Vec<Node<'_>> = node.children(&mut child_cursor).collect();
+            if children.len() == 1
+                && children[0].kind() == "word"
+                && let Ok(name_text) = children[0].utf8_text(inner_bytes)
+            {
+                let inner_pos = children[0].start_position();
+                let (row, col) =
+                    translate_position(inner_pos.row, inner_pos.column, outer_row, outer_col);
+                out.push((name_text.to_string(), row, col));
+            }
         }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_command_names(child, inner_bytes, out, outer_row, outer_col);
-    }
+        std::ops::ControlFlow::Continue(Walk::Descend)
+    });
 }
 
 /// 内側 AST 内の (row, col) を、ファイル全体での (row, col) に変換する。
@@ -327,5 +329,49 @@ mod tests {
         let segs = bash_trap_handler_ref_segments(trap, &bytes, LangId::Bash);
         let names: Vec<&str> = segs.iter().map(|(n, _, _)| n.as_str()).collect();
         assert!(names.contains(&"cleanup_signal"), "{names:?}");
+    }
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn collect_command_names_recursive(
+        node: Node<'_>,
+        inner_bytes: &[u8],
+        out: &mut Vec<(String, usize, usize)>,
+        outer_row: usize,
+        outer_col: usize,
+    ) {
+        if node.kind() == "command_name" {
+            let mut child_cursor = node.walk();
+            let children: Vec<Node<'_>> = node.children(&mut child_cursor).collect();
+            if children.len() == 1
+                && children[0].kind() == "word"
+                && let Ok(name_text) = children[0].utf8_text(inner_bytes)
+            {
+                let inner_pos = children[0].start_position();
+                let (row, col) =
+                    translate_position(inner_pos.row, inner_pos.column, outer_row, outer_col);
+                out.push((name_text.to_string(), row, col));
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_command_names_recursive(child, inner_bytes, out, outer_row, outer_col);
+        }
+    }
+
+    /// handler のコマンド名の収集は、反復版と再帰版で同じ順序・位置になる。
+    #[test]
+    fn collect_command_names_matches_recursive_version() {
+        let inner = b"first a; ( second b && { third; } ) | fourth\nif x; then fifth; fi; ${dyn} z; $(sixth)";
+        let tree = parser::parse_source(inner, LangId::Bash).expect("parse inner");
+        let mut actual = Vec::new();
+        collect_command_names(tree.root_node(), inner, &mut actual, 3, 7);
+        let mut expected = Vec::new();
+        collect_command_names_recursive(tree.root_node(), inner, &mut expected, 3, 7);
+        assert_eq!(actual, expected);
+        let names: Vec<&str> = actual.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"first") && names.contains(&"sixth") && !names.contains(&"${dyn}"),
+            "{names:?}"
+        );
     }
 }

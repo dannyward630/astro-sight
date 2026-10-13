@@ -226,7 +226,8 @@ fn php_member_call_inferred_or_bare(call_expr: Node<'_>, source: &[u8]) -> RefCo
     };
 
     // (1) パラメータ型注釈 / (2) `@var` コメント / (3) `new ClassName()` 代入を探す
-    if php_scope_has_inferable_var_type(func_body, source, var_name) {
+    let var_marker = format!("${var_name}");
+    if php_scope_has_inferable_var_type(func_body, source, &var_marker) {
         RefConfidence::InferredOwner
     } else {
         RefConfidence::BareNameOnly
@@ -256,17 +257,22 @@ fn enclosing_function_body<'a>(node: Node<'a>) -> Option<Node<'a>> {
     None
 }
 
-/// 関数本体内に変数 `$var_name` の型推論材料があるかを判定する。
-fn php_scope_has_inferable_var_type(body: Node<'_>, source: &[u8], var_name: &str) -> bool {
-    let var_marker = format!("${var_name}");
-    php_scope_has_inferable_var_type_recursive(body, source, &var_marker)
-}
-
-fn php_scope_has_inferable_var_type_recursive(
-    node: Node<'_>,
+/// 関数本体に変数 `var_marker` (`$x`) の型推論材料があるか。
+///
+/// 本体は任意の式を含むので、子 1 段ごとに再帰すると深い配列・式を持つ関数 1 つで
+/// impact / context ごと落ちていた。反復で辿る。
+pub(super) fn php_scope_has_inferable_var_type(
+    scope: Node<'_>,
     source: &[u8],
     var_marker: &str,
 ) -> bool {
+    crate::engine::tree_walk::any_node(scope, crate::engine::tree_walk::Children::All, |node| {
+        php_node_infers_var_type(node, source, var_marker)
+    })
+}
+
+/// 1 ノードが `var_marker` の型推論材料か (子は見ない)。
+fn php_node_infers_var_type(node: Node<'_>, source: &[u8], var_marker: &str) -> bool {
     match node.kind() {
         // simple_parameter / parameter は子に type と name を持つ
         "simple_parameter" | "property_promotion_parameter" => {
@@ -275,9 +281,7 @@ fn php_scope_has_inferable_var_type_recursive(
                 .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(source).ok())
                 .is_some_and(|t| t == var_marker);
-            if has_type && name_match {
-                return true;
-            }
+            has_type && name_match
         }
         // $x = new Foo(...) の代入式
         "assignment_expression" => {
@@ -288,27 +292,13 @@ fn php_scope_has_inferable_var_type_recursive(
             let rhs_is_object_creation = node
                 .child_by_field_name("right")
                 .is_some_and(|n| n.kind() == "object_creation_expression");
-            if lhs_match && rhs_is_object_creation {
-                return true;
-            }
+            lhs_match && rhs_is_object_creation
         }
         // PHPDoc `@var Foo $x` を含む block-level コメント
-        "comment" => {
-            if let Ok(text) = node.utf8_text(source)
-                && text.contains("@var")
-                && text.contains(var_marker)
-            {
-                // 雑だが「@var Foo $x」が同じ comment 内にあれば InferredOwner と判定
-                return true;
-            }
-        }
-        _ => {}
+        // (雑だが「@var Foo $x」が同じ comment 内にあれば InferredOwner と判定)
+        "comment" => node
+            .utf8_text(source)
+            .is_ok_and(|text| text.contains("@var") && text.contains(var_marker)),
+        _ => false,
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if php_scope_has_inferable_var_type_recursive(child, source, var_marker) {
-            return true;
-        }
-    }
-    false
 }

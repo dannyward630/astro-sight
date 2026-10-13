@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use streaming_iterator::StreamingIterator;
 use tree_sitter::QueryCursor;
 
 use crate::engine::parser;
+use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 use crate::language::LangId;
 
 use super::{
@@ -415,23 +417,25 @@ fn analyze_file(
 }
 
 /// 同ファイル内の class 定義名 (owner に一致するもの) をクラス名マップへ加える。
+///
+/// ファイル全体を辿るため、子 1 段ごとに再帰すると深い配列・式を持つファイル 1 つで
+/// dead-code ごと落ちる。named_children の再帰と同じ順序で反復して辿る。
 fn collect_local_class_definitions(
-    node: tree_sitter::Node<'_>,
+    root: tree_sitter::Node<'_>,
     source: &[u8],
     owners_set: &HashSet<&str>,
     local_to_owner: &mut HashMap<String, String>,
 ) {
-    if matches!(node.kind(), "class_declaration" | "class")
-        && let Some(name) = node.child_by_field_name("name")
-        && let Ok(text) = name.utf8_text(source)
-        && owners_set.contains(text)
-    {
-        local_to_owner.insert(text.to_string(), text.to_string());
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_local_class_definitions(child, source, owners_set, local_to_owner);
-    }
+    let _: ControlFlow<()> = walk_preorder(root, Children::Named, |node, _| {
+        if matches!(node.kind(), "class_declaration" | "class")
+            && let Some(name) = node.child_by_field_name("name")
+            && let Ok(text) = name.utf8_text(source)
+            && owners_set.contains(text)
+        {
+            local_to_owner.insert(text.to_string(), text.to_string());
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
 }
 
 /// binding マップへ 1 件登録する。同名バインディングが複数回現れた場合は
@@ -493,7 +497,24 @@ fn register_pattern_bindings(
 /// `Unresolvable` として登録する — 収集しないと receiver 解決が import 由来の
 /// class static access へフォールバックし、shadow された名前の票を owner へ誤計上
 /// する (dead-code の fail-open)。
+///
+/// ファイル全体を辿るので、named_children の再帰と同じ順序で反復して辿る
+/// (深い配列・式を持つファイル 1 つで dead-code ごと落ちていた)。
 fn collect_var_bindings(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    local_to_owner: &HashMap<String, String>,
+    owners_set: &HashSet<&str>,
+    bindings: &mut HashMap<String, VarBinding>,
+) {
+    let _: ControlFlow<()> = walk_preorder(root, Children::Named, |node, _| {
+        collect_var_bindings_at(node, source, local_to_owner, owners_set, bindings);
+        ControlFlow::Continue(Walk::Descend)
+    });
+}
+
+/// `collect_var_bindings` の 1 ノード分の処理 (子へは降りない)。
+fn collect_var_bindings_at(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     local_to_owner: &HashMap<String, String>,
@@ -599,10 +620,6 @@ fn collect_var_bindings(
             }
         }
         _ => {}
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_var_bindings(child, source, local_to_owner, owners_set, bindings);
     }
 }
 
@@ -996,5 +1013,107 @@ mod tests {
         );
         assert!(!a.has_unresolved_access);
         assert_eq!(count_for(&a, "Alpha"), 1);
+    }
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+    fn collect_local_class_definitions_recursive(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        owners_set: &HashSet<&str>,
+        local_to_owner: &mut HashMap<String, String>,
+    ) {
+        if matches!(node.kind(), "class_declaration" | "class")
+            && let Some(name) = node.child_by_field_name("name")
+            && let Ok(text) = name.utf8_text(source)
+            && owners_set.contains(text)
+        {
+            local_to_owner.insert(text.to_string(), text.to_string());
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_local_class_definitions_recursive(child, source, owners_set, local_to_owner);
+        }
+    }
+
+    /// 修正前の再帰版。1 ノード分の処理は共通で、辿る順序だけを再帰で再現する。
+    fn collect_var_bindings_recursive(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        local_to_owner: &HashMap<String, String>,
+        owners_set: &HashSet<&str>,
+        bindings: &mut HashMap<String, VarBinding>,
+    ) {
+        collect_var_bindings_at(node, source, local_to_owner, owners_set, bindings);
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_var_bindings_recursive(child, source, local_to_owner, owners_set, bindings);
+        }
+    }
+
+    fn describe_bindings(
+        bindings: &HashMap<String, VarBinding>,
+    ) -> std::collections::BTreeMap<String, String> {
+        bindings
+            .iter()
+            .map(|(name, binding)| {
+                let value = match binding {
+                    VarBinding::Owner(owner) => format!("owner:{owner}"),
+                    VarBinding::ElementOwner(owner) => format!("element:{owner}"),
+                    VarBinding::Unresolvable => "unresolvable".to_string(),
+                };
+                (name.clone(), value)
+            })
+            .collect()
+    }
+
+    /// class 定義と束縛の収集は、反復版と再帰版で同じ結果になる。
+    #[test]
+    fn collectors_match_recursive_version() {
+        let sources = [
+            "import { Alpha } from \"./alpha\";\nclass Beta { fmt() { return 1; } }\nconst a = new Alpha();\nconst b: Beta = make();\nconst xs: Alpha[] = [];\nexport function run(p: Alpha, q, { r, s: [t] }) {\n  for (const u of xs) { try { u.fmt(); } catch (e) { const a = 1; } }\n  const f = v => v;\n  return (function g() { class Alpha {} return p; })();\n}\n",
+            "function Alpha() {}\nconst k = class Beta {};\nfor (const [m, n = 1] of []) {}\nconst { o = new Alpha(), ...rest } = {};\n",
+        ];
+        let owners = ["Alpha", "Beta"];
+        let owners_set: HashSet<&str> = owners.iter().copied().collect();
+        for lang in [LangId::Typescript, LangId::Javascript] {
+            for source in sources {
+                let tree = parser::parse_source(source.as_bytes(), lang).unwrap();
+                let root = tree.root_node();
+
+                let mut classes = HashMap::new();
+                collect_local_class_definitions(root, source.as_bytes(), &owners_set, &mut classes);
+                let mut expected_classes = HashMap::new();
+                collect_local_class_definitions_recursive(
+                    root,
+                    source.as_bytes(),
+                    &owners_set,
+                    &mut expected_classes,
+                );
+                assert_eq!(classes, expected_classes, "{lang:?}: {source}");
+
+                let mut bindings = HashMap::new();
+                collect_var_bindings(
+                    root,
+                    source.as_bytes(),
+                    &classes,
+                    &owners_set,
+                    &mut bindings,
+                );
+                let mut expected_bindings = HashMap::new();
+                collect_var_bindings_recursive(
+                    root,
+                    source.as_bytes(),
+                    &classes,
+                    &owners_set,
+                    &mut expected_bindings,
+                );
+                assert_eq!(
+                    describe_bindings(&bindings),
+                    describe_bindings(&expected_bindings),
+                    "{lang:?}: {source}"
+                );
+                assert!(!bindings.is_empty(), "{lang:?}: 束縛を集めている");
+            }
+        }
     }
 }

@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::path::Path;
 
+use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 use crate::engine::{parser, refs};
 use crate::language::LangId;
 
@@ -260,11 +262,24 @@ fn merge_php_trait_use_entry(
     }
 }
 
+/// ファイル全体の型宣言を集める。
+///
+/// 型の索引は名前の事前フィルタ無しに全 PHP ファイルへ当てるので、子 1 段ごとに再帰すると
+/// 無関係な深い配列・式を持つファイル 1 つで dead-code ごと落ちていた。
+/// named_children の再帰と同じ順序で反復して辿る。
 fn collect_php_types_from_node(
-    node: tree_sitter::Node<'_>,
+    root: tree_sitter::Node<'_>,
     source: &[u8],
     types: &mut PhpTypeIndex,
 ) {
+    let _: ControlFlow<()> = walk_preorder(root, Children::Named, |node, _| {
+        collect_php_types_at(node, source, types);
+        ControlFlow::Continue(Walk::Descend)
+    });
+}
+
+/// `collect_php_types_from_node` の 1 ノード分の処理 (子へは降りない)。
+fn collect_php_types_at(node: tree_sitter::Node<'_>, source: &[u8], types: &mut PhpTypeIndex) {
     // enum (PHP 8.1+) も trait を use できるため収集対象に含める
     // (name/body フィールドは class と同形)。interface は trait を use できないので
     // 宣言の事実 (`decls`) だけを集める。
@@ -327,11 +342,6 @@ fn collect_php_types_from_node(
         if node.kind() != "interface_declaration" {
             merge_php_trait_use_entry(&mut types.trait_uses, owner, collected);
         }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_php_types_from_node(child, source, types);
     }
 }
 
@@ -429,7 +439,6 @@ fn analyze_php_file_into<F>(
             source.as_bytes(),
             owners,
             bare_key,
-            None,
             types,
             aliases,
             &mut analysis,
@@ -499,26 +508,27 @@ fn collect_php_file_aliases(root: tree_sitter::Node<'_>, source: &[u8]) -> PhpFi
     }
 }
 
+/// ファイル全体を named_children の再帰と同じ順序で反復して辿る
+/// (深い配列・式を持つファイル 1 つでスタックが溢れないように)。
 fn collect_php_aliases_from_node(
-    node: tree_sitter::Node<'_>,
+    root: tree_sitter::Node<'_>,
     source: &[u8],
     map: &mut HashMap<String, String>,
     alias_names: &mut HashSet<String>,
     conflicted: &mut bool,
     namespace_count: &mut usize,
 ) {
-    match node.kind() {
-        "namespace_definition" => *namespace_count += 1,
-        "namespace_use_declaration" => {
-            collect_php_use_clause_aliases(node, source, map, alias_names, conflicted);
-            // use 文の中はこれ以上潜らない (clause は上で処理済み)。
+    let _: ControlFlow<()> = walk_preorder(root, Children::Named, |node, _| {
+        match node.kind() {
+            "namespace_definition" => *namespace_count += 1,
+            "namespace_use_declaration" => {
+                collect_php_use_clause_aliases(node, source, map, alias_names, conflicted);
+                // use 文の中はこれ以上潜らない (clause は上で処理済み)。
+            }
+            _ => {}
         }
-        _ => {}
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_php_aliases_from_node(child, source, map, alias_names, conflicted, namespace_count);
-    }
+        ControlFlow::Continue(Walk::Descend)
+    });
 }
 
 /// `namespace_use_declaration` 配下の clause (grouped use 含む) から
@@ -565,37 +575,51 @@ struct PhpEnclosingType {
     is_trait: bool,
 }
 
-#[expect(clippy::too_many_arguments)]
+/// ファイル全体を前順に辿り、各ノードを処理する。型宣言の中では、その型を
+/// `self::` などの解決先 (enclosing type) として子孫へ引き継ぐ。ambiguous が立った
+/// 時点で走査を終える。
+///
+/// 子 1 段ごとに再帰すると深い配列・式を持つファイル 1 つで dead-code ごと落ちる。
+/// 1 つの TreeCursor で辿り、深さごとの enclosing type を `contexts` に持つ
+/// (`contexts[d]` = 深さ d のノードに効く型。`owned` の添字)。
 fn visit_php_node(
-    node: tree_sitter::Node<'_>,
+    root: tree_sitter::Node<'_>,
     source: &[u8],
     owners: &HashSet<String>,
     bare_key: &str,
-    current_type: Option<&PhpEnclosingType>,
     types: &PhpTypeIndex,
     aliases: &PhpFileAliases,
     analysis: &mut PhpFileAnalysis,
 ) {
-    if analysis.ambiguous {
-        return;
-    }
+    let mut owned: Vec<PhpEnclosingType> = Vec::new();
+    let mut contexts: Vec<Option<usize>> = Vec::new();
+    let _: ControlFlow<()> = walk_preorder(root, Children::All, |node, depth| {
+        // 前順なので、深さ depth のノードを訪れた時点で contexts には祖先の分だけが残る。
+        contexts.truncate(depth);
+        let inherited = depth.checked_sub(1).and_then(|parent| contexts[parent]);
+        let own = php_class_context_for_node(node, source, owners, bare_key, types).map(|ctx| {
+            owned.push(ctx);
+            owned.len() - 1
+        });
+        let current = own.or(inherited);
+        contexts.push(current);
 
-    let current_type_buf = php_class_context_for_node(node, source, owners, bare_key, types);
-    let next_type = current_type_buf.as_ref().or(current_type);
-
-    process_php_liveness_node(
-        node, source, owners, bare_key, next_type, types, aliases, analysis,
-    );
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        visit_php_node(
-            child, source, owners, bare_key, next_type, types, aliases, analysis,
+        process_php_liveness_node(
+            node,
+            source,
+            owners,
+            bare_key,
+            current.map(|index| &owned[index]),
+            types,
+            aliases,
+            analysis,
         );
         if analysis.ambiguous {
-            break;
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(Walk::Descend)
         }
-    }
+    });
 }
 
 fn php_class_context_for_node(
@@ -1068,4 +1092,238 @@ fn is_php_type_declaration(kind: &str) -> bool {
         kind,
         "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::*;
+
+    /// 修正前の再帰版 (浅い入力でだけ使う参照実装)。1 ノード分の処理は共通で、
+    /// 辿る順序と文脈の引き継ぎだけを再帰で再現する。
+    fn collect_php_types_recursive(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        types: &mut PhpTypeIndex,
+    ) {
+        collect_php_types_at(node, source, types);
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_php_types_recursive(child, source, types);
+        }
+    }
+
+    fn collect_php_aliases_recursive(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        map: &mut HashMap<String, String>,
+        alias_names: &mut HashSet<String>,
+        conflicted: &mut bool,
+        namespace_count: &mut usize,
+    ) {
+        match node.kind() {
+            "namespace_definition" => *namespace_count += 1,
+            "namespace_use_declaration" => {
+                collect_php_use_clause_aliases(node, source, map, alias_names, conflicted);
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_php_aliases_recursive(
+                child,
+                source,
+                map,
+                alias_names,
+                conflicted,
+                namespace_count,
+            );
+        }
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn visit_php_node_recursive(
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+        owners: &HashSet<String>,
+        bare_key: &str,
+        current_type: Option<&PhpEnclosingType>,
+        types: &PhpTypeIndex,
+        aliases: &PhpFileAliases,
+        analysis: &mut PhpFileAnalysis,
+    ) {
+        if analysis.ambiguous {
+            return;
+        }
+        let current_type_buf = php_class_context_for_node(node, source, owners, bare_key, types);
+        let next_type = current_type_buf.as_ref().or(current_type);
+        process_php_liveness_node(
+            node, source, owners, bare_key, next_type, types, aliases, analysis,
+        );
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_php_node_recursive(
+                child, source, owners, bare_key, next_type, types, aliases, analysis,
+            );
+            if analysis.ambiguous {
+                break;
+            }
+        }
+    }
+
+    fn describe_types(types: &PhpTypeIndex) -> Vec<String> {
+        let mut out: Vec<String> = types
+            .decls
+            .iter()
+            .map(|(name, decl)| {
+                let methods: BTreeSet<&String> = decl.concrete_methods.iter().collect();
+                format!(
+                    "decl {name} count={} parent={} methods={methods:?}",
+                    decl.count, decl.has_parent
+                )
+            })
+            .chain(types.trait_uses.iter().map(|(owner, uses)| {
+                let traits: BTreeSet<&String> = uses.traits.iter().collect();
+                let declared: BTreeSet<&String> = uses.declared_methods.iter().collect();
+                format!(
+                    "uses {owner} traits={traits:?} adaptation={} ambiguous={} declared={declared:?}",
+                    uses.has_adaptation, uses.ambiguous
+                )
+            }))
+            .collect();
+        out.sort();
+        out
+    }
+
+    const SOURCES: &[&str] = &[
+        "<?php\nnamespace App;\nuse Lib\\Alpha as A;\nuse Lib\\{Beta, Gamma as G};\n\
+         trait T { public function fmt() { return self::fmt(); } }\n\
+         class Alpha { use T; public function fmt() { return self::fmt() + static::fmt(); }\n\
+           public function make() { return new self(); } }\n\
+         class Beta extends Alpha {\n  public function fmt() {\n\
+             $x = new class extends Alpha { public function fmt() { return self::fmt(); } };\n\
+             return A::fmt() + G::fmt() + Beta::fmt() + parent::fmt() + self::fmt();\n  }\n}\n\
+         function f() { return Alpha::fmt() + Beta::fmt(); }\n",
+        // ambiguous が途中で立つ: 以降のノードは数えない
+        "<?php\nclass Alpha { public function fmt() { return 1; } }\n\
+         class Beta { public function fmt() { return 2; } }\n\
+         function g($b) { Alpha::fmt(); $b->fmt(); return Beta::fmt(); }\n",
+        "<?php\nnamespace One { use X\\Alpha; class Alpha2 {} }\nnamespace Two { use Y\\Alpha; }\n\
+         interface I { public function fmt(); }\nenum E: string implements I { use T; case A = 'a'; public function fmt() {} }\n\
+         abstract class Beta { abstract public function fmt(); public function __construct() {} }\n\
+         function h() { return new Beta() ?? new Alpha() ?? new static(); }\n",
+    ];
+
+    /// 型の索引・alias・本体の走査は、反復版と再帰版で同じ結果になる。
+    /// 本体の走査は、型宣言の文脈 (`self::` の解決先) を入れ子の class・trait・
+    /// 無名 class で引き継ぐ順序と、ambiguous が立った後に数えないことを含めて比べる。
+    #[test]
+    fn traversals_match_recursive_version() {
+        let owners: HashSet<String> = ["alpha", "beta"].iter().map(|s| s.to_string()).collect();
+        for source in SOURCES {
+            let tree = parser::parse_source(source.as_bytes(), LangId::Php).unwrap();
+            let root = tree.root_node();
+            let bytes = source.as_bytes();
+
+            let mut types = PhpTypeIndex::default();
+            collect_php_types_from_node(root, bytes, &mut types);
+            let mut expected_types = PhpTypeIndex::default();
+            collect_php_types_recursive(root, bytes, &mut expected_types);
+            assert_eq!(describe_types(&types), describe_types(&expected_types));
+            assert!(!types.decls.is_empty(), "{source}");
+
+            let aliases = collect_php_file_aliases(root, bytes);
+            let (mut map, mut names, mut conflicted, mut namespaces) =
+                (HashMap::new(), HashSet::new(), false, 0usize);
+            collect_php_aliases_recursive(
+                root,
+                bytes,
+                &mut map,
+                &mut names,
+                &mut conflicted,
+                &mut namespaces,
+            );
+            let expected_resolved = (!conflicted && namespaces <= 1).then_some(map);
+            assert_eq!(
+                aliases
+                    .resolved
+                    .as_ref()
+                    .map(|m| m.iter().collect::<BTreeMap<_, _>>()),
+                expected_resolved
+                    .as_ref()
+                    .map(|m| m.iter().collect::<BTreeMap<_, _>>()),
+                "{source}"
+            );
+            assert_eq!(
+                aliases.alias_names.iter().collect::<BTreeSet<_>>(),
+                names.iter().collect::<BTreeSet<_>>()
+            );
+
+            for bare_key in ["fmt", "__construct", "make"] {
+                let mut analysis = PhpFileAnalysis::default();
+                visit_php_node(
+                    root,
+                    bytes,
+                    &owners,
+                    bare_key,
+                    &types,
+                    &aliases,
+                    &mut analysis,
+                );
+                let mut expected = PhpFileAnalysis::default();
+                visit_php_node_recursive(
+                    root,
+                    bytes,
+                    &owners,
+                    bare_key,
+                    None,
+                    &types,
+                    &aliases,
+                    &mut expected,
+                );
+                assert_eq!(
+                    (
+                        analysis.ambiguous,
+                        analysis.scoped_counts.iter().collect::<BTreeMap<_, _>>()
+                    ),
+                    (
+                        expected.ambiguous,
+                        expected.scoped_counts.iter().collect::<BTreeMap<_, _>>()
+                    ),
+                    "{bare_key}: {source}"
+                );
+            }
+        }
+    }
+
+    /// 対照: 文脈の引き継ぎを確かめるため、1 つ目の入力で `self::fmt()` が
+    /// 入れ子の型ごとに数えられ、2 つ目の入力では途中の `$b->fmt()` で ambiguous になる。
+    #[test]
+    fn visit_php_node_counts_scoped_calls_and_stops_on_ambiguous() {
+        let owners: HashSet<String> = ["alpha", "beta"].iter().map(|s| s.to_string()).collect();
+        let analyze = |source: &str| {
+            let tree = parser::parse_source(source.as_bytes(), LangId::Php).unwrap();
+            let mut types = PhpTypeIndex::default();
+            collect_php_types_from_node(tree.root_node(), source.as_bytes(), &mut types);
+            let aliases = collect_php_file_aliases(tree.root_node(), source.as_bytes());
+            let mut analysis = PhpFileAnalysis::default();
+            visit_php_node(
+                tree.root_node(),
+                source.as_bytes(),
+                &owners,
+                "fmt",
+                &types,
+                &aliases,
+                &mut analysis,
+            );
+            analysis
+        };
+        let first = analyze(SOURCES[1].replace("$b->fmt(); ", "").as_str());
+        assert!(!first.ambiguous);
+        assert_eq!(first.scoped_counts.get("alpha"), Some(&1));
+        assert_eq!(first.scoped_counts.get("beta"), Some(&1));
+        let second = analyze(SOURCES[1]);
+        assert!(second.ambiguous);
+    }
 }

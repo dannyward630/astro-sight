@@ -360,51 +360,41 @@ fn rust_file_root(node: Node<'_>) -> Option<Node<'_>> {
 /// 持ち込むため、存在するだけで全ての名前について判定を諦める** (テストモジュールの
 /// `use super::*;` で広く該当するが、安全側 = 従来どおりの過大計上に戻るだけ)。
 /// いずれかに該当したら束縛判定を諦める (fail-closed)。
-fn rust_file_declares_non_binding_name(root: Node<'_>, name: &str, source: &[u8]) -> bool {
-    fn walk(node: Node<'_>, name: &str, source: &[u8]) -> bool {
-        match node.kind() {
-            // `use foo::*;` は持ち込む名前が AST に現れないため、対象名が定数パターン
-            // でないことを確定できない。
-            "use_wildcard" => return true,
-            "const_item" | "static_item" => {
-                if node
+///
+/// ファイル全体を辿るので、子 1 段ごとに再帰すると深い式を持つファイル 1 つで
+/// スタックが溢れる (refs / impact / dead-code の件数集計ごと落ちていた)。反復で辿る。
+pub(crate) fn rust_file_declares_non_binding_name(
+    root: Node<'_>,
+    name: &str,
+    source: &[u8],
+) -> bool {
+    use crate::engine::tree_walk::{Children, any_node};
+    any_node(root, Children::All, |node| match node.kind() {
+        // `use foo::*;` は持ち込む名前が AST に現れないため、対象名が定数パターン
+        // でないことを確定できない。
+        "use_wildcard" => true,
+        "const_item" | "static_item" => {
+            node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                == Some(name)
+        }
+        // 単位構造体 (`struct X;`) だけがパターン位置で定数パターンになる。
+        // フィールドを持つ struct はパターンに `X { .. }` / `X(..)` が要る。
+        "struct_item" => {
+            node.child_by_field_name("body").is_none()
+                && node
                     .child_by_field_name("name")
                     .and_then(|n| n.utf8_text(source).ok())
                     == Some(name)
-                {
-                    return true;
-                }
-            }
-            "struct_item" => {
-                // 単位構造体 (`struct X;`) だけがパターン位置で定数パターンになる。
-                // フィールドを持つ struct はパターンに `X { .. }` / `X(..)` が要る。
-                let is_unit = node.child_by_field_name("body").is_none();
-                if is_unit
-                    && node
-                        .child_by_field_name("name")
-                        .and_then(|n| n.utf8_text(source).ok())
-                        == Some(name)
-                {
-                    return true;
-                }
-            }
-            // `use foo::tail;` で持ち込まれた名前は外部の const / unit struct / variant
-            // かもしれず、ファイル内では確定できない。
-            "use_declaration"
-                if node.utf8_text(source).is_ok_and(|text| {
-                    text.split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .any(|seg| seg == name)
-                }) =>
-            {
-                return true;
-            }
-            _ => {}
         }
-        let mut cursor = node.walk();
-        node.children(&mut cursor)
-            .any(|child| walk(child, name, source))
-    }
-    walk(root, name, source)
+        // `use foo::tail;` で持ち込まれた名前は外部の const / unit struct / variant
+        // かもしれず、ファイル内では確定できない。
+        "use_declaration" => node.utf8_text(source).is_ok_and(|text| {
+            text.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|seg| seg == name)
+        }),
+        _ => false,
+    })
 }
 
 /// Rust の属性引数で文字列値を識別子/パス参照として解釈すべきキー。

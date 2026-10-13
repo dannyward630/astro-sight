@@ -52,6 +52,12 @@ fn main() {
 
     install_broken_pipe_panic_hook();
 
+    // rayon のグローバルプール (dead-code の member liveness などが使う) のスタックも、
+    // アプリが作るほかのワーカーと同じ 8 MiB にそろえる。スレッド数は既定のまま。
+    let _ = rayon::ThreadPoolBuilder::new()
+        .stack_size(astro_sight::engine::WORKER_STACK_SIZE)
+        .build_global();
+
     let cli = Cli::parse();
 
     #[cfg(feature = "dhat-heap")]

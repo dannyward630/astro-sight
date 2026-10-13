@@ -31,7 +31,15 @@ pub(crate) mod rust_use_tree;
 pub mod sequence;
 pub mod snippet;
 pub mod symbols;
+pub(crate) mod tree_walk;
 pub mod xml_refs;
+
+/// アプリが作るワーカースレッド (rayon のプール・MCP の tokio ランタイム) のスタックサイズ。
+///
+/// main スレッド (Linux / macOS の既定、Windows は build.rs で指定) と同じ 8 MiB にそろえる。
+/// 構文木の走査は反復で行い深さに比例してスタックを使わないが、スレッドの既定 (2 MiB) の
+/// ままだと、同じ入力が main では通りワーカーでは落ちるという余裕の差が残る。
+pub const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 /// signature 文字列の改行・タブ・連続空白を単一 space に正規化する。
 pub(crate) fn normalize_whitespace(bytes: &[u8]) -> String {

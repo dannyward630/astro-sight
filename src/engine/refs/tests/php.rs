@@ -607,3 +607,81 @@ fn shebang_php_file_single_and_batch_agree_on_case_insensitive_call() {
         "対照: .php の大小違い呼び出しは従来どおり返ること: {single:?}"
     );
 }
+
+/// 修正前の再帰版 (浅い入力でだけ使う参照実装)。
+fn php_scope_has_inferable_var_type_recursive(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    var_marker: &str,
+) -> bool {
+    match node.kind() {
+        "simple_parameter" | "property_promotion_parameter" => {
+            let has_type = node.child_by_field_name("type").is_some();
+            let name_match = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .is_some_and(|t| t == var_marker);
+            if has_type && name_match {
+                return true;
+            }
+        }
+        "assignment_expression" => {
+            let lhs_match = node
+                .child_by_field_name("left")
+                .and_then(|n| n.utf8_text(source).ok())
+                .is_some_and(|t| t == var_marker);
+            let rhs_is_object_creation = node
+                .child_by_field_name("right")
+                .is_some_and(|n| n.kind() == "object_creation_expression");
+            if lhs_match && rhs_is_object_creation {
+                return true;
+            }
+        }
+        "comment" => {
+            if let Ok(text) = node.utf8_text(source)
+                && text.contains("@var")
+                && text.contains(var_marker)
+            {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if php_scope_has_inferable_var_type_recursive(child, source, var_marker) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 型推論材料の探索は、どのノードを根にしても反復版と再帰版で一致する。
+#[test]
+fn php_scope_has_inferable_var_type_matches_recursive_version() {
+    let source = "<?php\nclass S {\n  public function __construct(private Repo $p) {}\n  public function m(Repo $a, $b) {\n    /** @var Repo $c */\n    $d = new Repo();\n    $e = make();\n    $f = fn(Repo $g) => $g->save([]);\n    return [$a, $b, $c, $d, $e, $f];\n  }\n}\n";
+    let tree = parser::parse_source(source.as_bytes(), LangId::Php).unwrap();
+    let markers = ["$a", "$b", "$c", "$d", "$e", "$f", "$g", "$p", "$missing"];
+    let mut checked = 0;
+    let mut found = 0;
+    let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+        tree.root_node(),
+        crate::engine::tree_walk::Children::All,
+        |node, _| {
+            for marker in markers {
+                let expected =
+                    php_scope_has_inferable_var_type_recursive(node, source.as_bytes(), marker);
+                assert_eq!(
+                    php_scope_has_inferable_var_type(node, source.as_bytes(), marker),
+                    expected,
+                    "{marker} under {}",
+                    node.kind()
+                );
+                found += usize::from(expected);
+            }
+            checked += 1;
+            std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+        },
+    );
+    assert!(checked > 30 && found > 0, "checked={checked} found={found}");
+}

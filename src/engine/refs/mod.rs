@@ -71,6 +71,7 @@ fn build_bounded_pool() -> Result<rayon::ThreadPool> {
         .unwrap_or(4)
         .min(bounded_worker_count());
     rayon::ThreadPoolBuilder::new()
+        .stack_size(crate::engine::WORKER_STACK_SIZE)
         .num_threads(worker_limit)
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build rayon pool: {e}"))

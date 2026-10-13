@@ -740,6 +740,93 @@ fn rust_closure_bound_identifiers_are_not_references() {
     }
 }
 
+/// 修正前の再帰版。反復版と判定が一致することを確かめる参照実装 (浅い入力でだけ使う)。
+fn rust_file_declares_non_binding_name_recursive(
+    node: Node<'_>,
+    name: &str,
+    source: &[u8],
+) -> bool {
+    match node.kind() {
+        "use_wildcard" => return true,
+        "const_item" | "static_item" => {
+            if node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                == Some(name)
+            {
+                return true;
+            }
+        }
+        "struct_item" => {
+            let is_unit = node.child_by_field_name("body").is_none();
+            if is_unit
+                && node
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    == Some(name)
+            {
+                return true;
+            }
+        }
+        "use_declaration"
+            if node.utf8_text(source).is_ok_and(|text| {
+                text.split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .any(|seg| seg == name)
+            }) =>
+        {
+            return true;
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| rust_file_declares_non_binding_name_recursive(child, name, source))
+}
+
+/// ファイル内の「束縛ではなくする宣言」の判定は、反復版と再帰版で一致する。
+/// 入れ子の item (関数内の const、ブロック内の use) と glob import も含める。
+#[test]
+fn rust_file_declares_non_binding_name_matches_recursive_version() {
+    let sources = [
+        "pub fn tail() -> u8 { 0 }\npub fn run(v: &[u8]) -> usize { v.iter().map(|tail| *tail).count() }\n",
+        "const tail: u8 = 1;\npub fn run() -> u8 { let f = |tail: u8| tail; f(1) }\n",
+        "pub fn run() -> u8 { const head: u8 = 2; static tail: u8 = 3; head + tail }\n",
+        "struct Unit;\nstruct Wide { a: u8 }\nstruct Pair(u8, u8);\npub fn run() {}\n",
+        "mod m { use crate::o::{tail, head as h}; }\npub fn run() { { use crate::x::*; } }\n",
+        "use crate::o::tailor;\npub fn run() {}\n",
+    ];
+    let names = [
+        "tail", "head", "h", "Unit", "Wide", "Pair", "tailor", "run", "x",
+    ];
+    for source in sources {
+        let tree = parser::parse_source(source.as_bytes(), LangId::Rust).unwrap();
+        for name in names {
+            assert_eq!(
+                rust_file_declares_non_binding_name(tree.root_node(), name, source.as_bytes()),
+                rust_file_declares_non_binding_name_recursive(
+                    tree.root_node(),
+                    name,
+                    source.as_bytes()
+                ),
+                "{name} in {source}"
+            );
+        }
+    }
+    // 対照: 該当する宣言の有無で結果が分かれる
+    let tree = parser::parse_source(sources[1].as_bytes(), LangId::Rust).unwrap();
+    assert!(rust_file_declares_non_binding_name(
+        tree.root_node(),
+        "tail",
+        sources[1].as_bytes()
+    ));
+    let tree = parser::parse_source(sources[0].as_bytes(), LangId::Rust).unwrap();
+    assert!(!rust_file_declares_non_binding_name(
+        tree.root_node(),
+        "tail",
+        sources[0].as_bytes()
+    ));
+}
+
 /// 束縛判定のメモが walk を跨いで再利用されない (前ファイルの判定を誤用しない)。
 ///
 /// 判定結果を `source` のポインタ+長さでキャッシュすると、allocator が同サイズの

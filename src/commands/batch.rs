@@ -28,6 +28,7 @@ fn effective_batch_worker_count(available: usize, configured: Option<usize>) -> 
 
 fn build_batch_pool() -> Result<rayon::ThreadPool> {
     rayon::ThreadPoolBuilder::new()
+        .stack_size(crate::engine::WORKER_STACK_SIZE)
         .num_threads(batch_worker_count())
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build batch rayon pool: {e}"))

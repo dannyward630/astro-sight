@@ -212,6 +212,7 @@ fn prepare_scan(
     // 膨らむため、デフォルトは 1 worker (= fold バケット 1 個、ピーク 2x も小さい) とする。
     // 並列性を使いたい CI 環境などでは `ASTRO_SIGHT_IMPACT_WORKERS` で上書きできる。
     let pool = rayon::ThreadPoolBuilder::new()
+        .stack_size(crate::engine::WORKER_STACK_SIZE)
         .num_threads(impact_worker_count())
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build impact worker pool: {e}"))?;
