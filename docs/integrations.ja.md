@@ -50,6 +50,7 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 | `Grep "functionName"` | ❌ → `astro-sight refs --name functionName --dir .` | Code identifier |
 | `Grep "ClassName"` | ❌ → `astro-sight refs --name ClassName --dir .` | Code identifier |
 | `Grep "MY_CONST\|OtherVar"` | ❌ → `astro-sight refs --names MY_CONST,OtherVar --dir .` | Pipe-separated identifiers |
+| `Grep "fn foo"`, `Grep "struct Foo\|impl Foo"` (definition lookup) | ❌ → `astro-sight refs --name foo --dir .` (the `"kind":"def"` hit is the definition) | A keyword prefix (`fn` / `struct` / `impl` / `class` / `def`) does not make it a text search |
 | `Grep "import.*module"` | ❌ → `astro-sight imports --path file` | Import analysis |
 | `grep/rg "identifier"` | ❌ → `astro-sight refs` | CLI grep/rg is also forbidden for identifiers |
 | `grep "name" one/file.ts` (single file) | ❌ → `astro-sight refs --name name --dir . --glob one/file.ts` | Single-file identifier search is still identifier search |
