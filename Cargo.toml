@@ -24,17 +24,17 @@ globset = "0.4.20"
 hashbrown = "0.17.1"
 ignore = "0.4.33"
 logroller = "0.1.12"
-lru = "0.18.4"
+lru = "0.18.5"
 memchr = "2.8.3"
 memmap2 = "0.9.11"
 mimalloc = "0.1.52"
 rayon = "1.12.0"
-rmcp = { version = "3.4.0", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.5.0", features = ["server", "macros", "transport-io"] }
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 serde_yaml = "0.9.34"
-smallvec = "1.16.1"
+smallvec = "1.16.2"
 streaming-iterator = "0.1.9"
 tempfile = "3.27.0"
 time = { version = "0.3.55", features = ["formatting", "macros", "local-offset"] }
