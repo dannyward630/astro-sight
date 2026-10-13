@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 
 use tree_sitter::Node;
 
+use crate::engine::bounded_read::{read_input_file, read_input_text_file};
 use crate::engine::parser;
 use crate::language::LangId;
 
@@ -89,7 +90,7 @@ impl RustCargoReachability {
 /// The subset accepted here is intentionally smaller than Cargo's manifest
 /// language. Every unhandled form makes the proof unavailable.
 fn scan_workspace(root: &Path) -> Option<CargoIndex> {
-    let root_source = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let root_source = read_input_text_file(&root.join("Cargo.toml"))?;
     let root_value = toml::from_str::<toml::Value>(&root_source).ok()?;
     let root_manifest = root_value.get("workspace")?.as_table()?.clone();
     if root_manifest.get("exclude").is_some() {
@@ -156,7 +157,7 @@ fn scan_workspace(root: &Path) -> Option<CargoIndex> {
                 if directory == root {
                     continue;
                 }
-                let source = std::fs::read_to_string(&path).ok()?;
+                let source = read_input_text_file(&path)?;
                 let manifest = toml::from_str::<toml::Value>(&source).ok()?;
                 let relative = directory.strip_prefix(root).ok()?.to_owned();
                 manifests.push((relative, manifest));
@@ -256,7 +257,7 @@ fn scan_workspace(root: &Path) -> Option<CargoIndex> {
     // include!, or a macro. A path-based owner is safe only when no Rust source
     // in the workspace can introduce such a cross-package compilation context.
     for path in rust_files {
-        let source = std::fs::read(root.join(&path)).ok()?;
+        let source = read_input_file(&root.join(&path))?;
         if source_has_expansion(&source) {
             return None;
         }

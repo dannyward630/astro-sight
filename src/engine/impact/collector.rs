@@ -1038,8 +1038,9 @@ impl<'a> ImpactCollector<'a> {
                                 self.rust_path_owner.get().is_some_and(|index| {
                                     rust_ref_source
                                         .get_or_init(|| {
-                                            std::fs::read(Path::new(self.dir).join(self.path_str))
-                                                .ok()
+                                            crate::engine::bounded_read::read_input_file(
+                                                &Path::new(self.dir).join(self.path_str),
+                                            )
                                         })
                                         .as_ref()
                                         .is_some_and(|source| {

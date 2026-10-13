@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use aho_corasick::AhoCorasick;
 use tree_sitter::Node;
 
+use crate::engine::bounded_read::{read_input_file, read_input_text_file};
 use crate::engine::parser;
 use crate::engine::rust_macro_name::{
     has_token_tree_ancestor, is_field_name_in_token_tree, last_macro_identifier,
@@ -86,7 +87,9 @@ impl RustMemberLiveness {
         let mut ambiguous = HashSet::new();
         let mut counts: HashMap<(String, String, String), (usize, usize)> = HashMap::new();
         for path in files {
-            let Ok(source) = std::fs::read(path) else {
+            // 100MB の入力上限を超えるファイルは読めない場合と同じく、内容を確かめられないので
+            // 全候補を Ambiguous にする (上限なしで読むと 1 ファイルでメモリが際限なく増える)。
+            let Some(source) = read_input_file(path) else {
                 ambiguous.extend(names.iter().map(|name| (*name).to_owned()));
                 continue;
             };
@@ -292,7 +295,7 @@ fn workspace_has_proc_macro(root: &Path, files: &[PathBuf]) -> bool {
         if entry.path() != root.join("Cargo.toml") {
             return true;
         }
-        let Ok(manifest) = std::fs::read_to_string(entry.path()) else {
+        let Some(manifest) = read_input_text_file(entry.path()) else {
             return true;
         };
         let document: toml::Table = match toml::from_str(&manifest) {
@@ -498,7 +501,7 @@ fn is_identifier_byte(byte: u8) -> bool {
 }
 
 fn direct_inherent_methods(root: &Path, file: &str) -> Option<HashMap<(String, String), usize>> {
-    let source = std::fs::read(root.join(file)).ok()?;
+    let source = read_input_file(&root.join(file))?;
     let tree = parser::parse_source(&source, LangId::Rust).ok()?;
     let top = tree.root_node();
     if top.has_error() {
@@ -648,7 +651,7 @@ fn plain_lib_modules(root: &Path) -> Option<HashSet<String>> {
     {
         return None;
     }
-    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let manifest = read_input_text_file(&root.join("Cargo.toml"))?;
     let targets = RustTargets::parse(&manifest, Path::new(""))?;
     if !targets.has_package || !targets.roots_complete || targets.has_explicit_roots() {
         return None;
@@ -660,7 +663,7 @@ fn plain_lib_modules(root: &Path) -> Option<HashSet<String>> {
     {
         return None;
     }
-    let source = std::fs::read(root.join("src/lib.rs")).ok()?;
+    let source = read_input_file(&root.join("src/lib.rs"))?;
     let tree = parser::parse_source(&source, LangId::Rust).ok()?;
     let top = tree.root_node();
     if top.has_error() {
@@ -885,7 +888,7 @@ fn resolve_receiver<'a>(
 }
 
 fn candidate_has_unambiguous_unit_value(root: &Path, candidate: &Candidate) -> bool {
-    let Ok(source) = std::fs::read(root.join(&candidate.file)) else {
+    let Some(source) = read_input_file(&root.join(&candidate.file)) else {
         return false;
     };
     let Ok(tree) = parser::parse_source(&source, LangId::Rust) else {
@@ -989,9 +992,53 @@ fn candidate_has_unambiguous_unit_value(root: &Path, candidate: &Candidate) -> b
 
 #[cfg(test)]
 mod tests {
-    use super::has_dynamic_rust_macro;
+    use super::{RustMemberLiveness, has_dynamic_rust_macro};
+    use crate::commands::dead_code_member_liveness::MemberStatus;
     use crate::engine::parser;
     use crate::language::LangId;
+
+    /// 参照走査で 100MB の入力上限を超えるファイルは読まず、読めない場合と同じく全候補を
+    /// Ambiguous にする (内容を確かめられないファイルに参照があるかもしれない)。
+    /// 旧実装は上限なしで読み、1 ファイルでメモリが際限なく増えていた。
+    #[test]
+    fn reference_scan_treats_files_over_the_input_limit_as_unreadable() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().canonicalize().expect("canonical root");
+        std::fs::create_dir_all(dir.join("src")).expect("src");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(dir.join("src/lib.rs"), "pub mod a;\npub mod big;\n").expect("lib");
+        std::fs::write(
+            dir.join("src/a.rs"),
+            "pub struct Owner;\nimpl Owner {\n    pub fn method_x(&self) -> u32 {\n        1\n    }\n}\n",
+        )
+        .expect("a");
+        let big = dir.join("src/big.rs");
+        std::fs::write(&big, "// generated\n").expect("big");
+        let files = [dir.join("src/lib.rs"), dir.join("src/a.rs"), big.clone()];
+        let candidates = [(
+            "Owner.method_x".to_string(),
+            "method".to_string(),
+            "src/a.rs".to_string(),
+            LangId::Rust,
+        )];
+        let status = || {
+            RustMemberLiveness::build(&candidates, &dir, &files, |_| false)
+                .status_for("Owner", "method_x", "src/a.rs")
+        };
+        // 対照: 上限以内なら従来どおり読んで、参照 0 件の Dead になる。
+        assert_eq!(status(), Some(MemberStatus::Dead));
+        // ディスクを消費しない疎ファイルで上限を 1 byte 超えさせる。
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&big)
+            .and_then(|file| file.set_len(crate::commands::MAX_INPUT_SIZE as u64 + 1))
+            .expect("sparse file");
+        assert_eq!(status(), Some(MemberStatus::Ambiguous));
+    }
 
     #[test]
     fn spaced_or_commented_include_is_a_dynamic_source_barrier() {

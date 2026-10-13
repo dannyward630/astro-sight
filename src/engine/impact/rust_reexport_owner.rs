@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use tree_sitter::Node;
 
+use crate::engine::bounded_read::{read_input_file, read_input_text_file};
 use crate::engine::parser;
 use crate::engine::rust_use_tree::{RustPubUseEdge, expand_rust_use_tree_edges_ast};
 use crate::language::LangId;
@@ -273,7 +274,7 @@ fn proven_external_alias(
         }
         let (_package, src, _module) =
             cached_source_module_path(dir, Path::new(ref_path), project)?;
-        let manifest = std::fs::read_to_string(dir.join(src.parent()?.join("Cargo.toml"))).ok()?;
+        let manifest = read_input_text_file(&dir.join(src.parent()?.join("Cargo.toml")))?;
         let manifest: toml::Value = toml::from_str(&manifest).ok()?;
         let edition = manifest.get("package")?.get("edition")?.as_str()?;
         if !matches!(edition, "2018" | "2021" | "2024") {
@@ -323,7 +324,7 @@ fn proven_external_alias(
         if project.reexport_old_sources.contains_key(&root_file) {
             return None;
         }
-        let root_source = std::fs::read(dir.join(&root_file)).ok()?;
+        let root_source = read_input_file(&dir.join(&root_file))?;
         let tree = parser::parse_source(&root_source, LangId::Rust).ok()?;
         let root = tree.root_node();
         if root.has_error() {
@@ -496,11 +497,10 @@ fn load_bindings(
             .canonicalize()
             .ok()?
             .starts_with(project.canonical_root.as_ref()?)
-            || std::fs::metadata(&full).ok()?.len() > crate::commands::MAX_INPUT_SIZE as u64
         {
             return None;
         }
-        let source = std::fs::read(full).ok()?;
+        let source = read_input_file(&full)?;
         let tree = parser::parse_source(&source, LangId::Rust).ok()?;
         let bindings = parse_bindings(tree.root_node(), &source, module)?;
         if let Some(old_source) = project.reexport_old_sources.get(file) {
@@ -557,7 +557,7 @@ fn stable_module_chain_uncached(
             continue;
         };
         let old_source = old_source.as_ref()?;
-        let new_source = std::fs::read(dir.join(&parent_file)).ok()?;
+        let new_source = read_input_file(&dir.join(&parent_file))?;
         let old_tree = parser::parse_source(old_source, LangId::Rust).ok()?;
         let new_tree = parser::parse_source(&new_source, LangId::Rust).ok()?;
         let old = parse_bindings(old_tree.root_node(), old_source, &module[..depth])?;

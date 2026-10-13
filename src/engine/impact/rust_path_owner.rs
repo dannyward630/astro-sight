@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tree_sitter::Node;
 
 use crate::engine::{
+    bounded_read::{read_input_file, read_input_text_file},
     parser,
     rust_macro_name::{
         has_token_tree_ancestor, is_field_name_in_token_tree, last_macro_identifier,
@@ -151,7 +152,7 @@ impl RustPathOwnerProjectProof {
         for file in diff_files {
             let path = PathBuf::from(&file.new_path);
             if path.extension().is_some_and(|ext| ext == "rs") {
-                let old = std::fs::read(root.join(&path)).ok().and_then(|new_source| {
+                let old = read_input_file(&root.join(&path)).and_then(|new_source| {
                     crate::engine::diff::reconstruct_old_source(
                         diff_input,
                         &file.new_path,
@@ -254,11 +255,10 @@ impl RustPathOwnerProjectProof {
                 .canonicalize()
                 .ok()?
                 .starts_with(self.canonical_root.as_ref()?)
-                || std::fs::metadata(&file).ok()?.len() > crate::commands::MAX_INPUT_SIZE as u64
             {
                 return None;
             }
-            let source = std::fs::read(file).ok()?;
+            let source = read_input_file(&file)?;
             Some(!source_has_external_child_module(&source))
         })()
         .unwrap_or(false);
@@ -302,7 +302,7 @@ fn wiring_unchanged(
         }) {
             return true;
         }
-        let Ok(new_source) = std::fs::read(dir.join(path)) else {
+        let Some(new_source) = read_input_file(&dir.join(path)) else {
             return false;
         };
         let Some(old_source) =
@@ -448,7 +448,7 @@ impl RustPathOwnerIndex {
         if verified_ref != ref_file || target_file == source_file {
             return false;
         }
-        let Ok(target_source) = std::fs::read(dir.join(&target_file)) else {
+        let Some(target_source) = read_input_file(&dir.join(&target_file)) else {
             return false;
         };
         if source_can_retarget_private_scope(&target_source) {
@@ -892,11 +892,10 @@ impl RustPathOwnerIndex {
                 .canonicalize()
                 .ok()?
                 .starts_with(project.canonical_root.as_ref()?)
-                || std::fs::metadata(&full).ok()?.len() > crate::commands::MAX_INPUT_SIZE as u64
             {
                 return None;
             }
-            let source = std::fs::read(full).ok()?;
+            let source = read_input_file(&full)?;
             let tree = parser::parse_source(&source, LangId::Rust).ok()?;
             FileEvidence::collect(tree.root_node(), &source).map(Arc::new)
         })();
@@ -1009,7 +1008,7 @@ where
             return false;
         }
     }
-    let Ok(manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+    let Some(manifest) = read_input_text_file(&root.join("Cargo.toml")) else {
         return false;
     };
     let Ok(manifest) = toml::from_str::<toml::Value>(&manifest) else {
@@ -1081,7 +1080,7 @@ where
                     return false;
                 }
                 if extension.eq_ignore_ascii_case("rs") {
-                    let Ok(source) = std::fs::read(path) else {
+                    let Some(source) = read_input_file(&path) else {
                         return false;
                     };
                     if source_is_uncertain(&source) {
@@ -1251,7 +1250,7 @@ fn scan_safe_private_import_environment(root: &Path) -> bool {
                     .to_str()
                     .is_some_and(|name| name.eq_ignore_ascii_case("Cargo.toml"))
             {
-                let Ok(manifest) = std::fs::read_to_string(entry.path()) else {
+                let Some(manifest) = read_input_text_file(&entry.path()) else {
                     return false;
                 };
                 let Ok(manifest) = toml::from_str::<toml::Value>(&manifest) else {
@@ -1270,7 +1269,7 @@ fn scan_safe_private_import_environment(root: &Path) -> bool {
                     return false;
                 }
                 if extension.eq_ignore_ascii_case("rs") {
-                    let Ok(source) = std::fs::read(entry.path()) else {
+                    let Some(source) = read_input_file(&entry.path()) else {
                         return false;
                     };
                     if source_defines_allowed_macro(&source)
@@ -1325,7 +1324,7 @@ fn scan_no_source_inclusion(root: &Path) -> bool {
                     return false;
                 }
                 if extension.eq_ignore_ascii_case("rs") {
-                    let Ok(source) = std::fs::read(entry.path()) else {
+                    let Some(source) = read_input_file(&entry.path()) else {
                         return false;
                     };
                     if source_has_include_macro(&source) {
@@ -1672,7 +1671,7 @@ pub(super) fn source_module_path(
     let package = ref_file
         .ancestors()
         .find(|ancestor| dir.join(ancestor).join("Cargo.toml").is_file())?;
-    let manifest = std::fs::read_to_string(dir.join(package).join("Cargo.toml")).ok()?;
+    let manifest = read_input_text_file(&dir.join(package).join("Cargo.toml"))?;
     let manifest_value = toml::from_str::<toml::Value>(&manifest).ok()?;
     let edition = manifest_value.get("package")?.get("edition")?.as_str()?;
     if !matches!(edition, "2018" | "2021" | "2024") {
@@ -1721,7 +1720,7 @@ pub(super) fn private_module_file(
         let mut prefix = PathBuf::new();
         let mut valid = true;
         for module in modules {
-            let source = std::fs::read(dir.join(&parent)).ok()?;
+            let source = read_input_file(&dir.join(&parent))?;
             if verify_syntax && source_can_retarget_private_scope(&source) {
                 return None;
             }
@@ -1776,6 +1775,33 @@ mod tests {
     };
     use crate::engine::parser;
     use crate::language::LangId;
+
+    /// プロジェクト単位の証明は Rust ソースを全部読む。100MB の入力上限を超えるファイル
+    /// (gitignore 済みの生成物でも `read_dir` で見つかる) は読まず、内容を確かめられない
+    /// として証明を止める。旧実装は上限なしで読み、1 ファイルでメモリが際限なく増えていた。
+    #[test]
+    fn project_scan_does_not_read_sources_over_the_input_limit() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::create_dir_all(root.path().join("out")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        let generated = root.path().join("out/generated.rs");
+        std::fs::write(&generated, "pub fn generated() {}\n").unwrap();
+        // 対照: 上限以内のファイルは従来どおり読んで判定する。
+        assert!(scan_ordinary_sources(root.path()));
+        // ディスクを消費しない疎ファイルで上限を 1 byte 超えさせる。
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&generated)
+            .and_then(|file| file.set_len(crate::commands::MAX_INPUT_SIZE as u64 + 1))
+            .unwrap();
+        assert!(!scan_ordinary_sources(root.path()));
+    }
 
     #[test]
     fn type_alias_does_not_prove_an_independent_type_owner() {

@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 
 use tree_sitter::Node;
 
+use crate::engine::bounded_read::{read_input_file, read_input_text_file};
 use crate::engine::parser;
 use crate::language::LangId;
 
@@ -491,7 +492,7 @@ fn scan_project(root: &Path) -> Option<Vec<ManifestInfo>> {
             if kind.is_dir() {
                 pending.push(path);
             } else if kind.is_file() && name == "Cargo.toml" {
-                let source = std::fs::read_to_string(&path).ok()?;
+                let source = read_input_text_file(&path)?;
                 let value = toml::from_str::<toml::Value>(&source).ok()?;
                 if has_sysroot_dependency(&value, false) {
                     return None;
@@ -520,18 +521,13 @@ fn scan_project(root: &Path) -> Option<Vec<ManifestInfo>> {
     for manifest in &manifests {
         for name in ["config", "config.toml"] {
             let path = manifest.directory.join(".cargo").join(name);
-            if path.exists()
-                && std::fs::read(&path)
-                    .ok()?
-                    .windows(8)
-                    .any(|w| w == b"--extern")
-            {
+            if path.exists() && read_input_file(&path)?.windows(8).any(|w| w == b"--extern") {
                 return None;
             }
         }
     }
     for path in rust_files {
-        let source = std::fs::read(&path).ok()?;
+        let source = read_input_file(&path)?;
         if memchr::memmem::find(&source, b"extern").is_none()
             && memchr::memmem::find(&source, b"macro_use").is_none()
         {
