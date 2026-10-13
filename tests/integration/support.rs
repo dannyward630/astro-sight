@@ -142,6 +142,12 @@ pub(super) fn mcp_send_after_init(extra_messages: &[&str]) -> String {
 
 /// `mcp_send_after_init` の拡張版。`global_args` (`--pretty` / `--format toon` 等) を
 /// `mcp` サブコマンドの前に付け、`cwd` を指定すればそこをサンドボックスとして起動する。
+///
+/// initialize の応答を待ってから追加メッセージを送り、`id` を持つ要求の応答がそろう
+/// (または 300 秒の期限を過ぎる) まで stdin を閉じない。stdin を閉じるとサーバーは処理中の
+/// 要求を残したまま終了するので、要求の直後に閉じていた旧実装は、負荷の高い環境
+/// (load average 100〜300) で重い要求の応答が欠け、テストの中身と関係なく落ちていた。
+/// サーバーが落ちた場合は出力がその時点で閉じるので、欠けた応答として検出できる。
 pub(super) fn mcp_send_after_init_with(
     global_args: &[&str],
     cwd: Option<&Path>,
@@ -149,6 +155,8 @@ pub(super) fn mcp_send_after_init_with(
 ) -> String {
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     let mut command = cargo_bin();
     command.args(global_args).arg("mcp");
@@ -165,18 +173,35 @@ pub(super) fn mcp_send_after_init_with(
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
 
-    // 別スレッドで stdout を最後まで読み取る
+    // 別スレッドで stdout を 1 行ずつ読み、届いた順に渡す
+    let (tx, rx) = mpsc::channel::<String>();
     let reader_handle = std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        let mut lines = Vec::new();
-        for line in reader.lines() {
-            match line {
-                Ok(l) => lines.push(l),
-                Err(_) => break,
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
             }
         }
-        lines
     });
+
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut lines: Vec<String> = Vec::new();
+    // 期限内に `id` の応答が届くまで読む。出力が閉じたら (サーバーの終了) false。
+    let wait_for = |id: &serde_json::Value, lines: &mut Vec<String>| -> bool {
+        loop {
+            if lines
+                .iter()
+                .any(|line| mcp_response_id(line).as_ref() == Some(id))
+            {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining) {
+                Ok(line) => lines.push(line),
+                Err(_) => return false,
+            }
+        }
+    };
 
     // initialize 送信
     writeln!(
@@ -185,9 +210,7 @@ pub(super) fn mcp_send_after_init_with(
     )
     .unwrap();
     stdin.flush().unwrap();
-
-    // サーバーが initialize を処理する時間を確保
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    wait_for(&serde_json::json!(1), &mut lines);
 
     // initialized 通知 + 追加メッセージを送信
     writeln!(
@@ -199,11 +222,33 @@ pub(super) fn mcp_send_after_init_with(
         writeln!(stdin, "{msg}").unwrap();
     }
     stdin.flush().unwrap();
+    for id in extra_messages.iter().filter_map(|msg| mcp_request_id(msg)) {
+        if !wait_for(&id, &mut lines) {
+            break;
+        }
+    }
     drop(stdin);
 
     let _ = child.wait();
-    let lines = reader_handle.join().expect("reader thread panicked");
+    reader_handle.join().expect("reader thread panicked");
+    lines.extend(rx.try_iter());
     lines.join("\n")
+}
+
+/// JSON-RPC の要求 (`method` と null でない `id` を持つ) なら、その `id`。
+fn mcp_request_id(message: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(message).ok()?;
+    value.get("method")?;
+    value.get("id").filter(|id| !id.is_null()).cloned()
+}
+
+/// JSON-RPC の応答 (`method` を持たない) なら、その `id`。
+fn mcp_response_id(line: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("method").is_some() {
+        return None;
+    }
+    value.get("id").cloned()
 }
 
 /// A3 用 helper: base_files を commit し、`setup` で削除/追加した temp git repo を作って
