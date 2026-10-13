@@ -249,7 +249,7 @@ fn explicit_review_rejects_new_side_line_offsets_that_do_not_match() {
 }
 
 #[test]
-fn staged_snapshot_preserves_locked_split_index_and_ignores_unparsed_assets() {
+fn staged_snapshot_preserves_locked_split_index_and_writes_unparsed_assets() {
     let repo = TestRepo::new();
     repo.write("api.py", "def price(amount):\n    return amount\n");
     repo.write(
@@ -285,7 +285,7 @@ fn staged_snapshot_preserves_locked_split_index_and_ignores_unparsed_assets() {
         "caller.py",
         "from api import price\n\ndef use():\n    return price(1, 2)\n",
     );
-    // 解析対象でない index blob は snapshot の容量制限に入れない。
+    // 解析対象でない大きな blob (101 MiB) も、合計の上限内なら書き出して review を続ける。
     std::fs::File::create(repo.path("binary.png"))
         .unwrap()
         .set_len(101 * 1024 * 1024)
@@ -313,6 +313,212 @@ fn staged_snapshot_preserves_locked_split_index_and_ignores_unparsed_assets() {
         "original index bytes changed"
     );
     assert!(repo.path(".git/index.lock").exists());
+}
+
+/// `review --hook` の (終了コード, stderr の JSON)。出力が無ければ JSON は null。
+fn review_hook_result(repo: &TestRepo, staged: bool) -> (Option<i32>, serde_json::Value) {
+    let mut command = cargo_bin();
+    command
+        .args(["review", "--git", "--hook", "--dir"])
+        .arg(repo.root());
+    if staged {
+        command.arg("--staged");
+    }
+    let output = command.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let json = if stderr.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(stderr.trim())
+            .unwrap_or_else(|error| panic!("invalid hook output: {error}: {stderr}"))
+    };
+    (output.status.code(), json)
+}
+
+/// index と作業ツリーが同じなら、staged review は unstaged review と同じ結果になる。
+/// スナップショットを許可リストで書き出していたころは `.vue`・`AndroidManifest.xml`・
+/// `jsconfig.json` が無いまま解析し、staged だけ互換と判定して exit 0・生きている Activity を
+/// dead と報告・`paths` の barrel 経由の影響を見落とし・解析できないソースの申告を落としていた。
+#[test]
+fn staged_review_matches_unstaged_review_for_non_source_inputs() {
+    type Files<'a> = &'a [(&'a str, &'a str)];
+    let cases: &[(&str, Files<'_>, Files<'_>)] = &[
+        (
+            "vue blocks optional parameter removal",
+            &[
+                (
+                    "spacing.ts",
+                    "export function spacing(scale = 1): number { return scale; }\n",
+                ),
+                (
+                    "use.ts",
+                    "import { spacing } from './spacing';\nspacing();\n",
+                ),
+                ("component.vue", "<script>load('./spacing')</script>"),
+            ],
+            &[(
+                "spacing.ts",
+                "export function spacing(): number { return 1; }\n",
+            )],
+        ),
+        (
+            "vue usage is declared",
+            &[
+                ("src/helper.ts", "export function helper() { return 1; }\n"),
+                (
+                    "src/App.vue",
+                    "<script setup>\nimport { helper } from './helper';\nhelper();\n</script>\n",
+                ),
+            ],
+            &[("src/helper.ts", "export function helper() { return 2; }\n")],
+        ),
+        (
+            "android manifest keeps the activity alive",
+            &[
+                (
+                    "app/src/main/AndroidManifest.xml",
+                    "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n  <application>\n    <activity android:name=\".MainActivity\" android:exported=\"true\" />\n  </application>\n</manifest>\n",
+                ),
+                (
+                    "app/src/main/java/com/example/MainActivity.kt",
+                    "package com.example\n\nclass MainActivity : AppCompatActivity() {\n    override fun onCreate(savedInstanceState: Bundle?) {}\n}\n",
+                ),
+            ],
+            &[(
+                "app/src/main/java/com/example/MainActivity.kt",
+                "package com.example\n\nclass MainActivity : ComponentActivity() {\n    override fun onCreate(savedInstanceState: Bundle?) {}\n}\n",
+            )],
+        ),
+        (
+            "jsconfig paths reach the barrel caller",
+            &[
+                (
+                    "jsconfig.json",
+                    "{\"compilerOptions\":{\"paths\":{\"@/*\":[\"src/*\"]}}}\n",
+                ),
+                (
+                    "src/lib/storage/impl.js",
+                    "export function save(key) { return key; }\n",
+                ),
+                (
+                    "src/lib/storage/index.js",
+                    "export { save } from './impl';\n",
+                ),
+                (
+                    "src/app.js",
+                    "import { save } from '@/lib/storage';\n\nexport const a = save('k');\n",
+                ),
+            ],
+            &[(
+                "src/lib/storage/impl.js",
+                "export function save(key, value) { return key + value; }\n",
+            )],
+        ),
+    ];
+    for (name, base, changed) in cases {
+        let repo = TestRepo::new();
+        for (path, content) in base.iter() {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                repo.create_dir_all(parent);
+            }
+            repo.write(path, content);
+        }
+        repo.init_git();
+        repo.commit_all("base");
+        for (path, content) in changed.iter() {
+            repo.write(path, content);
+        }
+        let unstaged = review_hook_result(&repo, false);
+        // 修正前に食い違っていた点を、正しい側 (unstaged) で確かめておく。
+        let json = &unstaged.1;
+        match *name {
+            "vue blocks optional parameter removal" => {
+                assert_eq!(unstaged.0, Some(1), "{json}");
+                assert!(json["api"]["mod_compat"].is_null(), "{json}");
+            }
+            "vue usage is declared" => assert!(
+                json["trunc"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|t| { t["r"] == "unanalyzable_source" && t["d"]["x"] == "vue" }),
+                "{json}"
+            ),
+            "android manifest keeps the activity alive" => {
+                assert!(json["dead"].is_null(), "{json}");
+            }
+            "jsconfig paths reach the barrel caller" => assert!(
+                json["impacts"].to_string().contains("\"p\":\"src/app.js\""),
+                "{json}"
+            ),
+            _ => unreachable!(),
+        }
+        repo.stage_all();
+        assert_eq!(review_hook_result(&repo, true), unstaged, "{name}");
+    }
+}
+
+/// `--hook` が blocking (exit 1) で終わっても、staged の一時スナップショットを残さない。
+/// `process::exit` はデストラクタを走らせないため、以前は Stop hook が止めるたびに
+/// リポジトリのコピーが一時ディレクトリに積み上がっていた。
+#[test]
+fn staged_review_hook_removes_the_snapshot_even_when_blocking() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "pub mod util;\n");
+    repo.write("src/util.rs", "pub fn helper(a: i32) -> i32 {\n    a\n}\n");
+    repo.write(
+        "src/main.rs",
+        "fn main() {\n    demo::util::helper(1);\n}\n",
+    );
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write(
+        "src/util.rs",
+        "pub fn helper(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    );
+    repo.stage_all();
+    let temp = tempfile::tempdir().unwrap();
+    let run = |hook: bool| {
+        let mut command = cargo_bin();
+        command
+            .args(["review", "--git", "--staged", "--dir"])
+            .arg(repo.root());
+        if hook {
+            command.arg("--hook");
+        }
+        command
+            .env("TMPDIR", temp.path())
+            .env("TMP", temp.path())
+            .env("TEMP", temp.path())
+            .output()
+            .unwrap()
+    };
+    let leftovers = || {
+        std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("astro-sight-index-"))
+            .collect::<Vec<_>>()
+    };
+    let blocking = run(true);
+    let stderr = String::from_utf8_lossy(&blocking.stderr);
+    assert_eq!(blocking.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("\"api.mod\""), "{stderr}");
+    assert!(leftovers().is_empty(), "snapshot leaked: {:?}", leftovers());
+    // 対照: hook なしの通常出力も残さない (こちらは従来から Drop で消えていた)。
+    let plain = run(false);
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert!(leftovers().is_empty(), "snapshot leaked: {:?}", leftovers());
 }
 
 #[test]

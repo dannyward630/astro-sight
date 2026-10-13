@@ -127,7 +127,7 @@ condition = { command_exists = "astro-sight" }
 
 判定には `git rev-parse --is-inside-work-tree`（`LC_ALL=C`）を使うので、worktree / submodule / bare repo でも正しく判定できる。**真のエラー**（`--base` 不正・base がコミットに解決できない・git 実行不能・壊れた repo・権限不足）は `exit 1` を返す。`--diff` / `--diff-file` / stdin で diff を渡す経路は、この判定を通らない。
 
-`review --git` は開始時に base をコミット ID に固定し、差分・cochange・API 解析で共有する。解析中に index や作業ツリーが変わった場合は `exit 1` で再実行を促す。`--staged` でも API と dead-code は作業ツリーのファイルを読むため、staged 差分と作業ツリーの両方を確認する。
+`review --git` は開始時に base をコミット ID に固定し、差分・cochange・API 解析で共有する。解析中に index や作業ツリーが変わった場合は `exit 1` で再実行を促す。`--staged` は index の内容を一時ディレクトリに書き出し、影響・API 差分・dead-code をすべてその内容で解析する。作業ツリーにある未ステージの編集は結果に入らない (大きなリポジトリの扱いは「staged review の書き出しの上限」を参照)。
 
 ### 未追跡ファイルの取り込み上限
 
@@ -142,6 +142,16 @@ condition = { command_exists = "astro-sight" }
 ```
 
 `--hook` では `trunc: [{"f": "generated.rs", "r": "untracked_file_too_large"}]` として出力する（検出ではなく解析範囲の申告なので exit 1 にはしない）。`impact` は構造化 JSON を持たないため stderr の `note:` 行で出す。`--staged` / `--diff` / `--diff-file` は明示された範囲を尊重するため未追跡の取り込み自体を行わない。
+
+### staged review の書き出しの上限
+
+`review --git --staged` は、index にある通常ファイルをすべて一時ディレクトリに書き出してから解析する。ファイル数が 50,000、または合計が 512 MiB を超えるリポジトリでは書き出さず、作業ツリーのファイルを読む経路に切り替える (変更したファイルだけは index の内容を読む)。エラーにはせず、切り替えたことを `truncations` で申告する:
+
+```json
+{ "...": "...", "truncations": [{ "reason": "staged_snapshot_unavailable", "message": "staged snapshot was not created: 61234 files / 734003200 bytes exceed the limit (50000 files / 536870912 bytes); the working tree matched the index, so files were read from the working tree" }] }
+```
+
+切り替えた経路では、作業ツリーに未ステージの編集があると、参照の検索結果はコミットされる内容と一致しない。そこで、作業ツリーが index と違うときは、参照が無いことを根拠に非 blocking へ分ける判定 (`mod_closed` / `mod_compat` / `rm_dead`) を使わず、blocking のまま残す。`--hook` では `trunc: [{"r": "staged_snapshot_unavailable"}]` として出る (解析範囲の申告なので、これだけでは exit 1 にしない)。
 
 ### 解析できないソースの申告
 

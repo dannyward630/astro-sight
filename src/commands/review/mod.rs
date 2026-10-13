@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use tracing::info;
 
 use crate::error::{AstroError, ErrorCode};
-use crate::models::review::{ApiSymbol, DeadSymbol, ReviewResult};
+use crate::models::review::{ApiChanges, ApiSymbol, ApiSymbolChange, DeadSymbol, ReviewResult};
 use crate::models::skip::SkipInfo;
 use crate::service::AppService;
 
@@ -192,14 +192,21 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
     if pinned_base.is_none() {
         index_snapshot::verify_explicit_new_side(dir, &diff_input, &diff_files)?;
     }
-    let snapshot = if matches!(new_side, crate::models::impact::DiffNewSide::Index) {
-        Some(index_snapshot::IndexSnapshot::prepare(
-            dir,
-            analysis_base,
-            &diff_input,
-        )?)
+    let StagedSource {
+        snapshot,
+        notice: snapshot_notice,
+        keep_reference_downgrades_blocking,
+    } = if matches!(new_side, crate::models::impact::DiffNewSide::Index) {
+        timed_ok("staged_snapshot", || {
+            prepare_staged_source(
+                dir,
+                analysis_base,
+                &diff_input,
+                index_snapshot::SnapshotBudget::DEFAULT,
+            )
+        })?
     } else {
-        None
+        StagedSource::default()
     };
     let analysis_dir = match &snapshot {
         Some(snapshot) => snapshot.dir()?,
@@ -269,6 +276,9 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
             &api_diff_files(&diff_files, &diff_input),
         )
     });
+    if keep_reference_downgrades_blocking {
+        keep_reference_based_downgrades_blocking(&mut api_changes);
+    }
 
     // 6. dead symbol 検出
     let dead_opts = ReviewDeadSymbolsOpts {
@@ -290,6 +300,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         truncations: dead_truncations,
     } = dead_phase;
     let mut truncations = truncations;
+    truncations.extend(snapshot_notice);
     truncations.extend(dead_truncations);
     truncations.append(&mut api_changes.parse_truncations);
 
@@ -313,14 +324,21 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
     )?;
 
     if hook {
-        return review_hook_output(
+        let blocking = review_hook_output(
             &result,
             analysis_dir,
             strict_public_const_values,
             strict_public_type_annotations,
             &diff_input,
             &diff_files,
-        );
+        )?;
+        // `process::exit` はデストラクタを走らせないため、staged の一時スナップショットを
+        // exit の前に片付ける (Drop 任せにすると blocking のたびに一時ディレクトリが残る)。
+        drop(snapshot);
+        if blocking {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     let text = serialize_cli_document(&result, output)?;
@@ -364,6 +382,80 @@ fn ensure_review_diff_unchanged(
         }
     }
     Ok(())
+}
+
+/// staged review の解析元。スナップショットを作れたらそれを、作れなければ縮退の申告を持つ。
+#[derive(Default)]
+struct StagedSource {
+    snapshot: Option<index_snapshot::IndexSnapshot>,
+    notice: Option<crate::models::truncation::TruncationInfo>,
+    /// 作業ツリー由来の参照を根拠にした API の降格を blocking に戻すか。
+    keep_reference_downgrades_blocking: bool,
+}
+
+/// staged review の index tree スナップショットを用意する。上限を超えたらエラーにせず、
+/// スナップショット導入前の経路 (作業ツリー + 変更ファイルだけ index の blob) へ縮退する。
+/// 作業ツリーの追跡ファイルが index と同じなら、作業ツリーから集めた参照は staged のものと
+/// 一致する。違うときは参照の状況を根拠にした降格を確定させない (fail-closed)。
+fn prepare_staged_source(
+    dir: &str,
+    base: &str,
+    diff: &str,
+    budget: index_snapshot::SnapshotBudget,
+) -> Result<StagedSource> {
+    Ok(
+        match index_snapshot::IndexSnapshot::prepare(dir, base, diff, budget)? {
+            index_snapshot::PreparedSnapshot::Ready(snapshot) => StagedSource {
+                snapshot: Some(snapshot),
+                ..StagedSource::default()
+            },
+            index_snapshot::PreparedSnapshot::OverBudget(over) => {
+                let matches = working_tree_matches_index(dir);
+                StagedSource {
+                    snapshot: None,
+                    notice: Some(over.truncation(matches)),
+                    keep_reference_downgrades_blocking: !matches,
+                }
+            }
+        },
+    )
+}
+
+/// 作業ツリーの追跡ファイルが index と同じか (`git diff --quiet`)。hook が渡した
+/// `GIT_INDEX_FILE` も staged diff と同じく尊重する。判定できなければ「違う」に倒す
+/// (参照に依存する降格を確定させない側)。
+fn working_tree_matches_index(dir: &str) -> bool {
+    crate::git_support::git_command_for_dir(dir)
+        .args(["diff", "--quiet", "--no-ext-diff", "--no-textconv"])
+        .current_dir(dir)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// 作業ツリーから集めた参照を根拠にした API の降格を取り消し、blocking のバケットへ戻す。
+///
+/// staged review のスナップショットを作れなかったとき (上限超過) は、参照を作業ツリーから
+/// 集める。作業ツリーに未ステージの変更があると、その参照は commit される内容と一致しない
+/// ため、「呼び出し側が追随済み」「互換」「参照が残っていない」の証明にならない。
+fn keep_reference_based_downgrades_blocking(api: &mut ApiChanges) {
+    let closed = std::mem::take(&mut api.modified_closed_in_diff);
+    api.modified.extend(closed);
+    let compatible = std::mem::take(&mut api.compatible_modified);
+    api.modified
+        .extend(compatible.into_iter().map(|change| ApiSymbolChange {
+            name: change.name,
+            kind: change.kind,
+            file: change.file,
+            old_signature: change.old_signature,
+            new_signature: change.new_signature,
+            no_resolved_internal_callers: false,
+            contract_change: None,
+        }));
+    let dead = std::mem::take(&mut api.removed_dead);
+    api.removed.extend(dead);
 }
 
 #[cfg(test)]
@@ -422,6 +514,148 @@ mod snapshot_tests {
             "staged が同じでも作業ツリー側の変化は破棄する"
         );
     }
+
+    /// 上限を超えた staged tree はエラーにせず縮退し、申告を出す。作業ツリーの追跡ファイルが
+    /// index と同じときだけ、作業ツリーの参照を根拠にした降格をそのまま使う。
+    #[test]
+    fn over_budget_staged_tree_falls_back_and_keeps_downgrades_only_when_clean() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(repo)
+                    .status()
+                    .expect("git")
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        fs::write(repo.join("a.py"), "def a():\n    return 1\n").expect("write");
+        fs::write(repo.join("b.py"), "def b():\n    return 1\n").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "initial"]);
+        fs::write(repo.join("a.py"), "def a():\n    return 2\n").expect("write");
+        git(&["add", "a.py"]);
+        let dir = repo.to_str().expect("utf-8");
+        // review は解決済みのコミット ID を渡す。
+        let base = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo)
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .expect("utf-8");
+        let base = base.trim();
+        let diff = run_git_diff(dir, base, true).expect("staged diff");
+        let tiny = index_snapshot::SnapshotBudget {
+            files: 1,
+            bytes: u64::MAX,
+        };
+
+        let clean = prepare_staged_source(dir, base, &diff, tiny).expect("no hard error");
+        assert!(clean.snapshot.is_none());
+        assert!(!clean.keep_reference_downgrades_blocking);
+        let notice = clean.notice.expect("fallback must be declared");
+        assert_eq!(
+            notice.reason,
+            crate::models::truncation::TruncationReason::StagedSnapshotUnavailable
+        );
+        assert!(notice.message.contains("2 files"), "{}", notice.message);
+        assert!(
+            notice.message.contains("matched the index"),
+            "{}",
+            notice.message
+        );
+
+        // 未ステージの変更があると、作業ツリーの参照は commit される内容と一致しない。
+        fs::write(repo.join("b.py"), "def b():\n    return 3\n").expect("write");
+        let dirty = prepare_staged_source(dir, base, &diff, tiny).expect("no hard error");
+        assert!(dirty.snapshot.is_none());
+        assert!(dirty.keep_reference_downgrades_blocking);
+        assert!(
+            dirty
+                .notice
+                .expect("fallback must be declared")
+                .message
+                .contains("kept blocking")
+        );
+
+        // 対照: 上限内ならスナップショットを作り、申告も降格の取り消しもしない。
+        let ready =
+            prepare_staged_source(dir, base, &diff, index_snapshot::SnapshotBudget::DEFAULT)
+                .expect("snapshot");
+        assert!(ready.snapshot.is_some());
+        assert!(ready.notice.is_none());
+        assert!(!ready.keep_reference_downgrades_blocking);
+    }
+
+    /// 縮退時は、参照の状況を根拠にした降格 (mod_closed / mod_compat / rm_dead) を
+    /// blocking のバケットへ戻す。それ以外のバケットは動かさない。
+    #[test]
+    fn reference_based_downgrades_return_to_blocking_buckets() {
+        use crate::models::review::CompatibleApiModification;
+        let symbol = |name: &str| ApiSymbol {
+            name: name.into(),
+            kind: "function".into(),
+            file: "a.ts".into(),
+            refs_internal: 0,
+        };
+        let change = |name: &str| ApiSymbolChange {
+            name: name.into(),
+            kind: "function".into(),
+            file: "a.ts".into(),
+            old_signature: Some(format!("{name}(a)")),
+            new_signature: Some(format!("{name}(a, b)")),
+            no_resolved_internal_callers: false,
+            contract_change: None,
+        };
+        let mut api = ApiChanges {
+            modified: vec![change("modified")],
+            modified_closed_in_diff: vec![change("closed")],
+            compatible_modified: vec![CompatibleApiModification {
+                name: "compatible".into(),
+                kind: "function".into(),
+                file: "a.ts".into(),
+                old_signature: Some("compatible(a, b?)".into()),
+                new_signature: Some("compatible(a)".into()),
+                reason: "trailing_optional_params_removed".into(),
+            }],
+            removed: vec![symbol("removed")],
+            removed_dead: vec![symbol("dead")],
+            const_value_changes: vec![change("value")],
+            ..ApiChanges::default()
+        };
+        keep_reference_based_downgrades_blocking(&mut api);
+        let names =
+            |items: &[ApiSymbolChange]| items.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&api.modified), ["modified", "closed", "compatible"]);
+        assert_eq!(
+            api.modified[2].new_signature.as_deref(),
+            Some("compatible(a)")
+        );
+        assert!(api.modified_closed_in_diff.is_empty());
+        assert!(api.compatible_modified.is_empty());
+        assert_eq!(
+            api.removed
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["removed", "dead"]
+        );
+        assert!(api.removed_dead.is_empty());
+        assert_eq!(
+            names(&api.const_value_changes),
+            ["value"],
+            "値だけの変更は動かさない"
+        );
+    }
 }
 
 /// 解析へ進まず空結果で打ち切る共通処理 (git 管理外 / 空 diff / CI 言語のみ の 3 経路)。
@@ -451,14 +685,17 @@ fn emit_review_short_circuit(
 
     if hook {
         // 解析へ進まない経路なので impact も空 = diff 内の解決判定も要らない。
-        return review_hook_output(
+        if review_hook_output(
             &result,
             dir,
             strict_const_values,
             strict_type_annotations,
             "",
             &[],
-        );
+        )? {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     let text = serialize_cli_document(&result, output)?;

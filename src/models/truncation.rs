@@ -50,6 +50,9 @@ pub enum TruncationReason {
     /// (`.vue` / `.svelte` / `.scala` など)。そのファイル内の参照は数えられないため、
     /// dead-code の判定は「参照が無い」ではなく「観測できなかった」可能性を含む。
     UnanalyzableSource,
+    /// staged review で index tree のスナップショットが上限を超えたため作らず、
+    /// 作業ツリーを読んだ (影響分析の変更ファイルだけは index の blob を読む)。
+    StagedSnapshotUnavailable,
 }
 
 impl TruncationInfo {
@@ -78,6 +81,34 @@ impl TruncationInfo {
             TruncationReason::UntrackedFileTooLarge,
             format!(
                 "untracked file excluded from --git analysis: {limit_label} {actual} exceeds limit {limit}"
+            ),
+        )
+    }
+
+    /// staged review の index tree スナップショットを上限超過で作らなかった打ち切り。
+    ///
+    /// 件数・バイト数は tree の通常ファイル全体の実測値で、上限と並べて出す。
+    /// `working_tree_matches_index` が false なら、作業ツリー由来の参照に依存する API の
+    /// 降格を確定させず blocking に戻したことも書く。
+    pub fn staged_snapshot_unavailable(
+        files: usize,
+        bytes: u64,
+        file_limit: usize,
+        byte_limit: u64,
+        working_tree_matches_index: bool,
+    ) -> Self {
+        let consequence = if working_tree_matches_index {
+            "the working tree matched the index, so files were read from the working tree"
+        } else {
+            "files were read from the working tree, which differs from the index, so \
+             reference-based API downgrades (mod_closed / mod_compat / rm_dead) were kept blocking"
+        };
+        Self::new(
+            None,
+            TruncationReason::StagedSnapshotUnavailable,
+            format!(
+                "staged snapshot was not created: {files} files / {bytes} bytes exceed the limit \
+                 ({file_limit} files / {byte_limit} bytes); {consequence}"
             ),
         )
     }

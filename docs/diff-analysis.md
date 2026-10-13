@@ -127,7 +127,7 @@ When a command that accepts `--git` (`context` / `impact` / `review` / `dead-cod
 
 The check uses `git rev-parse --is-inside-work-tree` (with `LC_ALL=C`), so worktrees, submodules, and bare repositories are detected correctly. **Real errors** (an invalid `--base`, a base that cannot resolve to a commit, git not runnable, a broken repository, missing permissions) return `exit 1`. Passing a diff through `--diff` / `--diff-file` / stdin does not go through this check.
 
-For `review --git`, the base is resolved to a commit once and used for the diff, cochange, and API analysis. If the index or working tree changes during review, the command returns `exit 1` and asks you to run it again. With `--staged`, both the staged diff and working tree are checked because API and dead-code analysis also read working-tree files.
+For `review --git`, the base is resolved to a commit once and used for the diff, cochange, and API analysis. If the index or working tree changes during review, the command returns `exit 1` and asks you to run it again. With `--staged`, the index contents are written to a temporary directory, and impact, API, and dead-code analysis all read those contents. Unstaged edits in the working tree do not enter the result (for large repositories, see "Size limit of the staged snapshot").
 
 ### Limit on Untracked Files
 
@@ -142,6 +142,16 @@ Excluded files are not dropped silently; they are listed in `truncations` (so th
 ```
 
 With `--hook`, this is printed as `trunc: [{"f": "generated.rs", "r": "untracked_file_too_large"}]` (it reports the analyzed scope rather than a finding, so it does not cause exit 1). `impact`, which has no structured JSON, prints it as a `note:` line on stderr. `--staged` / `--diff` / `--diff-file` respect the scope given explicitly and do not pull in untracked files at all.
+
+### Size limit of the staged snapshot
+
+`review --git --staged` writes every regular file in the index to a temporary directory before analyzing it. When the repository has more than 50,000 files or 512 MiB in total, it does not write them and reads the working tree instead (only the changed files are read from the index). This is not an error; the switch is reported in `truncations`:
+
+```json
+{ "...": "...", "truncations": [{ "reason": "staged_snapshot_unavailable", "message": "staged snapshot was not created: 61234 files / 734003200 bytes exceed the limit (50000 files / 536870912 bytes); the working tree matched the index, so files were read from the working tree" }] }
+```
+
+On this path, references found in the working tree do not match the content being committed when it has unstaged edits. So when the working tree differs from the index, the checks that move a change to a non-blocking category because no references remain (`mod_closed` / `mod_compat` / `rm_dead`) are not used, and the change stays blocking. With `--hook`, this is printed as `trunc: [{"r": "staged_snapshot_unavailable"}]` (it reports the analyzed scope, so it does not cause exit 1 by itself).
 
 ### Reporting Sources That Cannot Be Analyzed
 

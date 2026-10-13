@@ -709,9 +709,22 @@ mod tests {
         write(root, "caller.ts", "export const output = 1;\n");
         write(root, "notes.md", "No reference\n");
         let diff = crate::commands::git_input::run_git_diff(name, base, true).unwrap();
-        let snapshot =
-            super::super::index_snapshot::IndexSnapshot::prepare(name, base, &diff).unwrap();
-        assert!(!Path::new(snapshot.dir().unwrap()).join("notes.md").exists());
+        let super::super::index_snapshot::PreparedSnapshot::Ready(snapshot) =
+            super::super::index_snapshot::IndexSnapshot::prepare(
+                name,
+                base,
+                &diff,
+                super::super::index_snapshot::SnapshotBudget::DEFAULT,
+            )
+            .unwrap()
+        else {
+            panic!("small staged tree must be materialized");
+        };
+        // 解析対象の言語でないファイルも index の内容のまま書き出す (作業ツリーの編集は入れない)。
+        assert_eq!(
+            std::fs::read_to_string(Path::new(snapshot.dir().unwrap()).join("notes.md")).unwrap(),
+            "Check source.ts\n"
+        );
         let mut scope = Scope::new(snapshot.dir().unwrap(), Some(base), &[], &[], &[]).unwrap();
         assert_eq!(
             scope.evidence("source.ts", "caller.ts").unwrap().kind,

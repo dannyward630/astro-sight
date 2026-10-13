@@ -697,6 +697,9 @@ pub(crate) fn build_review_hook_json_for_diff(
                     crate::models::truncation::TruncationReason::UnanalyzableSource => {
                         "unanalyzable_source"
                     }
+                    crate::models::truncation::TruncationReason::StagedSnapshotUnavailable => {
+                        "staged_snapshot_unavailable"
+                    }
                 },
                 d: if t.reason == crate::models::truncation::TruncationReason::UnanalyzableSource {
                     t.detail
@@ -772,8 +775,11 @@ pub(crate) fn build_review_hook_json_for_diff(
 /// `serde_json::Value` の `Display` (= compact JSON) で直接書く。
 /// `serialize_document` を通すと `--format auto` で TOON が選ばれ、黙って契約が壊れる
 /// (`OutputOptions::ensure_json_protocol` の不変条件を参照)。
-/// blocking な検出 (impacts / api / dead) があれば exit 1、
+/// 戻り値は blocking な検出 (impacts / api / dead) があったか。呼び出し側はこれを見て exit 1 にし、
 /// cochange のみの informational な出力は exit 0 にして Stop hook を止めない。
+///
+/// ここで `process::exit` しないのは、exit がデストラクタを走らせないため。staged review の
+/// 一時スナップショット (`TempDir`) が消えずに残り、Stop hook が止めるたびに増えていた。
 pub(crate) fn review_hook_output(
     result: &ReviewResult,
     dir: &str,
@@ -781,7 +787,7 @@ pub(crate) fn review_hook_output(
     strict_type_annotations: bool,
     diff_input: &str,
     diff_files: &[crate::models::impact::DiffFile],
-) -> Result<()> {
+) -> Result<bool> {
     let build = build_review_hook_json_for_diff(
         result,
         dir,
@@ -791,12 +797,9 @@ pub(crate) fn review_hook_output(
         diff_files,
     );
     let Some(hook_output) = build.value else {
-        return Ok(());
+        return Ok(false);
     };
 
     eprintln!("{hook_output}");
-    if build.is_blocking {
-        std::process::exit(1);
-    }
-    Ok(())
+    Ok(build.is_blocking)
 }
