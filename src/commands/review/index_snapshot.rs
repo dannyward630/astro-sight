@@ -522,6 +522,16 @@ mod tests {
             b"*.txt text eol=crlf\n*.c ident\n*.utf16 working-tree-encoding=UTF-16\n",
         );
         write(repo, "src/app.ts", b"export const a = 1;\n");
+        // 非 UTF-8 のパスは差分入力では拒否する。基準側に置き、生パスの展開だけを確かめる。
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            fs::write(
+                repo.join(std::ffi::OsString::from_vec(b"raw-\xff.txt".to_vec())),
+                b"raw\n",
+            )
+            .expect("write non-UTF-8 name");
+        }
         commit_all(repo, "base");
         let base = head(repo);
         let files: &[(&str, &[u8])] = &[
@@ -561,16 +571,6 @@ mod tests {
             .expect("chmod");
             std::os::unix::fs::symlink("src/app.ts", repo.join("link")).expect("symlink");
         }
-        // Linux だけが非 UTF-8 のファイル名を作れる。生バイト列のまま書き出す。
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::ffi::OsStringExt;
-            fs::write(
-                repo.join(std::ffi::OsString::from_vec(b"raw-\xff.txt".to_vec())),
-                b"raw\n",
-            )
-            .expect("write non-UTF-8 name");
-        }
         git(repo, &["add", "-A"]);
         git(
             repo,
@@ -584,6 +584,15 @@ mod tests {
         // 作業ツリーだけの編集はスナップショットに入れない。
         write(repo, "src/app.ts", b"export const a = 3;\n");
         write(repo, "notes/lines.txt", b"worktree only\n");
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            fs::write(
+                repo.join(std::ffi::OsString::from_vec(b"raw-\xff.txt".to_vec())),
+                b"worktree only\n",
+            )
+            .expect("write non-UTF-8 worktree file");
+        }
 
         let snapshot = ready(prepare_staged(repo, SnapshotBudget::DEFAULT));
         let root = Path::new(snapshot.dir().expect("utf-8"));
