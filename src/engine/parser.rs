@@ -172,7 +172,7 @@ pub fn parse_source(source: &[u8], lang_id: LangId) -> Result<Tree> {
 }
 
 /// ファイルサイズ上限: 100 MB。
-const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
+pub(crate) const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 
 /// ゼロコピー対応ソースバッファ。
 /// 64KB 超のファイルは mmap（コピー不要）、それ以下は Vec<u8> を使用。

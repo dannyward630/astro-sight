@@ -29,6 +29,12 @@ pub(crate) struct DeadCodeDetection {
     /// 参照集計の走査で見つかった「解析できないソース」の申告。候補が 0 件で参照集計を
     /// 行わなかった場合は空 (dead と断定したものが無いので誤検出の余地も無い)。
     pub(crate) unanalyzable: Vec<crate::models::truncation::TruncationInfo>,
+    /// 参照を数えられなかったファイル (読み込み・構文解析の失敗) の申告。
+    /// 1 件でもあれば、件数は入力の一部しか数えていない。
+    pub(crate) uncounted: Vec<crate::models::truncation::TruncationInfo>,
+    /// 参照の件数だけなら dead / test_only だが、数えられなかったファイルから参照されて
+    /// いるかもしれないため断定を保留した候補。
+    pub(crate) unverified: Vec<DeadSymbol>,
 }
 
 impl DeadCodeDetection {
@@ -41,7 +47,9 @@ impl DeadCodeDetection {
     }
 }
 
-/// dead-code 検出本体 (既定の生成物の扱い)。`(dead_symbols, test_only_symbols)` を返す。
+/// dead-code 検出本体 (既定の生成物の扱い)。`(dead_symbols, test_only_symbols)` を返す
+/// テスト用の簡易版 (申告と保留した候補は捨てる。製品の経路は `detect_dead_symbols` を使う)。
+#[cfg(test)]
 pub(crate) fn detect_dead_symbols_from_files(
     dir: &str,
     files: &[std::path::PathBuf],
@@ -98,7 +106,7 @@ pub(crate) fn detect_dead_symbols(
 
     // production / test 別に refs カウント。test/ 配下のみで参照されるシンボルは
     // dead_symbols ではなく test_only_symbols として分離する (F5)。
-    let counts = match crate::engine::refs::count_non_definition_refs_split_in_files(
+    let ref_counts = match crate::engine::refs::count_non_definition_refs_split_in_files(
         &index.unique_names,
         &scan.files,
         is_test,
@@ -106,6 +114,7 @@ pub(crate) fn detect_dead_symbols(
         Ok(v) => v,
         Err(_) => return DeadCodeDetection::without_dead(generated_candidates_skipped),
     };
+    let unobserved = UnobservedReferences::new(&index.unique_names, &ref_counts.uncounted);
 
     let asset_refs = collect_framework_asset_refs(&canonical_dir);
     let default_liveness =
@@ -113,20 +122,190 @@ pub(crate) fn detect_dead_symbols(
     let rust_member_liveness =
         RustMemberLiveness::build(&candidates.all_syms, &canonical_dir, &scan.files, is_test);
 
-    let (mut dead, mut test_only) = classify_dead_symbols(
+    let mut classified = classify_dead_symbols(
         &candidates,
         &index,
-        &counts,
+        &ref_counts.counts,
         &asset_refs,
         &default_liveness,
         &rust_member_liveness,
+        &unobserved,
     );
-    attach_declaration_lines(dir, &mut dead, &mut test_only);
+    attach_declaration_lines(dir, &mut classified.dead, &mut classified.test_only);
+    attach_declaration_lines(dir, &mut classified.unverified, &mut []);
+    let uncounted = uncounted_truncations(
+        &canonical_dir,
+        &ref_counts.uncounted,
+        default_liveness.unobserved_files(),
+        classified.unverified.len(),
+    );
     DeadCodeDetection {
-        dead,
-        test_only,
+        dead: classified.dead,
+        test_only: classified.test_only,
         generated_candidates_skipped,
         unanalyzable,
+        uncounted,
+        unverified: classified.unverified,
+    }
+}
+
+/// 参照を観測できなかった範囲。dead / test_only の断定を名前ごとに控えるために使う。
+///
+/// 件数集計で読み込み・構文解析に失敗したファイルからの参照は数えられていない。そのファイルに
+/// 現れうる名前の候補を「参照が無い」と断定すると、唯一の呼び出しが読めないファイル
+/// (100MB の上限超過など) にある関数を dead と報告する (旧実装は失敗を黙って捨てていた)。
+/// production のファイルなら dead も test_only も、test のファイルなら dead だけを控える。
+#[derive(Default)]
+struct UnobservedReferences {
+    /// production のファイルから参照されているかもしれない名前 (正規化済みのキー)。
+    prod_names: HashSet<String>,
+    /// test のファイルから参照されているかもしれない名前。
+    test_names: HashSet<String>,
+    /// 中身を確かめられない production / test のファイルがあり、どの名前も参照されうる。
+    any_prod: bool,
+    any_test: bool,
+}
+
+impl UnobservedReferences {
+    fn new(names: &[String], uncounted: &[crate::engine::refs::UncountedFile]) -> Self {
+        let mut unobserved = Self::default();
+        for file in uncounted {
+            match &file.possible_names {
+                None if file.is_test => unobserved.any_test = true,
+                None => unobserved.any_prod = true,
+                Some(indices) => {
+                    let bucket = if file.is_test {
+                        &mut unobserved.test_names
+                    } else {
+                        &mut unobserved.prod_names
+                    };
+                    bucket.extend(indices.iter().filter_map(|&ix| names.get(ix).cloned()));
+                }
+            }
+        }
+        unobserved
+    }
+
+    /// `keys` のどれかが、数えられなかった production / test のファイルから参照されうるか。
+    fn may_be_referenced(&self, keys: &[&str]) -> (bool, bool) {
+        (
+            self.any_prod || keys.iter().any(|key| self.prod_names.contains(*key)),
+            self.any_test || keys.iter().any(|key| self.test_names.contains(*key)),
+        )
+    }
+}
+
+/// 参照を数えられなかったファイルの申告を作る (パス順、上限付き)。
+///
+/// 件数集計で失敗したファイルと、default export の判定で失敗したファイルを合わせる
+/// (同じファイルは 1 件にまとめる)。`withheld` は断定を保留した候補の件数で、
+/// 先頭の申告に添える。
+fn uncounted_truncations(
+    canonical_dir: &std::path::Path,
+    uncounted: &[crate::engine::refs::UncountedFile],
+    default_unobserved: &super::dead_code_default_liveness::UnobservedFiles,
+    withheld: usize,
+) -> Vec<crate::models::truncation::TruncationInfo> {
+    use crate::models::truncation::TruncationInfo;
+
+    let mut entries: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for file in uncounted {
+        let rel = normalize_workspace_separators(
+            &file
+                .path
+                .strip_prefix(canonical_dir)
+                .unwrap_or(&file.path)
+                .to_string_lossy(),
+        );
+        let scope = match &file.possible_names {
+            Some(names) if names.is_empty() => {
+                "no candidate name appears in it, so no judgement was withheld".to_string()
+            }
+            Some(names) => format!(
+                "{} candidate name(s) appear in it, so they are not reported as dead",
+                names.len()
+            ),
+            None => {
+                "its content could not be scanned, so no candidate is reported as dead".to_string()
+            }
+        };
+        entries.insert(
+            rel,
+            format!(
+                "references in this file were not counted ({}); {scope}",
+                file.cause
+            ),
+        );
+    }
+    for (rel, cause) in default_unobserved
+        .prod
+        .iter()
+        .chain(default_unobserved.test.iter())
+    {
+        entries.entry(rel.clone()).or_insert_with(|| {
+            format!(
+                "default imports in this file were not counted ({cause}); \
+                 default-export candidates are not reported as dead"
+            )
+        });
+    }
+    let total = entries.len();
+    let mut out: Vec<TruncationInfo> = entries
+        .into_iter()
+        .take(UNCOUNTED_TRUNCATION_CAP)
+        .map(|(rel, message)| TruncationInfo::source_analysis_failed(&rel, message))
+        .collect();
+    if total > UNCOUNTED_TRUNCATION_CAP {
+        out.push(TruncationInfo::new(
+            None,
+            crate::models::truncation::TruncationReason::SourceAnalysisFailed,
+            format!(
+                "{} more file(s) whose references were not counted",
+                total - UNCOUNTED_TRUNCATION_CAP
+            ),
+        ));
+    }
+    if let Some(first) = out.first_mut()
+        && withheld > 0
+    {
+        first.message.push_str(&format!(
+            " ({withheld} candidate(s) in total were withheld from dead/test-only)"
+        ));
+    }
+    out
+}
+
+/// 参照を数えられなかったファイルの申告の上限 (残りは件数だけの 1 件にまとめる)。
+const UNCOUNTED_TRUNCATION_CAP: usize = 10;
+
+/// 分類の結果。
+#[derive(Default)]
+struct ClassifiedDead {
+    dead: Vec<DeadSymbol>,
+    test_only: Vec<DeadSymbol>,
+    /// 件数だけなら dead / test_only だが、数えられなかった参照がありうるので保留した候補。
+    unverified: Vec<DeadSymbol>,
+}
+
+impl ClassifiedDead {
+    /// production の参照が 0 件の候補を、test の参照の有無と未観測の参照に応じて振り分ける。
+    ///
+    /// `unobserved` は (production, test) のファイルで数えられなかった参照がありうるか。
+    /// test_only は production の参照が無いことの断定なので production 側だけを、
+    /// dead は参照が 1 件も無いことの断定なので両方を見る。
+    fn push(&mut self, sym: DeadSymbol, has_test_refs: bool, unobserved: (bool, bool)) {
+        let (prod_unobserved, test_unobserved) = unobserved;
+        if has_test_refs {
+            if prod_unobserved {
+                self.unverified.push(sym);
+            } else {
+                self.test_only.push(sym);
+            }
+        } else if prod_unobserved || test_unobserved {
+            self.unverified.push(sym);
+        } else {
+            self.dead.push(sym);
+        }
     }
 }
 
@@ -524,14 +703,38 @@ fn classify_dead_symbols(
     asset_refs: &FrameworkAssetRefs,
     default_liveness: &DefaultExportLiveness,
     rust_member_liveness: &RustMemberLiveness,
-) -> (Vec<DeadSymbol>, Vec<DeadSymbol>) {
+    unobserved: &UnobservedReferences,
+) -> ClassifiedDead {
     // production 0 / test 0 → dead_symbols
     // production 0 / test > 0 → test_only_symbols (F5)
     // production > 0 → 生存とみなしどちらにも報告しない
-    let mut dead = Vec::new();
-    let mut test_only = Vec::new();
+    // 数えられなかったファイルから参照されうる候補は断定せず unverified に回す
+    let mut classified = ClassifiedDead::default();
     for (name, kind, file, lang) in &candidates.all_syms {
         let key = normalized_bare_name(*lang, name);
+        // 数えられなかったファイルからの参照がありうるか (検索キーと liveness 補助名、
+        // default export の import)。(production, test) の組。
+        let unobserved_refs = || {
+            let mut keys: Vec<&str> = vec![key.as_str()];
+            if let Some(extra) = index
+                .liveness_aliases
+                .get(&(file.to_string(), key.to_string()))
+            {
+                keys.extend(extra.iter().map(String::as_str));
+            }
+            let (prod, test) = unobserved.may_be_referenced(&keys);
+            let (default_prod, default_test) =
+                default_liveness.may_have_unobserved_uses(file, name);
+            (prod || default_prod, test || default_test)
+        };
+        let symbol = || DeadSymbol {
+            name: name.clone(),
+            kind: kind.clone(),
+            file: file.clone(),
+            // 宣言行は attach_declaration_lines で後付けする
+            // (per-file の parse を 1 回に集約するため)。
+            line: None,
+        };
         // 同名シンボルが複数存在する場合は bare name では区別できないためスキップする。
         // ただし TS/JS の class member については `JsTsMemberLiveness` で owner 一意推定
         // が成立した場合のみ、duplicate スキップを緩和して通常判定に乗せる。
@@ -552,34 +755,16 @@ fn classify_dead_symbols(
         {
             match member_status {
                 Some(MemberStatus::Live) => continue,
-                Some(MemberStatus::TestOnly) => {
+                Some(status @ (MemberStatus::TestOnly | MemberStatus::Dead)) => {
                     // Angular template / Android XML から参照されるシンボルは live。
                     if asset_refs.contains_symbol(name) {
                         continue;
                     }
-                    test_only.push(DeadSymbol {
-                        name: name.clone(),
-                        kind: kind.clone(),
-                        file: file.clone(),
-                        // 宣言行は attach_declaration_lines で後付けする
-                        // (per-file の parse を 1 回に集約するため)。
-                        line: None,
-                    });
-                    continue;
-                }
-                Some(MemberStatus::Dead) => {
-                    // Angular template / Android XML から参照されるシンボルは live。
-                    if asset_refs.contains_symbol(name) {
-                        continue;
-                    }
-                    dead.push(DeadSymbol {
-                        name: name.clone(),
-                        kind: kind.clone(),
-                        file: file.clone(),
-                        // 宣言行は attach_declaration_lines で後付けする
-                        // (per-file の parse を 1 回に集約するため)。
-                        line: None,
-                    });
+                    classified.push(
+                        symbol(),
+                        status == MemberStatus::TestOnly,
+                        unobserved_refs(),
+                    );
                     continue;
                 }
                 Some(MemberStatus::Ambiguous) | None => continue,
@@ -599,24 +784,14 @@ fn classify_dead_symbols(
             continue;
         }
 
-        let sym = DeadSymbol {
-            name: name.clone(),
-            kind: kind.clone(),
-            file: file.clone(),
-            line: None,
-        };
-        if test_cnt > 0 {
-            // PHPUnit テストクラス内のヘルパーメソッドは test_only からも除外する。
-            if has_phpunit_test_container(name, *lang) {
-                continue;
-            }
-            test_only.push(sym);
-        } else {
-            dead.push(sym);
+        // PHPUnit テストクラス内のヘルパーメソッドは test_only からも除外する。
+        if test_cnt > 0 && has_phpunit_test_container(name, *lang) {
+            continue;
         }
+        classified.push(symbol(), test_cnt > 0, unobserved_refs());
     }
 
-    (dead, test_only)
+    classified
 }
 
 /// C/C++ ファイルをパースし、dead-code liveness 補助情報 (enum→列挙子 / typedef tag→alias) を返す。
@@ -1567,6 +1742,7 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
                     scanned_files: 0,
                     dead_symbols: Vec::new(),
                     test_only_symbols: Vec::new(),
+                    unverified_symbols: Vec::new(),
                     skipped: None,
                     truncations,
                     generated_candidates_skipped: None,
@@ -1589,6 +1765,7 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
                 scanned_files: 0,
                 dead_symbols: Vec::new(),
                 test_only_symbols: Vec::new(),
+                unverified_symbols: Vec::new(),
                 skipped: Some(skip),
                 truncations: Vec::new(),
                 generated_candidates_skipped: None,
@@ -1655,12 +1832,16 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
 
     let mut truncations = resolved_diff.truncations;
     truncations.extend(detection.unanalyzable);
+    // 参照を数えられなかったファイルは、dead を保留したかに関わらず申告する
+    // (「全部数えた」と読めないように)。
+    truncations.extend(detection.uncounted);
 
     let result = DeadCodeResult {
         dir: canonical_dir.to_string_lossy().to_string(),
         scanned_files,
         dead_symbols,
         test_only_symbols,
+        unverified_symbols: detection.unverified,
         skipped: None,
         truncations,
         generated_candidates_skipped: crate::engine::refs::skipped_files_from_relative(
@@ -1678,4 +1859,92 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
     );
     print!("{text}");
     Ok(())
+}
+
+#[cfg(test)]
+mod uncounted_tests {
+    use super::*;
+
+    fn sym(name: &str) -> DeadSymbol {
+        DeadSymbol {
+            name: name.to_string(),
+            kind: "function".to_string(),
+            file: "a.ts".to_string(),
+            line: None,
+        }
+    }
+
+    fn names(symbols: &[DeadSymbol]) -> Vec<&str> {
+        symbols.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    /// 数えられなかった参照がありうる候補は断定しない。test_only は production の参照が
+    /// 無いことの断定なので production 側だけ、dead は両方を見る。
+    #[test]
+    fn classified_dead_withholds_only_what_unobserved_files_could_change() {
+        let mut classified = ClassifiedDead::default();
+        // (名前, test の参照あり, (production の未観測, test の未観測))
+        for (name, has_test_refs, unobserved) in [
+            ("dead_clean", false, (false, false)),
+            ("dead_prod_unobserved", false, (true, false)),
+            ("dead_test_unobserved", false, (false, true)),
+            ("test_only_clean", true, (false, false)),
+            ("test_only_prod_unobserved", true, (true, false)),
+            ("test_only_test_unobserved", true, (false, true)),
+        ] {
+            classified.push(sym(name), has_test_refs, unobserved);
+        }
+        assert_eq!(names(&classified.dead), vec!["dead_clean"]);
+        assert_eq!(
+            names(&classified.test_only),
+            vec!["test_only_clean", "test_only_test_unobserved"]
+        );
+        assert_eq!(
+            names(&classified.unverified),
+            vec![
+                "dead_prod_unobserved",
+                "dead_test_unobserved",
+                "test_only_prod_unobserved"
+            ]
+        );
+    }
+
+    /// 参照しうる名前が分かるファイルはその名前だけ、中身を確かめられないファイルは
+    /// 全部の名前を未観測にする。production / test を分けて持つ。
+    #[test]
+    fn unobserved_references_follow_possible_names() {
+        let names: Vec<String> = ["alpha", "beta", "gamma"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let file = |path: &str, possible: Option<Vec<usize>>, is_test: bool| {
+            crate::engine::refs::UncountedFile {
+                path: std::path::PathBuf::from(path),
+                cause: "x".to_string(),
+                possible_names: possible,
+                is_test,
+            }
+        };
+        let unobserved = UnobservedReferences::new(
+            &names,
+            &[
+                file("big.ts", Some(vec![0]), false),
+                file("t.ts", Some(vec![1]), true),
+            ],
+        );
+        assert_eq!(unobserved.may_be_referenced(&["alpha"]), (true, false));
+        assert_eq!(unobserved.may_be_referenced(&["beta"]), (false, true));
+        assert_eq!(unobserved.may_be_referenced(&["gamma"]), (false, false));
+        // liveness 補助名 (列挙子など) のどれかが未観測でも断定しない
+        assert_eq!(
+            unobserved.may_be_referenced(&["gamma", "alpha"]),
+            (true, false)
+        );
+
+        let unreadable = UnobservedReferences::new(&names, &[file("locked.ts", None, false)]);
+        assert_eq!(unreadable.may_be_referenced(&["gamma"]), (true, false));
+        // 対照: 失敗が無ければ何も未観測にしない
+        let clean = UnobservedReferences::new(&names, &[]);
+        assert_eq!(clean.may_be_referenced(&["alpha"]), (false, false));
+    }
 }

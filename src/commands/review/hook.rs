@@ -700,6 +700,9 @@ pub(crate) fn build_review_hook_json_for_diff(
                     crate::models::truncation::TruncationReason::StagedSnapshotUnavailable => {
                         "staged_snapshot_unavailable"
                     }
+                    crate::models::truncation::TruncationReason::SourceAnalysisFailed => {
+                        "source_analysis_failed"
+                    }
                 },
                 d: if t.reason == crate::models::truncation::TruncationReason::UnanalyzableSource {
                     t.detail

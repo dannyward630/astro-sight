@@ -16,6 +16,7 @@ mod integration {
     mod dead_code_conventions;
     mod dead_code_languages;
     mod dead_code_locations;
+    mod dead_code_uncounted;
     mod deep_nesting;
     mod git_non_ascii;
     mod hidden_and_angular_liveness;

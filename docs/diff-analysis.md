@@ -330,6 +330,8 @@ Symbols that frameworks and test runners call dynamically, by naming convention 
 - **Python framework registration decorators**: functions, methods, and classes with registration decorators of Typer / Click / FastAPI / Flask / Django / Celery / pytest, and so on
 - **Python dynamic protocol methods**: `*_open` / `*_request` / `*_response` / `http_error_*` of the `urllib.request.BaseHandler` family, and the `on_*` callbacks of watchdog's `FileSystemEventHandler` family. Only methods of classes that directly inherit the known base classes are excluded
 - **Angular**: lifecycle hooks of classes decorated with `@Component` / `@Directive` (`ngOnInit` / `ngOnDestroy` / `ngOnChanges` / `ngDoCheck` / `ngAfterContentInit` / `ngAfterContentChecked` / `ngAfterViewInit` / `ngAfterViewChecked`) are excluded because the Angular runtime calls them in the change detection cycle. `transform` of `@Pipe` classes (called from `| name` in templates) and `ngOnDestroy` of `@Injectable` / `@Pipe` classes (called when a service / pipe is destroyed) are excluded too. Other hooks of services and pipes (`ngOnInit`, and so on) are not called by Angular and are not excluded
+- **PHP annotations and attributes**: methods and classes whose docblock has an annotation starting with an uppercase letter (`@Route`, `@Entity`, ...) or a PHPUnit annotation such as `@test` / `@dataProvider`, and those with a PHP 8 attribute of the same name (`#[Route]`, `#[Test]`, ...)
+- **Methods called through syntax**: Kotlin `operator fun` and Swift `callAsFunction`. They are called through operators or call syntax, not by name. They stay in the API diff
 - **Program entry points**: the following are excluded (they stay in the API diff)
   - C / C++: `main` at global scope
   - Kotlin: top-level `fun main`, and `@JvmStatic fun main` directly inside an `object` / `companion object`
@@ -346,6 +348,16 @@ Files left out of the candidates are listed in `generated_candidates_skipped`, i
 ```json
 { "...": "...", "generated_candidates_skipped": { "generated": 1, "paths": ["api/greeter_grpc.pb.go"] } }
 ```
+
+### Files whose references could not be counted
+
+When a file whose references are counted cannot be read (over the 100MB limit, no permission, ...) or fails to parse, candidates whose names appear in that file are not reported as dead. They are listed in `unverified_symbols`, and `dead_symbols` keeps only the symbols confirmed to have no references. The file is reported as `source_analysis_failed` in `truncations`, whether or not any candidate was withheld.
+
+```json
+{ "...": "...", "unverified_symbols": [{ "name": "load_fixture", "kind": "function", "file": "src/fixtures.rs", "line": 3 }], "truncations": [{ "path": "data/huge.rs", "reason": "source_analysis_failed", "message": "references in this file were not counted (the file exceeds the read limit (115343360 bytes > 104857600 bytes)); 1 candidate name(s) appear in it, so they are not reported as dead (1 candidate(s) in total were withheld from dead/test-only)" }] }
+```
+
+A file over the limit is not parsed. Its content is read in fixed-size chunks only to check which candidate names appear in it. When a file cannot be opened or is larger than 1GiB, it is unknown which names appear, so every candidate is withheld. When only a test file could not be counted, `test_only_symbols` is not withheld: the absence of references from production files does not depend on test files. With `review --hook`, this appears in `trunc` only and does not cause exit 1 by itself.
 
 ### Detecting Frameworks Automatically
 

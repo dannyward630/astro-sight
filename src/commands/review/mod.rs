@@ -12,7 +12,7 @@ use crate::output::{OutputOptions, serialize_cli_document};
 
 use super::common::{MAX_INPUT_SIZE, log_phase, read_to_string_limited, timed, timed_ok};
 use super::dead_code::{
-    detect_dead_symbols_from_files, filter_dead_by_touched_symbols, filter_dead_by_wip_added,
+    detect_dead_symbols, filter_dead_by_touched_symbols, filter_dead_by_wip_added,
     filter_diff_files_for_dead_code, resolve_dead_code_excludes,
     resolve_framework_globs_with_auto_detect,
 };
@@ -758,7 +758,8 @@ fn review_dead_symbols(opts: &ReviewDeadSymbolsOpts<'_>) -> Result<ReviewDeadSym
         &combined_globs,
         None,
     )?;
-    let (dead_symbols, test_only_symbols) = detect_dead_symbols_from_files(opts.dir, &files);
+    let detection = detect_dead_symbols(opts.dir, &files, false);
+    let (dead_symbols, test_only_symbols) = (detection.dead, detection.test_only);
     // dead-scope=touched-symbols: 宣言行が diff の `+` 行と重ならない dead を除外。
     // `--hook` のデフォルトで「changed file 内の元から存在した dead」の
     // ノイズを抑える (Issue: zod-inferred-types-pre-existing-dead)。
@@ -784,7 +785,7 @@ fn review_dead_symbols(opts: &ReviewDeadSymbolsOpts<'_>) -> Result<ReviewDeadSym
     // dead と断定してしまう (生きているシンボルを dead と報告する最悪方向の誤り)。
     // ただし dead が 1 件も無ければ誤検出のしようが無いので、その場合は
     // 追加のディレクトリ走査を行わない (`--hook` のホットパスにコストを足さない)。
-    let truncations = if dead_symbols.is_empty() && test_only_symbols.is_empty() {
+    let mut truncations = if dead_symbols.is_empty() && test_only_symbols.is_empty() {
         Vec::new()
     } else {
         crate::engine::refs::collect_files_scan_with_excludes(
@@ -797,6 +798,9 @@ fn review_dead_symbols(opts: &ReviewDeadSymbolsOpts<'_>) -> Result<ReviewDeadSym
         .map(|collection| collection.unanalyzable_truncations(&canonical_dir))
         .unwrap_or_default()
     };
+    // 参照を数えられなかったファイル (読み込み・構文解析の失敗) は、dead を保留した結果
+    // dead が 0 件でも申告する (「全部数えた」と読めないように)。
+    truncations.extend(detection.uncounted);
 
     Ok(ReviewDeadSymbols {
         dead: dead_symbols,

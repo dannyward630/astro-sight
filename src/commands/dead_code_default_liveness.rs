@@ -13,6 +13,31 @@ use crate::language::LangId;
 #[derive(Default)]
 pub(super) struct DefaultExportLiveness {
     counts: HashMap<String, HashMap<String, (usize, usize)>>,
+    /// 読み込み・構文解析に失敗し、default の import を数えられなかった JS/TS のファイル。
+    /// default の import は宣言名と別の名前で書けるので、名前の出現では絞れない。
+    /// 1 件でもあれば、対象の default export を dead / test_only と断定しない。
+    unobserved: UnobservedFiles,
+}
+
+/// 中身を数えられなかったファイル (`dir` 相対のパスと失敗の内容)。
+#[derive(Default)]
+pub(super) struct UnobservedFiles {
+    pub(super) prod: Vec<(String, String)>,
+    pub(super) test: Vec<(String, String)>,
+}
+
+impl UnobservedFiles {
+    fn merge(&mut self, other: Self) {
+        self.prod.extend(other.prod);
+        self.test.extend(other.test);
+    }
+}
+
+/// worker ごとの集計。
+#[derive(Default)]
+struct FileUses {
+    counts: HashMap<String, (usize, usize)>,
+    unobserved: UnobservedFiles,
 }
 
 impl DefaultExportLiveness {
@@ -60,27 +85,39 @@ impl DefaultExportLiveness {
         // ファイル毎に一度だけ解析し、worker 内で集計する。参照全件の中間 Vec は作らない。
         let imports = scan_files
             .par_iter()
-            .fold(HashMap::new, |mut counts, path| {
-                collect_file_uses(root, path, &targets, prefilter.as_ref(), &mut counts);
-                counts
+            .fold(FileUses::default, |mut uses, path| {
+                collect_file_uses(root, path, &targets, prefilter.as_ref(), &mut uses);
+                uses
             })
-            .reduce(HashMap::new, |mut counts, other| {
-                for (file, (prod, tests)) in other {
-                    let entry = counts.entry(file).or_insert((0usize, 0usize));
+            .reduce(FileUses::default, |mut uses, other| {
+                for (file, (prod, tests)) in other.counts {
+                    let entry = uses.counts.entry(file).or_insert((0usize, 0usize));
                     entry.0 = entry.0.saturating_add(prod);
                     entry.1 = entry.1.saturating_add(tests);
                 }
-                counts
+                uses.unobserved.merge(other.unobserved);
+                uses
             });
         let mut counts = HashMap::new();
-        for (file, uses) in imports {
+        for (file, uses) in imports.counts {
             let mut names = HashMap::new();
             for name in &targets[&file] {
                 names.insert(name.clone(), uses);
             }
             counts.insert(file, names);
         }
-        Self { counts }
+        // 未観測の default export も「対象である」ことは表に残す (件数 0)。
+        for (file, names) in &targets {
+            let entry = counts.entry(file.clone()).or_default();
+            for name in names {
+                entry.entry(name.clone()).or_insert((0, 0));
+            }
+        }
+        let mut unobserved = imports.unobserved;
+        // rayon の集約順に依らず決定論的にする。
+        unobserved.prod.sort();
+        unobserved.test.sort();
+        Self { counts, unobserved }
     }
 
     pub(super) fn counts_for(&self, file: &str, name: &str) -> (usize, usize) {
@@ -89,6 +126,27 @@ impl DefaultExportLiveness {
             .and_then(|names| names.get(name))
             .copied()
             .unwrap_or_default()
+    }
+
+    /// `file` の `name` が default export の対象で、数えられなかったファイルからの
+    /// default import がありうるか。(production から, test から) の組で返す。
+    pub(super) fn may_have_unobserved_uses(&self, file: &str, name: &str) -> (bool, bool) {
+        let is_target = self
+            .counts
+            .get(file)
+            .is_some_and(|names| names.contains_key(name));
+        if !is_target {
+            return (false, false);
+        }
+        (
+            !self.unobserved.prod.is_empty(),
+            !self.unobserved.test.is_empty(),
+        )
+    }
+
+    /// 数えられなかった JS/TS のファイル (`dir` 相対、パス順)。
+    pub(super) fn unobserved_files(&self) -> &UnobservedFiles {
+        &self.unobserved
     }
 }
 
@@ -133,7 +191,7 @@ fn collect_file_uses(
     path: &Path,
     targets: &HashMap<String, Vec<String>>,
     prefilter: Option<&aho_corasick::AhoCorasick>,
-    counts: &mut HashMap<String, (usize, usize)>,
+    uses: &mut FileUses,
 ) {
     let Some(lang) = crate::engine::refs::detect_source_lang(path) else {
         return;
@@ -148,21 +206,40 @@ fn collect_file_uses(
         return;
     };
     let relative = normalize_workspace_separators(&relative.to_string_lossy());
+    // テストからの参照かは `dir` 相対で判定する (親ディレクトリ名に `test` があっても
+    // 全参照をテスト扱いにしない)。
+    let is_test = super::dead_code::is_test_path(Path::new(&relative));
+    // 読めない・解析できないファイルは黙って飛ばさず記録する (default import を数えられない)。
+    let mut unobserved = |cause: String| {
+        let bucket = if is_test {
+            &mut uses.unobserved.test
+        } else {
+            &mut uses.unobserved.prod
+        };
+        bucket.push((relative.clone(), cause));
+    };
     let Some(path_utf8) = camino::Utf8Path::from_path(&canonical) else {
+        unobserved("the path is not valid UTF-8".to_string());
         return;
     };
-    let Ok(source) = parser::read_file(path_utf8) else {
-        return;
+    let source = match parser::read_file(path_utf8) {
+        Ok(source) => source,
+        Err(_) => {
+            unobserved(crate::engine::refs::read_failure_cause(&canonical));
+            return;
+        }
     };
     if prefilter.is_some_and(|prefilter| !prefilter.is_match(&source[..])) {
         return;
     }
-    let Ok(tree) = parser::parse_source(&source, lang) else {
-        return;
+    let tree = match parser::parse_source(&source, lang) {
+        Ok(tree) => tree,
+        Err(_) => {
+            unobserved(crate::engine::refs::PARSE_FAILURE_CAUSE.to_string());
+            return;
+        }
     };
-    // テストからの参照かは `dir` 相対で判定する (親ディレクトリ名に `test` があっても
-    // 全参照をテスト扱いにしない)。
-    let is_test = super::dead_code::is_test_path(Path::new(&relative));
+    let counts = &mut uses.counts;
     let queries = [
         Some(DEFAULT_USE_QUERY),
         matches!(lang, LangId::Typescript | LangId::Tsx).then_some(TS_IMPORT_REQUIRE_QUERY),

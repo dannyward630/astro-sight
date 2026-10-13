@@ -232,7 +232,8 @@ fn count_non_definition_refs_split_without_extra_files_keeps_existing_api() {
         &[],
         |_| false,
     )
-    .unwrap();
+    .unwrap()
+    .counts;
 
     assert_eq!(counts.get("helper"), Some(&(1, 0)));
 }

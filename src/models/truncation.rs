@@ -53,6 +53,10 @@ pub enum TruncationReason {
     /// staged review で index tree のスナップショットが上限を超えたため作らず、
     /// 作業ツリーを読んだ (影響分析の変更ファイルだけは index の blob を読む)。
     StagedSnapshotUnavailable,
+    /// 対応言語のソースだが、読み込み (100MB の上限超過・権限など) や構文解析に失敗し、
+    /// 中の参照を数えられなかった。dead-code はそのファイルから参照されうる候補を
+    /// dead / test_only と断定しない (`dead-code` の出力では `unverified_symbols` に載せる)。
+    SourceAnalysisFailed,
 }
 
 impl TruncationInfo {
@@ -110,6 +114,16 @@ impl TruncationInfo {
                 "staged snapshot was not created: {files} files / {bytes} bytes exceed the limit \
                  ({file_limit} files / {byte_limit} bytes); {consequence}"
             ),
+        )
+    }
+
+    /// 参照を数えられなかったソースファイル (読み込み・構文解析の失敗)。
+    /// `message` は失敗の内容と、dead の断定をどこまで控えたかを含める。
+    pub fn source_analysis_failed(path: &str, message: String) -> Self {
+        Self::new(
+            Some(path.to_string()),
+            TruncationReason::SourceAnalysisFailed,
+            message,
         )
     }
 

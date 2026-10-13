@@ -149,7 +149,8 @@ if cfg.redact {
         &[],
         |_| false,
     )
-    .unwrap();
+    .unwrap()
+    .counts;
     let (prod, _test) = counts["redact"];
     assert_eq!(
         prod, 1,
@@ -195,7 +196,8 @@ Table { handler }
         &[],
         |_| false,
     )
-    .unwrap();
+    .unwrap()
+    .counts;
     let (prod, _test) = counts["handler"];
     assert!(
         prod >= 1,
@@ -230,7 +232,8 @@ if value {
         &[],
         |_| false,
     )
-    .unwrap();
+    .unwrap()
+    .counts;
     let (prod, _test) = counts["redact"];
     assert_eq!(
         prod, 1,
@@ -318,7 +321,8 @@ fn rust_shorthand_field_pattern_is_returned_by_refs_but_not_counted() {
         &[],
         |_| false,
     )
-    .unwrap();
+    .unwrap()
+    .counts;
     assert_eq!(counts["zeta"].0, 1, "`*zeta` の 1 件だけを数える");
 }
 
@@ -387,7 +391,8 @@ pub fn run(s: &Store) -> u32 {
         &[],
         |_| false,
     )
-    .unwrap();
+    .unwrap()
+    .counts;
     assert_eq!(
         counts["fetch"].0, 1,
         "turbofish 付き呼び出し 1 件だけを数える (フィールド宣言・`s.fetch` は数えない)"
@@ -1169,7 +1174,8 @@ pub trait Child: Parent {}
         &[],
         |_| false,
     )
-    .unwrap();
+    .unwrap()
+    .counts;
     let (prod, _test) = counts["Parent"];
     assert_eq!(prod, 1, "supertrait 位置が参照として数えられること");
 }

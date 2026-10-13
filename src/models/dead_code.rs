@@ -16,6 +16,11 @@ pub struct DeadCodeResult {
     pub dead_symbols: Vec<DeadSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub test_only_symbols: Vec<DeadSymbol>,
+    /// 参照の件数だけなら dead / test_only だが、参照を数えられなかったファイル
+    /// (`truncations` の `source_analysis_failed`) から参照されているかもしれないため、
+    /// 断定を保留した候補。`dead_symbols` の意味 (参照が無いと確かめた) は変えない。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unverified_symbols: Vec<DeadSymbol>,
     /// git 管理外 dir で `--git` が要求され diff を取得できず skip した場合の理由。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub skipped: Option<SkipInfo>,

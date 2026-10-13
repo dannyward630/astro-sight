@@ -326,6 +326,8 @@ astro-sight dead-code --dir . --git --staged
 - **Python フレームワーク登録デコレータ**: Typer / Click / FastAPI / Flask / Django / Celery / pytest などの登録デコレータが付いた関数・メソッド・クラス
 - **Python 動的プロトコルメソッド**: `urllib.request.BaseHandler` 系の `*_open` / `*_request` / `*_response` / `http_error_*` と、watchdog の `FileSystemEventHandler` 系 `on_*` callback。いずれも既知の基底クラスを直接継承するメソッドだけを除外する
 - **Angular**: `@Component` / `@Directive` 装飾クラスのライフサイクルフック（`ngOnInit` / `ngOnDestroy` / `ngOnChanges` / `ngDoCheck` / `ngAfterContentInit` / `ngAfterContentChecked` / `ngAfterViewInit` / `ngAfterViewChecked`）は Angular ランタイムが change detection サイクルで自動呼び出しするため除外。`@Pipe` 装飾クラスの `transform`（テンプレートの `| name` から呼ばれる）と、`@Injectable` / `@Pipe` 装飾クラスの `ngOnDestroy`（service / pipe の破棄時に呼ばれる）も除外する。service / pipe の他のフック（`ngOnInit` など）は Angular が呼ばないので除外しない
+- **PHP のアノテーションと属性**: docblock に大文字で始まるアノテーション（`@Route` / `@Entity` など）か PHPUnit の `@test` / `@dataProvider` などを書いたメソッド・クラスと、同じ名前の PHP 8 の属性（`#[Route]` / `#[Test]` など）を付けたもの
+- **構文から呼ばれるメソッド**: Kotlin の `operator fun` と Swift の `callAsFunction`。演算子や関数呼び出しの構文から呼ばれ、名前では参照されない。API 差分には残す
 - **プログラムのエントリポイント**: 次を除外する。API 差分には残す
   - C / C++: グローバルスコープの `main`
   - Kotlin: トップレベルの `fun main`、`object` / `companion object` 直下の `@JvmStatic fun main`
@@ -342,6 +344,16 @@ astro-sight dead-code --dir . --git --staged
 ```json
 { "...": "...", "generated_candidates_skipped": { "generated": 1, "paths": ["api/greeter_grpc.pb.go"] } }
 ```
+
+### 参照を数えられなかったファイル
+
+参照を数える対象のファイルを読めなかった場合（100MB の上限を超えた、権限が無いなど）や、構文解析に失敗した場合は、そのファイルに名前が現れる候補を dead と断定しない。該当する候補は `unverified_symbols` に出し、`dead_symbols` には参照が無いと確かめたものだけを残す。数えられなかったファイルは、`truncations` の `source_analysis_failed` で申告する（dead を保留したかどうかに関わらず出す）。
+
+```json
+{ "...": "...", "unverified_symbols": [{ "name": "load_fixture", "kind": "function", "file": "src/fixtures.rs", "line": 3 }], "truncations": [{ "path": "data/huge.rs", "reason": "source_analysis_failed", "message": "references in this file were not counted (the file exceeds the read limit (115343360 bytes > 104857600 bytes)); 1 candidate name(s) appear in it, so they are not reported as dead (1 candidate(s) in total were withheld from dead/test-only)" }] }
+```
+
+上限を超えたファイルは、構文木を作らずに中身を一定の大きさずつ読み、候補の名前が現れるかだけを調べる。開けないファイルや 1GiB を超えるファイルは、どの名前が現れるか分からないので、すべての候補を保留する。テストのファイルを数えられなかった場合は、`test_only_symbols` の判定は保留しない（本番のファイルからの参照が無いことは、テストのファイルを読めなくても変わらないため）。`review --hook` では `trunc` に出るだけで、これだけでは exit 1 にしない。
 
 ### フレームワーク自動検出
 

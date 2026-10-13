@@ -5,6 +5,7 @@ mod files;
 mod line_context;
 mod php;
 mod rust;
+mod uncounted;
 mod walker;
 
 use tree_sitter::Node;
