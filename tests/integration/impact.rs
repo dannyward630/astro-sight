@@ -6717,3 +6717,118 @@ fn impact_rust_alias_used_only_in_attribute_string_keeps_import_blocking() {
         }
     }
 }
+
+/// Rust の引数の束縛に付く `mut` (`mut self`・`mut x`・パターンの中の `mut`) だけの変更は、
+/// 関数の型にも呼び出し方にも影響しないので、impact と review の hook を止めない。
+/// 修正前は `mut self` とパターンの中の `mut` をシグネチャ変更とみなし、呼び出し元を
+/// 未解決の影響 (impact --hook) と api.mod (review --hook) として報告していた。1 行の関数
+/// (本体の変更と同時) でも同じ。
+/// 対照: 型の `mut` (`&self` → `&mut self`、`&T` → `&mut T`、`*const` → `*mut`) は契約の
+/// 変更なので、従来どおり両方の hook が止める。
+#[test]
+fn rust_binding_mut_only_change_does_not_block_hooks() {
+    let s = "pub struct S {\n    pub v: u32,\n}\n";
+    // (ラベル, 変更前, 変更後, b.rs の呼び出し, hook が止めるべきか)
+    let cases = [
+        (
+            "mut self",
+            "impl S {\n    pub fn take(self) -> u32 {\n        self.v\n    }\n}\n",
+            "impl S {\n    pub fn take(mut self) -> u32 {\n        self.v += 0;\n        self.v\n    }\n}\n",
+            "S { v: 1 }.take()",
+            false,
+        ),
+        (
+            "mut x",
+            "pub fn add(x: u32) -> u32 {\n    x\n}\n",
+            "pub fn add(mut x: u32) -> u32 {\n    x += 0;\n    x\n}\n",
+            "crate::a::add(1)",
+            false,
+        ),
+        (
+            "mut in pattern",
+            "pub fn sum((a, b): (u32, u32)) -> u32 {\n    a + b\n}\n",
+            "pub fn sum((mut a, b): (u32, u32)) -> u32 {\n    a += 0;\n    a + b\n}\n",
+            "crate::a::sum((1, 2))",
+            false,
+        ),
+        (
+            "one-line mut self",
+            "impl S {\n    pub fn take(self) -> u32 { self.v }\n}\n",
+            "impl S {\n    pub fn take(mut self) -> u32 { self.v += 0; self.v }\n}\n",
+            "S { v: 1 }.take()",
+            false,
+        ),
+        (
+            "&mut self",
+            "impl S {\n    pub fn peek(&self) -> u32 {\n        self.v\n    }\n}\n",
+            "impl S {\n    pub fn peek(&mut self) -> u32 {\n        self.v\n    }\n}\n",
+            "S { v: 1 }.peek()",
+            true,
+        ),
+        (
+            "&mut T",
+            "pub fn add(x: &u32) -> u32 {\n    *x\n}\n",
+            "pub fn add(x: &mut u32) -> u32 {\n    *x\n}\n",
+            "crate::a::add(&1)",
+            true,
+        ),
+        (
+            "*mut T",
+            "pub fn raw(p: *const u8) -> bool {\n    p.is_null()\n}\n",
+            "pub fn raw(p: *mut u8) -> bool {\n    p.is_null()\n}\n",
+            "crate::a::raw(std::ptr::null())",
+            true,
+        ),
+    ];
+    for (label, old, new, call, blocking) in cases {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write("src/lib.rs", "pub mod a;\npub mod b;\n");
+        repo.write("src/a.rs", format!("{s}{old}"));
+        repo.write(
+            "src/b.rs",
+            format!("use crate::a::S;\npub fn run() {{\n    let _ = {call};\n}}\n"),
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("src/a.rs", format!("{s}{new}"));
+
+        let dir = repo.root().to_str().unwrap();
+        let impact = cargo_bin()
+            .args(["impact", "--dir", dir, "--git", "--hook"])
+            .output()
+            .expect("failed to run astro-sight");
+        let impact_stderr = String::from_utf8_lossy(&impact.stderr);
+        let review = cargo_bin()
+            .args(["review", "--dir", dir, "--git", "--hook"])
+            .output()
+            .expect("failed to run astro-sight");
+        let review_stderr = String::from_utf8_lossy(&review.stderr);
+        if blocking {
+            assert_eq!(impact.status.code(), Some(1), "{label}: {impact_stderr}");
+            assert!(
+                impact_stderr.contains("→ src/b.rs:3"),
+                "{label}: {impact_stderr}"
+            );
+            assert_eq!(review.status.code(), Some(1), "{label}: {review_stderr}");
+            let json: serde_json::Value =
+                serde_json::from_str(review_stderr.trim()).expect("review hook json");
+            assert_eq!(
+                json["blocking_categories"],
+                serde_json::json!(["impacts", "api.mod"]),
+                "{label}: {review_stderr}"
+            );
+        } else {
+            assert_eq!(impact.status.code(), Some(0), "{label}: {impact_stderr}");
+            assert_eq!(review.status.code(), Some(0), "{label}: {review_stderr}");
+            assert!(
+                review_stderr.trim().is_empty(),
+                "{label}: 束縛の mut だけの変更は報告しない: {review_stderr}"
+            );
+        }
+    }
+}

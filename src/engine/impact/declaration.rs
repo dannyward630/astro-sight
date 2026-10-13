@@ -145,6 +145,9 @@ pub(super) struct DeclarationHeader {
     display: String,
     /// 本体の byte 範囲。Rust の行比較を取り消す際、ほかの変更が無い証拠に使う。
     body_bytes: Option<(usize, usize)>,
+    /// Rust の引数の束縛に付く `mut` の byte 範囲 (昇順)。本体だけの変更の証明で、
+    /// 本体の外のバイト列を比べるときに除く。
+    binding_mut_bytes: Vec<(usize, usize)>,
 }
 
 impl DeclarationHeader {
@@ -204,6 +207,7 @@ pub(super) fn declaration_header(
             tokens: vec![display.clone()],
             display,
             body_bytes,
+            binding_mut_bytes: Vec::new(),
         });
     }
 
@@ -212,13 +216,18 @@ pub(super) fn declaration_header(
     let mut leaves: Vec<Node<'_>> = Vec::new();
     // (開始, 終了) のうち表示・比較から外す範囲 (コメント、Rust の束縛側 `mut`)。
     let mut omitted: Vec<(usize, usize)> = Vec::new();
+    let mut binding_mut_bytes: Vec<(usize, usize)> = Vec::new();
     let mut cursor = decl.walk();
     let mut descend = true;
     loop {
         let node = cursor.node();
-        let skip_subtree = Some(node.id()) == body_id || is_omitted_token(node, lang_id);
-        if is_omitted_token(node, lang_id) {
+        let omitted_token = is_omitted_token(node, lang_id);
+        let skip_subtree = Some(node.id()) == body_id || omitted_token;
+        if omitted_token {
             omitted.push((node.start_byte(), node.end_byte()));
+            if !node.is_extra() {
+                binding_mut_bytes.push((node.start_byte(), node.end_byte()));
+            }
         }
         if !skip_subtree && node.child_count() == 0 {
             if name_node.is_none()
@@ -264,17 +273,36 @@ pub(super) fn declaration_header(
         tokens,
         display: header_display(source, line_start, header_end, &omitted),
         body_bytes,
+        binding_mut_bytes,
     })
 }
 
 /// 比較・表示から外すトークンか。コメント類 (`is_extra`) と、Rust の引数の束縛側 `mut`
-/// (`fn f(mut x: T)` の `mut` は本体側の束縛指定で呼び出し契約ではない。行ベースの
-/// 検出も `rust_signature::normalize_rust_signature_text` で同じものを除いている)。
+/// (`mut x: T`・`mut self`・`(mut a, b)` などの `mut` は本体側の束縛指定で呼び出し契約では
+/// ない。行ベースの検出と API 差分も `rust_signature::is_rust_binding_mut` で同じものを除く)。
 fn is_omitted_token(node: Node<'_>, lang_id: LangId) -> bool {
     node.is_extra()
-        || (lang_id == LangId::Rust
-            && node.kind() == "mutable_specifier"
-            && node.parent().is_some_and(|p| p.kind() == "parameter"))
+        || (lang_id == LangId::Rust && crate::engine::rust_signature::is_rust_binding_mut(node))
+}
+
+/// `bytes` (ファイル先頭からの範囲) から、引数の束縛に付く `mut` とその直後の空白を除く。
+/// `ranges` はファイル先頭からの byte 範囲で昇順。
+fn without_binding_muts(bytes: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut cursor = 0;
+    for &(start, end) in ranges {
+        if start < cursor || end > bytes.len() {
+            continue;
+        }
+        out.extend_from_slice(&bytes[cursor..start]);
+        let mut next = end;
+        while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+            next += 1;
+        }
+        cursor = next;
+    }
+    out.extend_from_slice(&bytes[cursor..]);
+    out
 }
 
 /// 閉じ括弧の直前にある末尾カンマを落とす (`(a, b,)` と `(a, b)` を同じ契約として扱う)。
@@ -978,7 +1006,8 @@ pub(super) fn reconcile_declaration_changes(
     proof
 }
 
-/// 旧新ソースから対象の本体だけを抜いた残りが完全一致するときに限る。
+/// 旧新ソースから対象の本体だけを抜いた残りが完全一致するときに限る。対象の宣言の
+/// 引数の束縛に付く `mut` だけは除いて比べる (呼び出し契約ではないため)。
 /// 同じファイルの別の変更も保守側に残す。
 fn rust_only_body_changed(
     input: &DeclarationChangeInput<'_>,
@@ -1002,7 +1031,9 @@ fn rust_only_body_changed(
     ) else {
         return false;
     };
-    old_prefix == new_prefix && old_suffix == new_suffix
+    old_suffix == new_suffix
+        && without_binding_muts(old_prefix, &old_header.binding_mut_bytes)
+            == without_binding_muts(new_prefix, &new_header.binding_mut_bytes)
 }
 
 /// 同名宣言が新旧とも一意で、両側を解析できるときだけヘッダを対応付ける。
@@ -1799,6 +1830,63 @@ mod tests {
         let (_, signatures) = run_pass1(LangId::Rust, "src/lib.rs", old, malformed, true);
         assert!(
             signatures.iter().any(|change| change.name == "helper"),
+            "{signatures:?}"
+        );
+    }
+
+    /// 引数の束縛に付く `mut` だけの差は宣言ヘッダの契約を変えない (`mut self`、パターンの
+    /// 中、本体の無い宣言)。1 行の関数で本体と同時に変えても、本体だけの変更として取り消す。
+    /// 対照: 型の `mut` (`&mut self`・`&mut T`) は契約の変更として残す。
+    #[test]
+    fn rust_binding_mut_is_not_a_header_change() {
+        let same = |old: &str, new: &str, name: &str| {
+            header_of(LangId::Rust, old, name).same_contract(&header_of(LangId::Rust, new, name))
+        };
+        for (old, new, name) in [
+            (
+                "impl S {\n    pub fn take(\n        self,\n    ) -> u32 {\n        1\n    }\n}\n",
+                "impl S {\n    pub fn take(\n        mut self,\n    ) -> u32 {\n        1\n    }\n}\n",
+                "take",
+            ),
+            (
+                "pub fn sum((a, b): (u32, u32), S { v, ref z }: S) -> u32 { 0 }\n",
+                "pub fn sum((mut a, b): (u32, u32), S { mut v, ref mut z }: S) -> u32 { 0 }\n",
+                "sum",
+            ),
+            (
+                "pub trait T {\n    fn g(self) -> u32;\n}\n",
+                "pub trait T {\n    fn g(mut self) -> u32;\n}\n",
+                "g",
+            ),
+        ] {
+            assert!(same(old, new, name), "{new}");
+        }
+        for (old, new, name) in [
+            (
+                "impl S {\n    pub fn take(&self) -> u32 { 1 }\n}\n",
+                "impl S {\n    pub fn take(&mut self) -> u32 { 1 }\n}\n",
+                "take",
+            ),
+            (
+                "pub fn add(x: &u32) -> u32 { 0 }\n",
+                "pub fn add(x: &mut u32) -> u32 { 0 }\n",
+                "add",
+            ),
+        ] {
+            assert!(!same(old, new, name), "{new}");
+        }
+
+        let old = "pub struct S;\nimpl S {\n    pub fn take(self) -> u8 { 1 }\n}\n";
+        let new = "pub struct S;\nimpl S {\n    pub fn take(mut self) -> u8 { 2 }\n}\n";
+        let (_, raw) = run_pass1(LangId::Rust, "src/lib.rs", old, new, false);
+        assert!(raw.iter().any(|change| change.name == "take"), "{raw:?}");
+        let (_, reconciled) = run_pass1(LangId::Rust, "src/lib.rs", old, new, true);
+        assert!(reconciled.is_empty(), "{reconciled:?}");
+        let type_mut = "pub struct S;\nimpl S {\n    pub fn take(&mut self) -> u8 { 2 }\n}\n";
+        let old_ref = "pub struct S;\nimpl S {\n    pub fn take(&self) -> u8 { 1 }\n}\n";
+        let (_, signatures) = run_pass1(LangId::Rust, "src/lib.rs", old_ref, type_mut, true);
+        assert!(
+            signatures.iter().any(|change| change.name == "take"),
             "{signatures:?}"
         );
     }

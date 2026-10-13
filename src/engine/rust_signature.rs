@@ -412,6 +412,10 @@ fn canonicalize_visit(
     stack: &mut Vec<String>,
     canonical: &mut CanonicalSignature,
 ) -> Option<Walk> {
+    // 引数の束縛に付く `mut` は呼び出し契約ではないので比べない (`is_rust_binding_mut`)。
+    if node.kind() == "mutable_specifier" && parent.is_some_and(is_binding_mut_parent) {
+        return Some(Walk::Skip);
+    }
     // 配列長と const generic 引数は値の評価が要る。関数・関連定数・式が
     // 同じ字面でも別の値になり得るため、リテラル以外を同値の証拠にしない。
     if node.kind() == "array_type"
@@ -565,12 +569,36 @@ fn parseable_signature_source(signature: &str) -> (Vec<u8>, usize) {
     (parseable, original_len)
 }
 
-/// Rust の通常引数に付く binding-side の `mut` を除いたシグネチャを返す。
+/// Rust の引数の束縛に付く `mut` か。
+///
+/// `mut x: T`・`mut self`・パターンの中の `(mut a, b)`・`S { mut v }`・`ref mut z` の `mut` は
+/// 本体側の束縛の指定で、関数の型にも呼び出し方にも影響しない。`&mut self`・`&mut T`・
+/// `*mut T`・参照パターン `&mut x` の `mut` は型の側なので含めない。
+pub(crate) fn is_rust_binding_mut(node: Node<'_>) -> bool {
+    node.kind() == "mutable_specifier" && node.parent().is_some_and(is_binding_mut_parent)
+}
+
+/// `mutable_specifier` の親から、その `mut` が束縛の指定かを決める。
+fn is_binding_mut_parent(parent: Node<'_>) -> bool {
+    match parent.kind() {
+        "parameter" | "mut_pattern" | "field_pattern" => true,
+        // `&mut self` / `&'a mut self` は `&` の後ろの `mut` で、参照の型の一部。
+        "self_parameter" => {
+            let mut cursor = parent.walk();
+            !parent
+                .children(&mut cursor)
+                .any(|child| child.kind() == "&")
+        }
+        _ => false,
+    }
+}
+
+/// Rust の引数の束縛に付く `mut` (`is_rust_binding_mut`) を除いたシグネチャを返す。
 ///
 /// `fn run(mut callback: F)` の `mut` は関数本体で callback 変数を再束縛・可変借用するための
 /// 指定で、呼び出し側の型契約ではない。一方、`callback: &mut F` の `mut` は型の一部なので
-/// 除外しない。文字列置換では両者を区別できないため、`parameter` の直接子にある
-/// `mutable_specifier` だけを AST 位置で除く。
+/// 除外しない。文字列置換では両者を区別できないため、AST 上の位置で束縛側の `mut` だけを除く。
+/// 本体の無い宣言 (トレイトの必須メソッド、extern の関数) も同じ規則で扱う。
 pub(crate) fn normalize_rust_parameter_binding_signature(
     function: Node<'_>,
     source: &[u8],
@@ -581,25 +609,12 @@ pub(crate) fn normalize_rust_parameter_binding_signature(
         .child_by_field_name("parameters")
         .or_else(|| direct_named_child(function, "parameters"))?;
     let mut omitted = Vec::new();
-
-    for index in 0..parameters.child_count() {
-        let Some(parameter) = parameters.child(index) else {
-            continue;
-        };
-        // `self_parameter` は `mut self` と `&mut self` の grammar shape が異なる版もある。
-        // 今回は通常引数の、構造的に型側と区別できる位置だけを扱う。
-        if parameter.kind() != "parameter" {
-            continue;
+    let _: ControlFlow<()> = walk_preorder(parameters, Children::Named, |node, _| {
+        if is_rust_binding_mut(node) {
+            omitted.push((node.start_byte(), node.end_byte()));
         }
-        for child_index in 0..parameter.child_count() {
-            let Some(child) = parameter.child(child_index) else {
-                continue;
-            };
-            if child.kind() == "mutable_specifier" {
-                omitted.push((child.start_byte(), child.end_byte()));
-            }
-        }
-    }
+        ControlFlow::Continue(Walk::Descend)
+    });
 
     rebuild_without_ranges(source, start, end, &omitted)
 }
@@ -704,6 +719,79 @@ mod tests {
             normalize_rust_signature_text("pub fn run<F>(callback: F, value: &u32) {")
                 .expect("Rust signature should parse");
         assert_ne!(without_binding_mut, immutable_type);
+    }
+
+    /// 束縛の `mut` は位置を問わず除く (`mut self`、パターンの中、本体の無い宣言)。
+    /// 型の `mut` (`&mut self`・`&mut T`・`*mut T`・参照パターン `&mut x`) は残す。
+    #[test]
+    fn binding_mut_is_removed_everywhere_but_type_mut_is_kept() {
+        let normalize = |signature: &str| {
+            normalize_rust_signature_text(signature)
+                .unwrap_or_else(|| panic!("Rust signature should parse: {signature}"))
+        };
+        for (with_mut, without_mut) in [
+            (
+                "pub fn take(mut self) -> u32 {",
+                "pub fn take(self) -> u32 {",
+            ),
+            (
+                "pub fn take(mut self: Box<Self>) -> u32 {",
+                "pub fn take(self: Box<Self>) -> u32 {",
+            ),
+            (
+                "pub fn f((mut a, b): (u32, u32), S { mut v, ref mut z, .. }: S, ref mut q: u32) {",
+                "pub fn f((a, b): (u32, u32), S { v, ref z, .. }: S, ref q: u32) {",
+            ),
+            ("fn g(mut self) -> u32;", "fn g(self) -> u32;"),
+            (
+                "pub fn ext(mut x: u32) -> u32;",
+                "pub fn ext(x: u32) -> u32;",
+            ),
+        ] {
+            assert_eq!(normalize(with_mut), normalize(without_mut), "{with_mut}");
+        }
+        for (shared, mutable) in [
+            (
+                "pub fn peek(&self) -> u32 {",
+                "pub fn peek(&mut self) -> u32 {",
+            ),
+            (
+                "pub fn peek<'a>(&'a self) -> u32 {",
+                "pub fn peek<'a>(&'a mut self) -> u32 {",
+            ),
+            (
+                "pub fn peek(self: &Self) -> u32 {",
+                "pub fn peek(self: &mut Self) -> u32 {",
+            ),
+            (
+                "pub fn add(x: &u32) -> u32 {",
+                "pub fn add(x: &mut u32) -> u32 {",
+            ),
+            (
+                "pub fn raw(p: *const u8) -> bool {",
+                "pub fn raw(p: *mut u8) -> bool {",
+            ),
+            (
+                "pub fn get(&t: &u32) -> u32 {",
+                "pub fn get(&mut t: &mut u32) -> u32 {",
+            ),
+            ("fn h(&self);", "fn h(&mut self);"),
+        ] {
+            assert_ne!(normalize(shared), normalize(mutable), "{mutable}");
+        }
+    }
+
+    /// 型別名の同値証明も、束縛の `mut` だけの差を同じ型とみなす。型の `mut` は違う型。
+    #[test]
+    fn alias_proof_ignores_binding_mut_but_not_type_mut() {
+        let old = b"pub fn run(x: u64, y: &u64) -> u64 { x + *y }";
+        let new = b"pub type N = u64;\npub fn run(mut x: N, y: &N) -> N { x += 0; x + *y }";
+        let context = RustTypeAliasEquivalence::new(old, new).expect("valid syntax trees");
+        assert!(context.prove_function("run"));
+
+        let new = b"pub type N = u64;\npub fn run(x: N, y: &mut N) -> N { x + *y }";
+        let context = RustTypeAliasEquivalence::new(old, new).expect("valid syntax trees");
+        assert!(!context.prove_function("run"));
     }
 
     #[test]
