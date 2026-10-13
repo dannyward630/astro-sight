@@ -6068,3 +6068,498 @@ fn impact_rust_new_marker_impl_keeps_its_owner() {
         "{context}"
     );
 }
+
+/// `impact --git` を実行し、(exit code, stderr) を返す。
+fn run_impact_git(repo: &TestRepo) -> (Option<i32>, String) {
+    let output = cargo_bin()
+        .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run astro-sight");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// 言語ごとに、変更する公開関数を呼ぶファイルを置く。
+/// 戻り値は (変更するファイル, 報告されるべき呼び出し元 `path:line`)。
+fn write_public_function_caller(repo: &TestRepo, lang: &str) -> (&'static str, &'static str) {
+    match lang {
+        "ts" => {
+            repo.create_dir_all("src");
+            repo.write(
+                "src/use.ts",
+                "import { format } from './a';\n\nexport function caller(): string {\n  return format(1);\n}\n",
+            );
+            ("src/a.ts", "src/use.ts:4")
+        }
+        "py" => {
+            repo.create_dir_all("pkg");
+            repo.write("pkg/__init__.py", "");
+            repo.write(
+                "pkg/use.py",
+                "from pkg.a import render\n\n\ndef caller():\n    return render(1)\n",
+            );
+            ("pkg/a.py", "pkg/use.py:5")
+        }
+        "rs" => {
+            repo.create_dir_all("src");
+            repo.write(
+                "Cargo.toml",
+                "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            );
+            repo.write("src/lib.rs", "pub mod a;\npub mod user;\n");
+            repo.write(
+                "src/user.rs",
+                "use crate::a::helper;\n\npub fn caller() -> u32 {\n    helper(1)\n}\n",
+            );
+            ("src/a.rs", "src/user.rs:4")
+        }
+        other => unreachable!("unknown fixture language: {other}"),
+    }
+}
+
+/// 変更した公開関数の直前に同名のローカル const・入れ子の関数・非公開メソッドがあっても、
+/// affected を作った元のシンボル自身でテスト / ローカル / 公開を判定する。
+/// 旧実装は「hunk (context 行を含む) に重なる最初の同名シンボル」を名前で引き直して判定し、
+/// 手前の同名シンボルをローカル・非公開と見て公開関数の呼び出し元を落としていた (exit 0)。
+#[test]
+fn impact_judges_each_affected_symbol_by_its_own_declaration() {
+    // 言語ごとの公開関数 (変更前, 変更後)。変更は必須引数の追加 (呼び出し側が壊れる)。
+    let public_function = |lang: &str| match lang {
+        "ts" => (
+            "export function format(value: number): string {\n  return String(value);\n}\n",
+            "export function format(value: number, digits: number): string {\n  return value.toFixed(digits);\n}\n",
+        ),
+        "py" => (
+            "def render(value):\n    return str(value)\n",
+            "def render(value, digits):\n    return f\"{value:.{digits}f}\"\n",
+        ),
+        _ => (
+            "pub fn helper(value: u32) -> u32 {\n    value\n}\n",
+            "pub fn helper(value: u32, extra: u32) -> u32 {\n    value + extra\n}\n",
+        ),
+    };
+    // (ラベル, 言語, 公開関数の手前に置く同名の宣言, 対照として名前だけ変えた宣言)
+    let cases = [
+        (
+            "TS local const",
+            "ts",
+            "export function App() {\n  const format = (v: number) => v.toFixed(2);\n  return format(1);\n}\n",
+            "export function App() {\n  const fmt = (v: number) => v.toFixed(2);\n  return fmt(1);\n}\n",
+        ),
+        (
+            "TS private class method",
+            "ts",
+            "class Formatter {\n  format(v: number): string { return String(v); }\n}\n",
+            "class Formatter {\n  render(v: number): string { return String(v); }\n}\n",
+        ),
+        (
+            "Python nested def",
+            "py",
+            "def app():\n    def render(v):\n        return v\n    return render(1)\n",
+            "def app():\n    def helper(v):\n        return v\n    return helper(1)\n",
+        ),
+        (
+            "Rust nested fn",
+            "rs",
+            "pub fn app() -> u32 {\n    fn helper(v: u32) -> u32 { v }\n    helper(1)\n}\n",
+            "pub fn app() -> u32 {\n    fn local_helper(v: u32) -> u32 { v }\n    local_helper(1)\n}\n",
+        ),
+    ];
+    for (label, lang, same_name, other_name) in cases {
+        let (before, after) = public_function(lang);
+        for (variant, head) in [("同名", same_name), ("別名 (対照)", other_name)] {
+            let repo = TestRepo::new();
+            let (changed_path, caller) = write_public_function_caller(&repo, lang);
+            repo.write(changed_path, format!("{head}{before}"));
+            repo.init_git();
+            repo.commit_all("initial");
+            repo.write(changed_path, format!("{head}{after}"));
+            let (code, stderr) = run_impact_git(&repo);
+            assert_eq!(
+                code,
+                Some(1),
+                "{label} / {variant}: 公開関数の必須引数追加は blocking にすべき: {stderr}"
+            );
+            assert!(
+                stderr.contains(&format!("→ {caller}")),
+                "{label} / {variant}: 呼び出し元 {caller} を報告すべき: {stderr}"
+            );
+        }
+    }
+}
+
+/// 親型の解決と公開判定も、変更した宣言自身で行う。
+/// - 公開クラスの同名メソッドと公開関数を両方変えた: 関数の呼び出し元を、メソッドの親型
+///   (`Formatter`) が出てくるファイルに絞らない (旧実装は手前のメソッドの親型を名前に紐づけ、
+///   `Formatter` を書いていない呼び出し元を落としていた)。
+/// - 非公開クラスのメソッドだけを変えた: 手前にある未変更の公開関数で公開判定しない
+///   (旧実装は同名の公開関数の呼び出し元を blocking にしていた。取り違えの逆方向)。
+/// - 対照: 公開関数だけを変えれば、従来どおり呼び出し元を報告する。
+#[test]
+fn impact_parent_type_and_export_check_follow_the_changed_declaration() {
+    let function = |params: &str| {
+        format!("export function format({params}): string {{\n  return String(value);\n}}\n")
+    };
+    let method = |params: &str| {
+        format!("class Formatter {{\n  format({params}): string {{ return String(v); }}\n}}\n")
+    };
+    let exported_method = |params: &str| format!("export {}", method(params));
+    // (ラベル, 変更前, 変更後, 呼び出し元を報告すべきか)
+    let cases = [
+        (
+            "公開クラスの同名メソッドと公開関数を両方変更",
+            format!(
+                "{}{}",
+                exported_method("v: number"),
+                function("value: number")
+            ),
+            format!(
+                "{}{}",
+                exported_method("v: number, d: number"),
+                function("value: number, digits: number")
+            ),
+            true,
+        ),
+        (
+            "非公開クラスのメソッドだけを変更",
+            format!("{}{}", function("value: number"), method("v: number")),
+            format!(
+                "{}{}",
+                function("value: number"),
+                method("v: number, d: number")
+            ),
+            false,
+        ),
+        (
+            "対照: 公開関数だけを変更",
+            format!("{}{}", function("value: number"), method("v: number")),
+            format!(
+                "{}{}",
+                function("value: number, digits: number"),
+                method("v: number")
+            ),
+            true,
+        ),
+    ];
+    for (label, before, after, expect_caller) in cases {
+        let repo = TestRepo::new();
+        let (changed_path, caller) = write_public_function_caller(&repo, "ts");
+        repo.write(changed_path, &before);
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(changed_path, &after);
+        let (code, stderr) = run_impact_git(&repo);
+        if expect_caller {
+            assert_eq!(code, Some(1), "{label}: {stderr}");
+            assert!(
+                stderr.contains(&format!("→ {caller}")),
+                "{label}: 呼び出し元 {caller} を報告すべき: {stderr}"
+            );
+        } else {
+            assert_eq!(code, Some(0), "{label}: 呼び出し元は無いはず: {stderr}");
+            assert!(!stderr.contains(caller), "{label}: {stderr}");
+        }
+    }
+}
+
+/// 移動しただけの 1 行 (`export const run = async () => foo(1);`) が、同じ diff の
+/// `foo` のシグネチャ変更を隠さない。行ベースの検出は名前を含むシグネチャらしい最初の
+/// `-` 行と `+` 行を比べるので、両側で先に見つかる囮行同士が一致して「変更なし」になり、
+/// 旧実装はその結論を AST の比較より優先していた (exit 0、実際は TS2322 / TS2554)。
+#[test]
+fn impact_moved_decoy_line_does_not_hide_signature_change() {
+    let decoy = "export const run = async () => foo(1);\n";
+    let bar = "export function bar(): number {\n  return 2;\n}\n";
+    let old_foo = "export function foo(x: number): number {\n  return x;\n}\n";
+    for (label, new_foo) in [
+        (
+            "戻り値型の変更",
+            "export function foo(x: number): string {\n  return String(x);\n}\n",
+        ),
+        (
+            "必須引数の追加",
+            "export function foo(x: number, y: number): number {\n  return x + y;\n}\n",
+        ),
+    ] {
+        // 囮行を foo の直前へ動かす (修正前に見逃した形) / 動かさない (対照)。
+        for (variant, after) in [
+            ("囮行を移動", format!("{bar}{decoy}{new_foo}")),
+            ("囮行はそのまま", format!("{decoy}{bar}{new_foo}")),
+        ] {
+            let repo = TestRepo::new();
+            repo.create_dir_all("src");
+            repo.write("src/a.ts", format!("{decoy}{bar}{old_foo}"));
+            repo.write(
+                "src/use.ts",
+                "import { foo } from './a';\n\nexport function caller(): number {\n  const n: number = foo(1);\n  return n;\n}\n",
+            );
+            repo.init_git();
+            repo.commit_all("initial");
+            repo.write("src/a.ts", &after);
+            let (code, stderr) = run_impact_git(&repo);
+            assert_eq!(code, Some(1), "{label} / {variant}: {stderr}");
+            assert!(
+                stderr.contains("→ src/use.ts:4"),
+                "{label} / {variant}: {stderr}"
+            );
+        }
+    }
+}
+
+/// `= require(` を含む文を丸ごと import とみなさない。同じ文の実際の呼び出し
+/// (`require('./a').foo(1)`) を import 行 (情報提供) として扱い、旧実装は exit 0 にしていた。
+/// 対照: CommonJS の束縛 (`const foo = require('./a').foo`) の行は従来どおり情報提供で、
+/// その束縛を呼ぶ行が blocking になる。
+#[test]
+fn impact_require_call_on_import_line_is_a_blocking_caller() {
+    // (呼び出し側, blocking な行 (0 始まり), 情報提供の行)
+    let cases: [(&str, &[u64], &[u64]); 5] = [
+        (
+            "const value = require('./a').foo(1);\nmodule.exports = { value };\n",
+            &[0],
+            &[],
+        ),
+        (
+            "const { foo } = require('./a'), value = foo(1);\nmodule.exports = { value };\n",
+            &[0],
+            &[],
+        ),
+        ("require('./a').foo(1);\n", &[0], &[]),
+        (
+            "const foo = require('./a').foo;\nconst value = foo(1);\nmodule.exports = { value };\n",
+            &[1],
+            &[0],
+        ),
+        (
+            "const { foo } = require('./a');\nconst value = foo(1);\nmodule.exports = { value };\n",
+            &[1],
+            &[],
+        ),
+    ];
+    for (consumer, blocking, informational) in cases {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write("src/a.js", "export function foo(x) {\n  return x;\n}\n");
+        repo.write("src/use.js", consumer);
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/a.js",
+            "export function foo(x, y) {\n  if (y === undefined) throw new Error(\"y required\");\n  return x + y;\n}\n",
+        );
+        let (code, stderr) = run_impact_git(&repo);
+        assert_eq!(code, Some(1), "{consumer}: {stderr}");
+        let context = repo.run_json("context", &["--git"]);
+        let lines = |key: &str| -> Vec<u64> {
+            context["changes"][0][key]
+                .as_array()
+                .map(|callers| {
+                    callers
+                        .iter()
+                        .filter(|caller| caller["path"] == "src/use.js")
+                        .filter_map(|caller| caller["line"].as_u64())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(lines("impacted_callers"), blocking, "{consumer}: {context}");
+        assert_eq!(
+            lines("informational_callers"),
+            informational,
+            "{consumer}: {context}"
+        );
+    }
+}
+
+/// 参照走査の準備 (対象ファイルの列挙) に失敗したら、空の結果ではなくエラー (exit 1) にする。
+/// 旧実装は失敗を握りつぶして cross-file の呼び出し元を 0 件にしていたため、読めない
+/// ディレクトリが 1 つあるだけで `impact --hook` が exit 0 で未解決の呼び出し元を通していた
+/// (同じ状態で `refs` / `dead-code` は IO_ERROR)。`context` は書きかけの JSON の後ろに
+/// エラーを付けず、エラーの JSON だけを返す。
+/// 対照: 同じリポジトリでディレクトリを読めるように戻せば、従来どおり呼び出し元を報告する。
+#[cfg(unix)]
+#[test]
+fn impact_scan_failure_is_an_error_not_an_empty_result() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "src/a.ts",
+        "export function foo(x: number): number {\n  return x;\n}\n",
+    );
+    repo.write(
+        "src/use.ts",
+        "import { foo } from './a';\nexport const v = foo(1);\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/a.ts",
+        "export function foo(x: number, y: number): number {\n  return x + y;\n}\n",
+    );
+    repo.create_dir_all("locked");
+    let set_mode = |mode: u32| {
+        std::fs::set_permissions(repo.path("locked"), std::fs::Permissions::from_mode(mode))
+            .expect("chmod");
+    };
+    set_mode(0o000);
+    // 特権で実行すると権限を外しても読めてしまい、失敗を再現できない。
+    if std::fs::read_dir(repo.path("locked")).is_ok() {
+        set_mode(0o755);
+        eprintln!("skip: 読めないディレクトリを作れない (特権で実行している)");
+        return;
+    }
+
+    let run = |args: &[&str]| {
+        let output = cargo_bin()
+            .args(args)
+            .arg("--dir")
+            .arg(repo.root())
+            .output()
+            .expect("failed to run astro-sight");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    };
+    for args in [
+        &["impact", "--git", "--hook"][..],
+        &["impact", "--git"][..],
+        &["context", "--git"][..],
+        &["review", "--git", "--hook"][..],
+    ] {
+        let (code, stdout) = run(args);
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(stdout.trim());
+        set_mode(0o755);
+        assert_eq!(code, Some(1), "{args:?}: {stdout}");
+        let json =
+            parsed.unwrap_or_else(|e| panic!("{args:?}: 出力が JSON でない ({e}): {stdout}"));
+        assert_eq!(json["error"]["code"], "IO_ERROR", "{args:?}: {json}");
+        assert!(
+            json.get("changes").is_none(),
+            "{args:?}: 書きかけの結果を出さない: {json}"
+        );
+        set_mode(0o000);
+    }
+    set_mode(0o755);
+
+    // 対照: 読めるディレクトリなら従来どおり呼び出し元を報告する。
+    let (code, stderr) = run_impact_git(&repo);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("→ src/use.ts:2"), "{stderr}");
+}
+
+/// 波括弧の struct を別モジュールへ移して旧パスを `pub use` で再公開するとき、移動先で
+/// フィールドを足した変更は「純粋な移動」ではない (`Shape { w: 1.0 }` が E0063 で壊れる)。
+/// 旧実装は宣言の 1 行目 (`pub struct Shape {`) だけを比べて informational に降格し、
+/// `impact --hook` / `review --hook` がどちらも exit 0 だった。
+/// 対照: 同じ struct をそのまま移した場合は従来どおり informational (exit 0)。
+/// `--staged` では移動元・移動先の両方を index から読んで照合する (作業ツリーに逆の内容を
+/// 置いても index の内容で判定する)。
+#[test]
+fn reexport_move_of_brace_struct_compares_fields() {
+    let shape = "pub struct Shape {\n    pub w: f32,\n}\n";
+    let widened = "pub struct Shape {\n    pub w: f32,\n    pub h: f32,\n}\n";
+    for (label, moved_shape, unstaged_shape, blocking) in [
+        ("フィールドを追加して移動", widened, shape, true),
+        ("そのまま移動 (対照)", shape, widened, false),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src/game");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write("src/lib.rs", "pub mod game;\n");
+        repo.write(
+            "src/game/mod.rs",
+            "pub mod background;\npub mod consumer;\n",
+        );
+        let background = "pub const BASE_Y: f32 = -70.0;\npub const BAND_H: f32 = 30.0;\n\npub fn draw() -> f32 {\n    BASE_Y + BAND_H\n}\n";
+        repo.write("src/game/background.rs", background);
+        let make = "\npub fn make() -> Shape {\n    Shape { w: 1.0 }\n}\n";
+        repo.write("src/game/consumer.rs", format!("{shape}{make}"));
+        repo.init_git();
+        repo.commit_all("initial");
+        // 移動先: BAND_H の値変更と同じ hunk に Shape を足す。移動元: 定義を再輸出に置き換える。
+        repo.write(
+            "src/game/background.rs",
+            background.replace(
+                "pub const BAND_H: f32 = 30.0;\n",
+                &format!("pub const BAND_H: f32 = 40.0;\n{moved_shape}"),
+            ),
+        );
+        repo.write(
+            "src/game/consumer.rs",
+            format!("pub use super::background::Shape;\n{make}"),
+        );
+
+        for subcommand in ["impact", "review"] {
+            let output = cargo_bin()
+                .args([
+                    subcommand,
+                    "--dir",
+                    repo.root().to_str().unwrap(),
+                    "--git",
+                    "--hook",
+                ])
+                .output()
+                .expect("failed to run astro-sight");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                !output.status.success(),
+                blocking,
+                "{label} / {subcommand}: {stderr}"
+            );
+        }
+        let context = repo.run_json("context", &["--git"]);
+        let change = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == "src/game/background.rs")
+            .unwrap_or_else(|| panic!("{label}: {context}"));
+        let key = if blocking {
+            "impacted_callers"
+        } else {
+            "informational_callers"
+        };
+        assert!(
+            change[key].as_array().is_some_and(|callers| callers
+                .iter()
+                .any(|caller| caller["path"] == "src/game/consumer.rs")),
+            "{label}: consumer.rs の参照は {key} に出るべき: {context}"
+        );
+
+        repo.stage_all();
+        repo.write(
+            "src/game/background.rs",
+            background.replace(
+                "pub const BAND_H: f32 = 30.0;\n",
+                &format!("pub const BAND_H: f32 = 40.0;\n{unstaged_shape}"),
+            ),
+        );
+        for subcommand in ["impact", "review"] {
+            let output = cargo_bin()
+                .args([
+                    subcommand,
+                    "--dir",
+                    repo.root().to_str().unwrap(),
+                    "--git",
+                    "--staged",
+                    "--hook",
+                ])
+                .output()
+                .expect("failed to run astro-sight");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                !output.status.success(),
+                blocking,
+                "{label} / {subcommand} --staged: {stderr}"
+            );
+        }
+    }
+}

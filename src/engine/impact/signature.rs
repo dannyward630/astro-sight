@@ -146,7 +146,7 @@ pub(crate) fn find_signature_in_lines(
     func_name: &str,
     lang_id: LangId,
 ) -> Option<String> {
-    let func_name = bare_symbol_name(func_name);
+    let func_name = bare_symbol_name(func_name, lang_id);
     for line in lines {
         let trimmed = line.trim();
         if line_has_identifier(trimmed, func_name, lang_id) && is_signature_line(trimmed) {
@@ -157,11 +157,19 @@ pub(crate) fn find_signature_in_lines(
 }
 
 /// `Type::method` 形式の名前でも、シグネチャ行では末尾の識別子だけを照合する。
-fn bare_symbol_name(symbol_name: &str) -> &str {
+fn bare_symbol_name(symbol_name: &str, lang: LangId) -> &str {
     symbol_name
-        .rsplit(|c: char| !(c == '_' || c.is_alphanumeric()))
+        .rsplit(|c: char| !is_identifier_char(c, lang))
         .find(|part| !part.is_empty())
         .unwrap_or(symbol_name)
+}
+
+/// 識別子を構成する文字か。JS/TS/TSX は `$` も識別子の文字 (`$config` / `config$`) なので、
+/// 区切りとして扱うと `$config` が `config` に化けて一致しなくなる。
+fn is_identifier_char(c: char, lang: LangId) -> bool {
+    c == '_'
+        || c.is_alphanumeric()
+        || (c == '$' && matches!(lang, LangId::Javascript | LangId::Typescript | LangId::Tsx))
 }
 
 /// ヒューリスティック: 関数定義キーワードを含む行をシグネチャと判定する。
@@ -270,7 +278,7 @@ pub(crate) fn is_symbol_in_changed_lines(
 /// 識別子境界で分割してから比較することで false-positive を排除する。
 fn line_has_identifier(line: &str, symbol: &str, lang: LangId) -> bool {
     let target = normalize_identifier(lang, symbol);
-    line.split(|c: char| !(c == '_' || c.is_alphanumeric()))
+    line.split(|c: char| !is_identifier_char(c, lang))
         .filter(|s| !s.is_empty())
         .any(|tok| normalize_identifier(lang, tok).as_ref() == target.as_ref())
 }
@@ -466,6 +474,61 @@ mod tests {
             "src/lib.rs",
             "new_func",
             LangId::Rust
+        ));
+    }
+
+    /// JS/TS/TSX では `$` も識別子の文字。行を英数字と `_` 以外で分けると `$config` が
+    /// `config` という語になり、`$config` の変更行に名前が無いと判定していた。
+    #[test]
+    fn js_ts_dollar_is_part_of_identifier() {
+        let diff = "--- a/src/config.ts\n+++ b/src/config.ts\n@@ -1 +1 @@\n-export const $config = { a: 1, b: 2 };\n+export const $config = { a: 1 };\n";
+        let trailing = "--- a/src/config.ts\n+++ b/src/config.ts\n@@ -1 +1 @@\n-export const config$ = 1;\n+export const config$ = 2;\n";
+        let template = "--- a/src/config.ts\n+++ b/src/config.ts\n@@ -1 +1 @@\n-const s = `${config}`;\n+const s = `${config}!`;\n";
+        for lang in [LangId::Javascript, LangId::Typescript, LangId::Tsx] {
+            assert!(is_symbol_in_changed_lines(
+                diff,
+                "src/config.ts",
+                "$config",
+                lang
+            ));
+            assert!(is_symbol_in_changed_lines(
+                trailing,
+                "src/config.ts",
+                "config$",
+                lang
+            ));
+            // `$` を含む別の識別子の一部とは一致させない。
+            assert!(!is_symbol_in_changed_lines(
+                diff,
+                "src/config.ts",
+                "config",
+                lang
+            ));
+            assert!(!is_symbol_in_changed_lines(
+                trailing,
+                "src/config.ts",
+                "config",
+                lang
+            ));
+            // 対照: テンプレートリテラルの `${config}` は従来どおり `config` に一致する。
+            assert!(is_symbol_in_changed_lines(
+                template,
+                "src/config.ts",
+                "config",
+                lang
+            ));
+            // シグネチャ行の照合も `$` を含む名前で行う。
+            let lines = vec!["function $fmt(a, b) {".to_string()];
+            assert!(find_signature_in_lines(&lines, "$fmt", lang).is_some());
+            assert!(find_signature_in_lines(&lines, "fmt", lang).is_none());
+        }
+        // 対照: JS/TS 以外は従来どおり `$` を区切りとして扱う (PHP の `$format` は `format`)。
+        let php = "--- a/a.php\n+++ b/a.php\n@@ -1 +1 @@\n-$format = 1;\n+$format = 2;\n";
+        assert!(is_symbol_in_changed_lines(
+            php,
+            "a.php",
+            "format",
+            LangId::Php
         ));
     }
 

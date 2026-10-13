@@ -164,6 +164,8 @@ For Bash/zsh parse errors, `api_changes.uncertain_removals` (hook: `api.rm_unver
 
 For a deleted source file in an explicit diff, `truncations` reports `diff_base_mismatch` when the deleted content cannot be checked against the requested base. The hook blocks with `api.diff_base_mismatch`; extracted deletions remain in `api.rm` because the old public surface cannot be proven from that base. Non-source files, including Git submodules, do not trigger this check. Supply the revision before deletion as `--base` when available.
 
+If the cross-file reference scan cannot be prepared (for example, an unreadable directory in the workspace), `context` / `impact` / `review` fail with `IO_ERROR` (exit 1) instead of reporting no callers; fix the permission or exclude the directory.
+
 - Rust functions and methods can opt out of dead/test-only candidates with the exact standalone line `// astro-sight:allow-dead` immediately before the declaration. Outer attributes and outer doc comments may intervene, with no blank line or ordinary comment. The marker applies to that declaration only; it is not inherited from an impl/module or shared across cfg variants, and does not apply to types or constants. It does not change refs, impact, or API changes.
 - `--framework` filters `dead_symbols` only. `--exclude-dir` / `--exclude-glob` affect both impact and `dead_symbols` (same meaning as on `dead-code`). `review` always excludes vendor / tests / build from `dead_symbols`.
 - `--dead-scope` defaults to `touched-symbols` with `--hook`, `all` otherwise. With `--hook`, exports newly added in the same diff are excluded from dead warnings (WIP noise); `--include-wip-dead` opts back in.

@@ -382,7 +382,17 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         // これにより `RefEventMini` は固定長で済み、per-file バッファの heap を削減する。
         // context は trim 済み文字列のため、列は context_column (trim 相対) を渡す
         // (絶対列 `column` は AST point 照合用で座標系が異なる)。
-        let is_import = filters::is_import_context_at(Some(context), context_column);
+        let is_import = match filters::import_context_at(Some(context), context_column) {
+            filters::ImportContext::NotImport => false,
+            filters::ImportContext::Import => true,
+            // `= require(` を含む文を丸ごと import とみなすと、同じ文の実際の呼び出し
+            // (`require('./a').foo(1)`) まで import (情報提供) に落ちる。JS/TS は AST で
+            // CommonJS の束縛位置かを確かめ、確かめられなければ import としない。
+            filters::ImportContext::RequireOnly => {
+                !self.ref_lang.is_some_and(lang_is_ts_family)
+                    || node.is_some_and(|node| filters::is_commonjs_require_binding(node, source))
+            }
+        };
         let unproven_module_ref = is_import
             && self.ref_lang.is_some_and(lang_is_ts_family)
             && !node.is_some_and(|node| {

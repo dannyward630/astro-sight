@@ -11,11 +11,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::engine::symbols;
 use crate::language::LangId;
-use crate::models::impact::{AffectedSymbol, HunkInfo, SignatureChange};
+use crate::models::impact::{AffectedSymbol, SignatureChange};
 use crate::models::symbol::Symbol;
 
 use super::declaration;
-use super::find_overlapping_symbol;
 use super::signature::is_symbol_in_changed_lines;
 use super::test_context::is_in_test_context;
 
@@ -25,9 +24,6 @@ use super::test_context::is_in_test_context;
 /// うち変化するのは `sym` だけで、残りはすべて「その diff ファイル」に固定された値。
 /// ファイルごとに 1 度だけ組み立てて affected ループから使い回す。
 pub(super) struct CrossFileFilterContext<'a> {
-    /// 変更ファイルから抽出した全シンボル。
-    pub(super) syms: &'a [Symbol],
-    pub(super) hunks: &'a [HunkInfo],
     pub(super) sig_changes: &'a [SignatureChange],
     pub(super) rust_kind_changes: &'a HashSet<String>,
     pub(super) rust_alias_changes: &'a HashSet<String>,
@@ -42,6 +38,8 @@ pub(super) struct CrossFileFilterContext<'a> {
     pub(super) lang_id: LangId,
     /// 新側の実変更行 (`+` 行、0-indexed)。
     pub(super) changed_new_lines: &'a HashSet<usize>,
+    /// 新側の削除位置 (`diff::ChangedLineFacts::deletion_gaps`)。
+    pub(super) deletion_gaps: &'a HashSet<usize>,
 }
 
 impl CrossFileFilterContext<'_> {
@@ -53,7 +51,14 @@ impl CrossFileFilterContext<'_> {
     /// 3. ボディのみの変更（シグネチャ変更なし）の関数/メソッドをスキップ
     /// 4. エクスポートされていないシンボルをスキップ
     /// 5. 変更された diff 行にシンボル名が出現しない場合スキップ
-    pub(super) fn should_include_for_cross_file(&self, sym: &AffectedSymbol) -> bool {
+    ///
+    /// `original` は `sym` を作った元のシンボル。判定はすべてこのシンボルで行う
+    /// (名前で引き直すと、同名のローカル const・入れ子の関数・非公開メソッドを取り違える)。
+    pub(super) fn should_include_for_cross_file(
+        &self,
+        sym: &AffectedSymbol,
+        original: &Symbol,
+    ) -> bool {
         // 1. impl ブロックの型名とモジュール宣言をスキップ
         // モジュール宣言（例: `pub mod tensor`）は API サーフェスを変更しない。
         // 実際の内容変更は diff 内のモジュール自身のファイルから検出される。
@@ -63,16 +68,13 @@ impl CrossFileFilterContext<'_> {
         {
             return false;
         }
-        // hunks と重なる定義シンボルは (syms, sym.name, hunks) が不変なので 1 回だけ引く。
-        // Option<&Symbol> は Copy のため以降の各判定で使い回せる (旧実装は 3 回線形スキャンしていた)。
+        // Rust の type はモジュール直下の type alias のときだけ判定対象にする
+        // (impl / trait の関連型は名前だけの cross-file 探索に流さない)。
         let overlapping = if self.lang_id == LangId::Rust && sym.kind == "type" {
-            self.syms.iter().find(|candidate| {
-                candidate.name == sym.name
-                    && super::symbol_overlaps_hunks(candidate, self.hunks)
-                    && declaration::rust_module_alias(self.root, candidate).is_some()
-            })
+            Some(original)
+                .filter(|candidate| declaration::rust_module_alias(self.root, candidate).is_some())
         } else {
-            find_overlapping_symbol(self.syms, &sym.name, self.hunks)
+            Some(original)
         };
         // 2. テストコンテキスト内のシンボルをスキップ
         if overlapping.is_some_and(|s| {
@@ -158,8 +160,24 @@ impl CrossFileFilterContext<'_> {
         // ただしシグネチャ変更が検出済みのシンボルは除外しない。複数行の引数リストへの
         // 引数追加 (`+    b: u32,`) は変更行に名前が出ないが、宣言ヘッダの比較で呼び出し
         // 契約の変更と確定している (`declaration::reconcile_declaration_changes`)。
+        // JS/TS のオブジェクトリテラル変数で範囲内に削除 (メンバーの削除・値の書き換え) が
+        // あるものも除外しない。複数行のオブジェクトは名前が宣言ヘッダ行にしか無く、メンバーの
+        // 変更行には出ないため、名前の有無では呼び出し元への影響を判定できない
+        // (メンバー追加だけの変更は 3c で除外済み。`as const` / `satisfies` / 括弧で包んだ
+        // オブジェクトも同じ理由で除外しない)。
         if !self.sig_changes.iter().any(|sc| sc.name == sym.name)
             && !self.rust_alias_changes.contains(&sym.name)
+            && !(sym.kind == "variable"
+                && overlapping.is_some_and(|s| {
+                    is_js_ts_wrapped_object_literal_variable(self.root, self.lang_id, &s.range)
+                        // 削除はオブジェクトの範囲の内側に限る (直前の別の宣言の削除は含めない。
+                        // affected の判定と同じ規約)。
+                        && super::symbol_range_has_deletion(
+                            s.range.start.line,
+                            s.range.end.line,
+                            self.deletion_gaps,
+                        )
+                }))
             && !is_symbol_in_changed_lines(self.diff_input, self.file_path, &sym.name, self.lang_id)
         {
             return false;
@@ -187,11 +205,43 @@ fn is_js_ts_object_literal_variable(
     lang_id: LangId,
     range: &crate::models::location::Range,
 ) -> bool {
+    js_ts_variable_value(root, lang_id, range).is_some_and(|v| v.kind() == "object")
+}
+
+/// `is_js_ts_object_literal_variable` と同じ判定を、`as const` / `satisfies` / 冗長括弧で
+/// 包んだ初期化子 (`const ns = { ... } as const;`) にも広げたもの。フィルタ 5 の除外を
+/// 外す側だけで使う (3c の「追加のみ」除外の対象は広げない)。既知の包みだけを外し、
+/// それ以外の式の中にあるオブジェクトは探さない。
+fn is_js_ts_wrapped_object_literal_variable(
+    root: tree_sitter::Node<'_>,
+    lang_id: LangId,
+    range: &crate::models::location::Range,
+) -> bool {
+    let mut value = js_ts_variable_value(root, lang_id, range);
+    while let Some(node) = value {
+        match node.kind() {
+            "object" => return true,
+            "parenthesized_expression" | "as_expression" | "satisfies_expression" => {
+                value = node.named_child(0);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// variable シンボルの range (variable_declarator 全体) から JS/TS の初期化子ノードを返す。
+/// 対象言語外・ノード不一致・value 欠落は `None`。
+fn js_ts_variable_value<'a>(
+    root: tree_sitter::Node<'a>,
+    lang_id: LangId,
+    range: &crate::models::location::Range,
+) -> Option<tree_sitter::Node<'a>> {
     if !matches!(
         lang_id,
         LangId::Javascript | LangId::Typescript | LangId::Tsx
     ) {
-        return false;
+        return None;
     }
     let start = tree_sitter::Point {
         row: range.start.line,
@@ -201,20 +251,15 @@ fn is_js_ts_object_literal_variable(
         row: range.end.line,
         column: range.end.column,
     };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
-        return false;
-    };
     // variable シンボルの range は variable_declarator 全体を指す。念のため祖先方向にも辿る。
-    let mut cur = Some(node);
+    let mut cur = root.descendant_for_point_range(start, end);
     while let Some(n) = cur {
         if n.kind() == "variable_declarator" {
-            return n
-                .child_by_field_name("value")
-                .is_some_and(|v| v.kind() == "object");
+            return n.child_by_field_name("value");
         }
         cur = n.parent();
     }
-    false
+    None
 }
 
 /// 同一ファイル判定。
@@ -229,12 +274,37 @@ pub(super) fn is_same_source_file(ref_path: &str, source_path: &str) -> bool {
     ref_path == source_path
 }
 
-/// 参照のコンテキスト行が import/re-export 文かどうかを判定する。
-pub(super) fn is_import_context(context: Option<&str>) -> bool {
-    let ctx = match context {
-        Some(c) => c.trim(),
-        None => return false,
-    };
+/// 参照のある文が import/re-export 文か (`import_context_at` の結果)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ImportContext {
+    NotImport,
+    Import,
+    /// `= require(` / `require(` の規則だけで import と判定した文。行のテキストに require が
+    /// あるだけなので、同じ文の実際の呼び出し (`require('./a').foo(1)`) まで含んでしまう。
+    /// JS/TS では AST で CommonJS の束縛位置かを確かめ直す (`is_commonjs_require_binding`)。
+    RequireOnly,
+}
+
+/// 参照のコンテキスト行が import/re-export 文かどうかを判定する (require の規則だけで
+/// 当たる文も import とみなす。テストで規則を確かめるための入口)。
+#[cfg(test)]
+fn is_import_context(context: Option<&str>) -> bool {
+    context.is_some_and(|ctx| import_context_kind(ctx.trim()) != ImportContext::NotImport)
+}
+
+fn import_context_kind(ctx: &str) -> ImportContext {
+    if is_import_statement_text(ctx) {
+        ImportContext::Import
+    } else if ctx.contains("= require(") || ctx.starts_with("require(") {
+        // JS/TS: const { X } = require('...'), require('...')
+        ImportContext::RequireOnly
+    } else {
+        ImportContext::NotImport
+    }
+}
+
+/// require 以外の規則で import/re-export 文と言えるか。
+fn is_import_statement_text(ctx: &str) -> bool {
     // JS/TS: import { X } from '...', import X from '...'
     if ctx.starts_with("import ") || ctx.starts_with("import{") {
         return true;
@@ -247,10 +317,6 @@ pub(super) fn is_import_context(context: Option<&str>) -> bool {
     }
     // JS/TS: import 済みシンボルを公開し直す barrel 形式
     if is_js_ts_export_clause(ctx) {
-        return true;
-    }
-    // JS/TS: const { X } = require('...'), require('...')
-    if ctx.contains("= require(") || ctx.starts_with("require(") {
         return true;
     }
     // Python: from module import X
@@ -293,12 +359,98 @@ pub(super) fn is_import_context(context: Option<&str>) -> bool {
 }
 
 /// 同一行に複数文がある場合、参照列を含む文だけで import/re-export 文脈を判定する。
-pub(super) fn is_import_context_at(context: Option<&str>, column: usize) -> bool {
+pub(super) fn import_context_at(context: Option<&str>, column: usize) -> ImportContext {
     let Some(ctx) = context else {
-        return false;
+        return ImportContext::NotImport;
     };
-    let segment = statement_segment_at_column(ctx, column);
-    is_import_context(Some(segment))
+    import_context_kind(statement_segment_at_column(ctx, column).trim())
+}
+
+/// JS/TS の参照ノードが CommonJS の import の束縛位置にあるか。
+///
+/// import とみなすのは次の 2 つだけ (どちらも括弧は透過する):
+/// - `require(...)` を初期化子に持つ変数宣言の束縛パターン (`const { foo } = require('./a')`
+///   の束縛名・`{ foo: bar }` の取り出すキー・入れ子・既定値付き・rest)。既定値の式と
+///   computed key の式はパターン内でも実行される式なので含めない
+///   (`const { foo = foo(1) } = ...` の 2 つ目の `foo` は呼び出し)。
+/// - 初期化子そのものが `require(...).foo` の変数宣言の `foo` (`const foo = require('./a').foo`)。
+///
+/// それ以外 (`require('./a').foo(1)` の呼び出し、同じ宣言の別の declarator、代入式
+/// `x = require('./a').foo`、`require('./a').sub` の分割代入など) は import と証明しない
+/// (呼び出し元として blocking 側に残す)。callee は素の `require` 識別子に限る。
+pub(super) fn is_commonjs_require_binding(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let is_field = |parent: tree_sitter::Node<'_>, field: &str, child: tree_sitter::Node<'_>| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|n| n.id() == child.id())
+    };
+    // `const foo = require('./a').foo;`
+    if let Some(member) = node.parent()
+        && member.kind() == "member_expression"
+        && is_field(member, "property", node)
+        && member
+            .child_by_field_name("object")
+            .is_some_and(|object| is_require_call(unwrap_parens(object), source))
+    {
+        let mut value = member;
+        while let Some(parent) = value.parent()
+            && parent.kind() == "parenthesized_expression"
+        {
+            value = parent;
+        }
+        return value.parent().is_some_and(|declarator| {
+            declarator.kind() == "variable_declarator" && is_field(declarator, "value", value)
+        });
+    }
+    // 束縛パターンを宣言まで辿る。実行される式 (既定値・computed key) へ入った時点で証明しない。
+    let mut child = node;
+    while let Some(parent) = child.parent() {
+        match parent.kind() {
+            "object_pattern" | "array_pattern" | "rest_pattern" => {}
+            "object_assignment_pattern" | "assignment_pattern" => {
+                if !is_field(parent, "left", child) {
+                    return false;
+                }
+            }
+            "pair_pattern" => {
+                // 取り出すキーは静的な名前だけ (computed key は式)。
+                if is_field(parent, "key", child) {
+                    if child.kind() == "computed_property_name" {
+                        return false;
+                    }
+                } else if !is_field(parent, "value", child) {
+                    return false;
+                }
+            }
+            "variable_declarator" => {
+                return is_field(parent, "name", child)
+                    && parent
+                        .child_by_field_name("value")
+                        .is_some_and(|value| is_require_call(unwrap_parens(value), source));
+            }
+            _ => return false,
+        }
+        child = parent;
+    }
+    false
+}
+
+/// 冗長な括弧を外す。
+fn unwrap_parens(mut node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    while node.kind() == "parenthesized_expression"
+        && let Some(inner) = node.named_child(0)
+    {
+        node = inner;
+    }
+    node
+}
+
+/// 素の `require` 識別子を callee とする呼び出し (`require('./a')`) か。
+fn is_require_call(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    node.kind() == "call_expression"
+        && node.child_by_field_name("function").is_some_and(|callee| {
+            callee.kind() == "identifier" && callee.utf8_text(source).ok() == Some("require")
+        })
 }
 
 fn statement_segment_at_column(ctx: &str, column: usize) -> &str {
@@ -328,6 +480,7 @@ fn is_js_ts_export_clause(ctx: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::impact::HunkInfo;
 
     // --- CrossFileFilterContext::should_include_for_cross_file ---
 
@@ -342,6 +495,16 @@ mod tests {
             kind: kind.to_string(),
             change_type: change_type.to_string(),
         }
+    }
+
+    /// Pass 1 と同じく、hunk に重なるシンボルを affected の元のシンボルとして選ぶ
+    /// (これらのテストの fixture では名前が一意)。該当が無い名前はフィルタ 1 で
+    /// シンボルを見る前に除外されるケースなので、先頭のシンボルで代用する。
+    fn original_for<'a>(syms: &'a [Symbol], name: &str, hunks: &[HunkInfo]) -> &'a Symbol {
+        syms.iter()
+            .find(|s| s.name == name && super::super::symbol_overlaps_hunks(s, hunks))
+            .or_else(|| syms.first())
+            .expect("fixture has at least one symbol")
     }
 
     /// 1 行目全体を hunk とみなす per-file 定数を組み立ててから判定を実行する。
@@ -373,16 +536,17 @@ mod tests {
         }];
         let diff_input = one_line_diff(source.lines().next().unwrap_or_default());
         let changed_new_lines: HashSet<usize> = changed_lines.iter().copied().collect();
+        let deletion_gaps =
+            crate::engine::diff::extract_changed_line_facts(&diff_input, "src/lib.rs")
+                .deletion_gaps;
         let rust_alias_changes: HashSet<String> = alias_changes
             .iter()
             .map(|name| (*name).to_string())
             .collect();
         let ctx = CrossFileFilterContext {
-            syms: &syms,
             rust_kind_changes: &HashSet::new(),
             rust_alias_changes: &rust_alias_changes,
             rust_private_method_owners: &HashMap::new(),
-            hunks: &hunks,
             sig_changes,
             diff_input: &diff_input,
             file_path: "src/lib.rs",
@@ -390,8 +554,9 @@ mod tests {
             source: bytes,
             lang_id: LangId::Rust,
             changed_new_lines: &changed_new_lines,
+            deletion_gaps: &deletion_gaps,
         };
-        ctx.should_include_for_cross_file(sym)
+        ctx.should_include_for_cross_file(sym, original_for(&syms, &sym.name, &hunks))
     }
 
     fn sig_change(name: &str) -> SignatureChange {
@@ -503,12 +668,12 @@ mod tests {
         let root = tree.root_node();
         let syms = symbols::extract_symbols(root, bytes, LangId::Typescript).expect("symbols");
         let changed_new_lines: HashSet<usize> = changed_lines.iter().copied().collect();
+        let deletion_gaps =
+            crate::engine::diff::extract_changed_line_facts(diff_input, "mod.ts").deletion_gaps;
         let ctx = CrossFileFilterContext {
-            syms: &syms,
             rust_kind_changes: &HashSet::new(),
             rust_alias_changes: &HashSet::new(),
             rust_private_method_owners: &HashMap::new(),
-            hunks: &hunks,
             sig_changes: &[],
             diff_input,
             file_path: "mod.ts",
@@ -516,8 +681,9 @@ mod tests {
             source: bytes,
             lang_id: LangId::Typescript,
             changed_new_lines: &changed_new_lines,
+            deletion_gaps: &deletion_gaps,
         };
-        ctx.should_include_for_cross_file(sym)
+        ctx.should_include_for_cross_file(sym, original_for(&syms, &sym.name, &hunks))
     }
 
     // 3c. オブジェクトリテラル変数への「メンバー追加のみ」変更は cross-file 検索から除外
@@ -560,6 +726,90 @@ mod tests {
         ));
     }
 
+    // 5. 複数行のオブジェクトリテラル変数は、名前が変更行に無くてもメンバーの削除・値の書き換えが
+    // あれば除外しない (名前が宣言ヘッダ行にしか無いため、フィルタ 5 では判定できない)。
+    // `as const` で包んだものも同じ。対照: メンバーを足しただけの変更は従来どおり除外する
+    // (包んでいないものは 3c、包んだものはフィルタ 5)。削除はオブジェクトの範囲の内側に限り、
+    // 直前の別の宣言を消しただけの削除では除外を外さない。
+    #[test]
+    fn cross_file_filter_keeps_multi_line_object_member_removal_without_name_on_changed_lines() {
+        // (ラベル, 変更後のメンバー行, diff の hunk (ヘッダ込み), cross-file 検索に含めるか)
+        let cases = [
+            (
+                "末尾のメンバー削除",
+                "  alpha: 1,\n",
+                "@@ -1,4 +1,3 @@\n export const api = {\n   alpha: 1,\n-  beta: 2,\n }SUFFIX;\n",
+                true,
+            ),
+            (
+                "先頭のメンバー削除",
+                "  alpha: 1,\n",
+                "@@ -1,4 +1,3 @@\n export const api = {\n-  beta: 2,\n   alpha: 1,\n }SUFFIX;\n",
+                true,
+            ),
+            (
+                "唯一のメンバー削除",
+                "",
+                "@@ -1,3 +1,2 @@\n export const api = {\n-  beta: 2,\n }SUFFIX;\n",
+                true,
+            ),
+            (
+                "-U0 のメンバー削除",
+                "  alpha: 1,\n",
+                "@@ -3 +2,0 @@\n-  beta: 2,\n",
+                true,
+            ),
+            (
+                "値の書き換え",
+                "  alpha: 2,\n",
+                "@@ -1,3 +1,3 @@\n export const api = {\n-  alpha: 1,\n+  alpha: 2,\n }SUFFIX;\n",
+                true,
+            ),
+            (
+                "対照: メンバー追加のみ",
+                "  alpha: 1,\n  beta: 2,\n",
+                "@@ -1,3 +1,4 @@\n export const api = {\n   alpha: 1,\n+  beta: 2,\n }SUFFIX;\n",
+                false,
+            ),
+            (
+                "対照: メンバー追加 + 直前の別の宣言の削除",
+                "  alpha: 1,\n  beta: 2,\n",
+                "@@ -1,4 +1,4 @@\n-export const before = 1;\n export const api = {\n   alpha: 1,\n+  beta: 2,\n }SUFFIX;\n",
+                false,
+            ),
+        ];
+        for suffix in ["", " as const"] {
+            for (label, members, hunk, expected) in cases {
+                let source = format!("export const api = {{\n{members}}}{suffix};\n");
+                let diff = format!(
+                    "--- a/mod.ts\n+++ b/mod.ts\n{}",
+                    hunk.replace("SUFFIX", suffix)
+                );
+                let hunks = crate::engine::diff::parse_unified_diff(&diff)
+                    .into_iter()
+                    .next()
+                    .expect("diff file")
+                    .hunks;
+                let added: Vec<usize> =
+                    crate::engine::diff::extract_changed_line_facts(&diff, "mod.ts")
+                        .added_lines
+                        .into_iter()
+                        .collect();
+                assert_eq!(
+                    include_for_ts(
+                        &source,
+                        &affected("api", "variable", "modified"),
+                        &diff,
+                        &added,
+                        hunks
+                    ),
+                    expected,
+                    "{label} (suffix={suffix:?})\n{diff}"
+                );
+            }
+        }
+    }
+
     // 3c. 宣言ヘッダ行自体が変更された場合は除外しない (署名変更の可能性)
     #[test]
     fn cross_file_filter_keeps_object_literal_with_changed_header() {
@@ -598,13 +848,12 @@ mod tests {
             new_count: 4,
         }];
         let changed_new_lines: HashSet<usize> = HashSet::from([2]);
+        let deletion_gaps = HashSet::new();
         let include = |sig_changes: &[SignatureChange]| {
             CrossFileFilterContext {
-                syms: &syms,
                 rust_kind_changes: &HashSet::new(),
                 rust_alias_changes: &HashSet::new(),
                 rust_private_method_owners: &HashMap::new(),
-                hunks: &hunks,
                 sig_changes,
                 diff_input: diff,
                 file_path: "mod.ts",
@@ -612,8 +861,12 @@ mod tests {
                 source: bytes,
                 lang_id: LangId::Typescript,
                 changed_new_lines: &changed_new_lines,
+                deletion_gaps: &deletion_gaps,
             }
-            .should_include_for_cross_file(&affected("arrow", "variable", "modified"))
+            .should_include_for_cross_file(
+                &affected("arrow", "variable", "modified"),
+                original_for(&syms, "arrow", &hunks),
+            )
         };
         assert!(include(&[sig_change("arrow")]));
         // 対照: シグネチャ変更が無ければ従来どおり「名前が変更行に無い」で除外する
@@ -699,8 +952,94 @@ mod tests {
         let reexport_col = line.find("useCommitStore").expect("re-export ref");
         let call_col = line.rfind("useCommitStore").expect("call ref");
 
-        assert!(is_import_context_at(Some(line), reexport_col));
-        assert!(!is_import_context_at(Some(line), call_col));
+        assert_eq!(
+            import_context_at(Some(line), reexport_col),
+            ImportContext::Import
+        );
+        assert_eq!(
+            import_context_at(Some(line), call_col),
+            ImportContext::NotImport
+        );
+    }
+
+    /// `= require(` / `require(` の規則だけで import と判定した文は `RequireOnly` として区別する
+    /// (呼び出し側が JS/TS では AST で束縛位置かを確かめ直す)。他の規則に当たる文は従来どおり。
+    #[test]
+    fn import_context_distinguishes_require_only_statements() {
+        for line in [
+            "const { foo } = require('./a');",
+            "const value = require('./a').foo(1);",
+            "require('./a').foo(1);",
+        ] {
+            assert_eq!(
+                import_context_at(Some(line), line.find("foo").unwrap()),
+                ImportContext::RequireOnly,
+                "{line}"
+            );
+            assert!(is_import_context(Some(line)), "{line}");
+        }
+        for line in ["import foo = require('./a');", "import { foo } from './a';"] {
+            assert_eq!(
+                import_context_at(Some(line), line.find("foo").unwrap()),
+                ImportContext::Import,
+                "{line}"
+            );
+        }
+        // Ruby の require (括弧なし) は従来どおり import。
+        assert_eq!(
+            import_context_at(Some("require 'commit_store'"), 0),
+            ImportContext::Import
+        );
+    }
+
+    /// JS/TS の参照ノードが CommonJS の束縛位置か。束縛パターン内でも既定値・computed key の
+    /// 式は実行されるので import ではない。
+    #[test]
+    fn commonjs_require_binding_accepts_only_binding_positions() {
+        // (ソース, 対象の `foo` の出現番号 (0 始まり), import とみなすか)
+        let cases = [
+            ("const { foo } = require('./a');", 0, true),
+            ("const { foo: bar } = require('./a');", 0, true),
+            ("const { foo = 1 } = require('./a');", 0, true),
+            ("const { a: { foo } } = require('./a');", 0, true),
+            ("const { ...foo } = require('./a');", 0, true),
+            ("const foo = require('./a').foo;", 1, true),
+            ("const foo = (require('./a')).foo;", 1, true),
+            ("const { foo } = (require('./a'));", 0, true),
+            // 呼び出し・他の式の中の参照は import ではない。
+            ("const value = require('./a').foo(1);", 0, false),
+            ("require('./a').foo(1);", 0, false),
+            ("const m = require('./m'), r = foo(1);", 0, false),
+            ("const { bar = foo(1) } = require('./a');", 0, false),
+            ("const { [foo(1)]: value } = require('./a');", 0, false),
+            ("let x; x = require('./a').foo;", 0, false),
+            ("exports.foo = require('./a').foo;", 1, false),
+            ("const { foo } = require('./a').sub;", 0, false),
+            ("const { foo } = load('./a');", 0, false),
+            ("const { foo } = obj.require('./a');", 0, false),
+        ];
+        for lang in [LangId::Javascript, LangId::Typescript, LangId::Tsx] {
+            for (source, occurrence, expected) in cases {
+                let tree =
+                    crate::engine::parser::parse_source(source.as_bytes(), lang).expect("parse");
+                let start = source
+                    .match_indices("foo")
+                    .nth(occurrence)
+                    .unwrap_or_else(|| panic!("{source}: occurrence {occurrence}"))
+                    .0;
+                let point = tree_sitter::Point::new(0, start);
+                let node = tree
+                    .root_node()
+                    .named_descendant_for_point_range(point, point)
+                    .expect("node");
+                assert_eq!(
+                    is_commonjs_require_binding(node, source.as_bytes()),
+                    expected,
+                    "{lang}: {source} ({})",
+                    node.kind()
+                );
+            }
+        }
     }
 
     #[test]

@@ -36,9 +36,18 @@
 //!
 //! 別名 (`as OTHER`) と glob (`use x::*`) は解決先を静的に確定できないため成立させない
 //! (fail-closed)。対象は Rust のみで、他言語は常に `false` を返す。
+//!
+//! 「移動と同時に宣言が変わっていない」ことは、行単位の宣言ヘッダ (1 行目) に加えて、
+//! 移動元の旧宣言と移動先の新宣言の全体 (直前の属性、struct のフィールド、enum の variant、
+//! 複数行の引数リスト等) を AST のトークン列で照合して確かめる (`verify_declarations`)。
+//! 1 行目だけでは `pub struct Shape {` のフィールド追加や複数行の引数変更を見落とす。
 use std::collections::{HashMap, HashSet};
 
+use tree_sitter::Node;
+
 use crate::engine::diff::{HunkBodyLine, HunkProgress, parse_hunk_header};
+use crate::engine::{diff, parser};
+use crate::language::LangId;
 
 /// Rust の item 定義を導入するキーワード。`rust_line_defines` で「キーワードの次の
 /// 識別子」を定義名として照合する。`use` は定義ではないので**含めない**
@@ -116,7 +125,39 @@ pub(super) struct ReexportMoveIndex {
     /// ファイルパス → シンボル名 → 同一 diff で**追加**された定義の宣言ヘッダ群。
     /// 条件 3 の照合に使う。
     added_defs: HashMap<String, HashMap<String, Vec<String>>>,
+    /// 参照ファイルパス → シンボル名 → 移動元で削除した宣言全体のトークン列。
+    /// `verify_declarations` が旧ソースの AST で一意に特定できたものだけを持つ。
+    removed_decls: HashMap<String, HashMap<String, Vec<DeclToken>>>,
+    /// ファイルパス → シンボル名 → 移動先で追加した宣言全体のトークン列 (同上)。
+    added_decls: HashMap<String, HashMap<String, Vec<DeclToken>>>,
 }
+
+/// 宣言の照合に使うトークン (ノード種別の ID, テキスト)。空白とコメントは含まない。
+type DeclToken = (u16, String);
+
+/// ファイル直下で再輸出の移動元・移動先として扱う item の種別。
+const RUST_ITEM_KINDS: &[&str] = &[
+    "struct_item",
+    "enum_item",
+    "union_item",
+    "trait_item",
+    "function_item",
+    "const_item",
+    "static_item",
+    "type_item",
+    "mod_item",
+    "macro_definition",
+];
+
+/// 末尾のカンマを省略できるリスト。ここに直接置かれた閉じ括弧直前のカンマは照合から外す
+/// (書式の違いだけで移動を否定しない)。tuple 型 `(T,)`・マクロ・属性の token tree の
+/// カンマは意味を持つので外さない。
+const OPTIONAL_TRAILING_COMMA_LISTS: &[&str] = &[
+    "field_declaration_list",
+    "ordered_field_declaration_list",
+    "enum_variant_list",
+    "parameters",
+];
 
 impl ReexportMoveIndex {
     /// unified diff を 1 度走査して索引を構築する。
@@ -183,7 +224,79 @@ impl ReexportMoveIndex {
             removed_identities,
             moves,
             added_defs,
+            removed_decls: HashMap::new(),
+            added_decls: HashMap::new(),
         }
+    }
+
+    /// 移動候補について、移動元の旧宣言と移動先の新宣言の全体を AST で取り出して保持する。
+    ///
+    /// `read_new_source` は diff の new 側パス (`--dir` 相対) の内容を返す (作業ツリーまたは
+    /// `--staged` の index。読めなければ `None`)。移動元の旧ソースは new 側 + diff から復元する。
+    /// どちらも名前の行がそれぞれ削除行・追加行にあるファイル直下の item を 1 つに特定できた
+    /// ときだけ登録する。読めない・復元できない・構文エラー・一意に決まらない場合は登録せず、
+    /// `covers` は移動と証明できない (= blocking のまま) 側に倒れる。
+    pub(super) fn verify_declarations<B: AsRef<[u8]>>(
+        &mut self,
+        diff_input: &str,
+        mut read_new_source: impl FnMut(&str) -> Option<B>,
+    ) {
+        if self.moves.is_empty() {
+            return;
+        }
+        // 移動先として照合する (ファイル, 名前)。`covers` の条件 3 と同じく、移動候補の
+        // モジュールパスがそのファイルへ解決し、そのファイルが同名の定義を追加している組だけ。
+        let mut targets: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for (ref_path, by_symbol) in &self.moves {
+            for (name, candidates) in by_symbol {
+                for (source_path, defs) in &self.added_defs {
+                    if defs.contains_key(name)
+                        && candidates
+                            .iter()
+                            .any(|c| module_resolves_to(ref_path, &c.module, source_path))
+                    {
+                        targets
+                            .entry(source_path.as_str())
+                            .or_default()
+                            .insert(name.as_str());
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let sections = diff::FileSections::split(diff_input);
+
+        let mut removed_decls: HashMap<String, HashMap<String, Vec<DeclToken>>> = HashMap::new();
+        for (ref_path, by_symbol) in &self.moves {
+            let names: Vec<&str> = by_symbol.keys().map(String::as_str).collect();
+            let file_diff = sections.get(ref_path);
+            let found = read_new_source(ref_path)
+                .and_then(|new_source| {
+                    diff::reconstruct_old_source(&file_diff, ref_path, new_source.as_ref())
+                })
+                .map(|old| declarations_on_lines(&old.source, &names, &old.removed_lines))
+                .unwrap_or_default();
+            if !found.is_empty() {
+                removed_decls.insert(ref_path.clone(), found);
+            }
+        }
+
+        let mut added_decls: HashMap<String, HashMap<String, Vec<DeclToken>>> = HashMap::new();
+        for (source_path, names) in targets {
+            let names: Vec<&str> = names.into_iter().collect();
+            let file_diff = sections.get(source_path);
+            let added_lines = diff::extract_changed_line_facts(&file_diff, source_path).added_lines;
+            let found = read_new_source(source_path)
+                .map(|new_source| declarations_on_lines(new_source.as_ref(), &names, &added_lines))
+                .unwrap_or_default();
+            if !found.is_empty() {
+                added_decls.insert(source_path.to_string(), found);
+            }
+        }
+        self.removed_decls = removed_decls;
+        self.added_decls = added_decls;
     }
 
     pub(super) fn might_have_removed_identity(&self, name: &str) -> bool {
@@ -209,15 +322,152 @@ impl ReexportMoveIndex {
         else {
             return false;
         };
-        candidates.iter().any(|candidate| {
+        let moved_unchanged = candidates.iter().any(|candidate| {
             module_resolves_to(ref_path, &candidate.module, source_path)
                 // 宣言ヘッダが一致する = 純粋な移動。移動と同時に引数や型が変わった場合は
                 // 再輸出があっても呼び出し側が壊れるため blocking のまま残す。
                 && added_headers
                     .iter()
                     .any(|header| header == &candidate.removed_header)
-        })
+        });
+        // 1 行目のヘッダだけでは struct のフィールドや複数行の引数リストを比べられないので、
+        // 宣言全体も一致することを要求する (`verify_declarations` で照合できた組だけ)。
+        moved_unchanged
+            && self
+                .removed_decls
+                .get(ref_path)
+                .and_then(|by_symbol| by_symbol.get(symbol))
+                .zip(
+                    self.added_decls
+                        .get(source_path)
+                        .and_then(|by_symbol| by_symbol.get(symbol)),
+                )
+                .is_some_and(|(removed, added)| removed == added)
     }
+}
+
+/// `source` のファイル直下の item のうち、名前が `names` のいずれかで、名前の行が `lines`
+/// (0 始まり) に含まれるものを探し、名前ごとに 1 つに決まった宣言のトークン列を返す。
+/// 構文エラーのあるファイルは対応付けを信用できないので何も返さない。
+fn declarations_on_lines(
+    source: &[u8],
+    names: &[&str],
+    lines: &HashSet<usize>,
+) -> HashMap<String, Vec<DeclToken>> {
+    let Ok(tree) = parser::parse_source(source, LangId::Rust) else {
+        return HashMap::new();
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return HashMap::new();
+    }
+    let mut matches: HashMap<&str, Vec<Node<'_>>> = HashMap::new();
+    let mut cursor = root.walk();
+    for item in root.named_children(&mut cursor) {
+        if !RUST_ITEM_KINDS.contains(&item.kind()) {
+            continue;
+        }
+        let Some(name_node) = item.child_by_field_name("name") else {
+            continue;
+        };
+        let Ok(name) = name_node.utf8_text(source) else {
+            continue;
+        };
+        if let Some(&name) = names.iter().find(|candidate| **candidate == name)
+            && lines.contains(&name_node.start_position().row)
+        {
+            matches.entry(name).or_default().push(item);
+        }
+    }
+    matches
+        .into_iter()
+        .filter_map(|(name, items)| match items.as_slice() {
+            [item] => declaration_tokens(*item, source).map(|tokens| (name.to_string(), tokens)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 宣言 1 つ分の照合用トークン列。直前の属性 (`#[derive]` / `#[repr]` / `#[cfg]` 等) も
+/// 宣言の一部として含める。関数の本体と const / static の初期化子は除く (本体だけ・定数の
+/// 値だけが変わった移動は従来どおり移動として扱う。値の変化は API 差分の const_value が報告する)。
+fn declaration_tokens(item: Node<'_>, source: &[u8]) -> Option<Vec<DeclToken>> {
+    let mut attributes = Vec::new();
+    let mut prev = item.prev_sibling();
+    while let Some(node) = prev {
+        if node.kind() == "attribute_item" {
+            attributes.push(node);
+        } else if !node.is_extra() {
+            break;
+        }
+        prev = node.prev_sibling();
+    }
+    let skipped = match item.kind() {
+        "function_item" => item.child_by_field_name("body"),
+        "const_item" | "static_item" => item.child_by_field_name("value"),
+        _ => None,
+    }
+    .map(|node| node.id());
+    let mut tokens = Vec::new();
+    for node in attributes.into_iter().rev().chain(std::iter::once(item)) {
+        if node.has_error() {
+            return None;
+        }
+        collect_declaration_tokens(node, source, skipped, &mut tokens)?;
+    }
+    Some(tokens)
+}
+
+/// `node` の部分木の葉を前順に集める。コメント (extra) と `skipped` の部分木は除く。
+fn collect_declaration_tokens(
+    node: Node<'_>,
+    source: &[u8],
+    skipped: Option<usize>,
+    tokens: &mut Vec<DeclToken>,
+) -> Option<()> {
+    let mut cursor = node.walk();
+    let mut descend = true;
+    loop {
+        let current = cursor.node();
+        let skip = current.is_extra()
+            || Some(current.id()) == skipped
+            || is_optional_trailing_comma(current);
+        if !skip && current.child_count() == 0 {
+            tokens.push((
+                current.kind_id(),
+                current.utf8_text(source).ok()?.to_string(),
+            ));
+        }
+        if descend && !skip && cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            descend = true;
+            continue;
+        }
+        if !cursor.goto_parent() || cursor.node().id() == node.id() {
+            return Some(());
+        }
+        descend = false;
+    }
+}
+
+/// 省略できる末尾カンマ (`OPTIONAL_TRAILING_COMMA_LISTS` の閉じ括弧直前) か。
+fn is_optional_trailing_comma(node: Node<'_>) -> bool {
+    if node.kind() != ","
+        || !node
+            .parent()
+            .is_some_and(|parent| OPTIONAL_TRAILING_COMMA_LISTS.contains(&parent.kind()))
+    {
+        return false;
+    }
+    let mut next = node.next_sibling();
+    while let Some(sibling) = next
+        && sibling.is_extra()
+    {
+        next = sibling.next_sibling();
+    }
+    next.is_some_and(|sibling| matches!(sibling.kind(), "}" | ")"))
 }
 
 /// 定義行から宣言ヘッダ (本体・初期化子を除いた部分) を取り出して正規化する。
@@ -672,6 +922,38 @@ mod tests {
         assert_eq!(lines.removed, vec!["pub const A: u32 = 1;".to_string()]);
     }
 
+    /// テスト用: diff の new 側 (context 行 + 追加行) をファイルごとに組み立てる。
+    /// このモジュールのテストの diff は、どれも hunk が 1 行目からファイル全体を覆う。
+    fn new_sources_from_diff(diff: &str) -> HashMap<String, String> {
+        let mut sources: HashMap<String, String> = HashMap::new();
+        let mut current: Option<String> = None;
+        for line in diff.lines() {
+            if let Some(path) = line.strip_prefix("+++ b/") {
+                current = Some(path.to_string());
+                sources.entry(path.to_string()).or_default();
+            } else if line.starts_with("--- ") {
+                current = None;
+            } else if line.starts_with("+++ ") || line.starts_with("@@ ") {
+                continue;
+            } else if let Some(path) = &current
+                && let Some(text) = line.strip_prefix('+').or_else(|| line.strip_prefix(' '))
+            {
+                let content = sources.get_mut(path).expect("section");
+                content.push_str(text);
+                content.push('\n');
+            }
+        }
+        sources
+    }
+
+    /// テスト用: 本番と同じく、索引を作ってから new 側のソースで宣言全体を照合する。
+    fn build_verified(diff: &str) -> ReexportMoveIndex {
+        let sources = new_sources_from_diff(diff);
+        let mut index = ReexportMoveIndex::build(diff);
+        index.verify_declarations(diff, |path| sources.get(path).cloned());
+        index
+    }
+
     /// Issue の再現形をそのまま diff にしたもの。
     /// background.rs へ定義が移動し、consumer.rs は旧パスを再輸出で維持する。
     fn move_diff() -> String {
@@ -694,7 +976,7 @@ mod tests {
 
     #[test]
     fn covers_reexport_move_from_sibling_module() {
-        let index = ReexportMoveIndex::build(&move_diff());
+        let index = build_verified(&move_diff());
         assert!(index.covers("src/game/consumer.rs", "CONST_A", "src/game/background.rs"));
     }
 
@@ -713,7 +995,7 @@ mod tests {
  // header
 +pub use super::background::CONST_A;
 ";
-        let index = ReexportMoveIndex::build(diff);
+        let index = build_verified(diff);
         assert!(!index.covers("src/game/consumer.rs", "CONST_A", "src/game/background.rs"));
     }
 
@@ -733,7 +1015,7 @@ mod tests {
 -pub const CONST_A: f32 = -50.0;
 +pub use super::background::CONST_A;
 ";
-        let index = ReexportMoveIndex::build(diff);
+        let index = build_verified(diff);
         assert!(!index.covers("src/game/consumer.rs", "CONST_A", "src/game/background.rs"));
     }
 
@@ -744,7 +1026,7 @@ mod tests {
             "+pub use super::background::CONST_A;",
             "+pub use super::background::CONST_A as OTHER;",
         );
-        let index = ReexportMoveIndex::build(&diff);
+        let index = build_verified(&diff);
         assert!(!index.covers("src/game/consumer.rs", "CONST_A", "src/game/background.rs"));
     }
 
@@ -755,7 +1037,7 @@ mod tests {
             "+pub use super::background::CONST_A;",
             "+pub use super::background::*;",
         );
-        let index = ReexportMoveIndex::build(&diff);
+        let index = build_verified(&diff);
         assert!(!index.covers("src/game/consumer.rs", "CONST_A", "src/game/background.rs"));
     }
 
@@ -766,7 +1048,7 @@ mod tests {
             "+pub use super::background::CONST_A;",
             "+pub use super::other::CONST_A;",
         );
-        let index = ReexportMoveIndex::build(&diff);
+        let index = build_verified(&diff);
         assert!(!index.covers("src/game/consumer.rs", "CONST_A", "src/game/background.rs"));
     }
 
@@ -787,7 +1069,7 @@ mod tests {
 -pub fn placement(a: i32) -> i32 { a }
 +pub use super::background::placement;
 ";
-        let index = ReexportMoveIndex::build(changed);
+        let index = build_verified(changed);
         assert!(!index.covers(
             "src/game/consumer.rs",
             "placement",
@@ -799,7 +1081,7 @@ mod tests {
             "+pub fn placement(a: i32, b: i32) -> i32 { a + b }",
             "+pub fn placement(a: i32) -> i32 { a * 2 }",
         );
-        let index = ReexportMoveIndex::build(&same);
+        let index = build_verified(&same);
         assert!(index.covers(
             "src/game/consumer.rs",
             "placement",
@@ -836,7 +1118,7 @@ mod tests {
             "+pub use super::background::CONST_A;",
             "+pub use super::background::{BASE_Y, CONST_A};",
         );
-        let index = ReexportMoveIndex::build(&diff);
+        let index = build_verified(&diff);
         assert!(index.covers("src/game/consumer.rs", "CONST_A", "src/game/background.rs"));
     }
 
@@ -846,7 +1128,7 @@ mod tests {
             "+pub use super::background::CONST_A;",
             "+pub use crate::game::background::CONST_A;",
         );
-        let index = ReexportMoveIndex::build(&diff);
+        let index = build_verified(&diff);
         assert!(index.covers("src/game/consumer.rs", "CONST_A", "src/game/background.rs"));
     }
 
@@ -970,7 +1252,7 @@ mod tests {
 -pub const fn placement(v: i32) -> i32 { v * 2 }
 +pub use super::background::placement;
 ";
-        let index = ReexportMoveIndex::build(diff);
+        let index = build_verified(diff);
         assert!(index.covers(
             "src/game/consumer.rs",
             "placement",
@@ -1112,7 +1394,7 @@ mod tests {
             "+pub use super::background::CONST_A;",
             "+pub use super::background::CONST_A; // moved out of consumer",
         );
-        let index = ReexportMoveIndex::build(&diff);
+        let index = build_verified(&diff);
         assert!(index.covers("src/game/consumer.rs", "CONST_A", "src/game/background.rs"));
     }
 
@@ -1131,5 +1413,148 @@ mod tests {
             "placement"
         ));
         assert!(rust_line_defines("macro_rules! my_macro {", "my_macro"));
+    }
+
+    /// `name` の定義を consumer.rs から background.rs へ移し、consumer.rs は `pub use` で
+    /// 再輸出する diff (移動先の hunk は BAND_H の値変更と混在させる)。
+    fn move_declaration_diff(name: &str, removed: &str, added: &str) -> String {
+        let removed: Vec<&str> = removed.lines().collect();
+        let added: Vec<&str> = added.lines().collect();
+        let mut diff = format!(
+            "--- a/src/game/background.rs\n+++ b/src/game/background.rs\n@@ -1,2 +1,{} @@\n pub const BASE_Y: f32 = -70.0;\n-pub const BAND_H: f32 = 30.0;\n+pub const BAND_H: f32 = 40.0;\n",
+            2 + added.len()
+        );
+        for line in &added {
+            diff.push_str(&format!("+{line}\n"));
+        }
+        diff.push_str(&format!(
+            "--- a/src/game/consumer.rs\n+++ b/src/game/consumer.rs\n@@ -1,{} +1,1 @@\n",
+            removed.len()
+        ));
+        for line in &removed {
+            diff.push_str(&format!("-{line}\n"));
+        }
+        diff.push_str(&format!("+pub use super::background::{name};\n"));
+        diff
+    }
+
+    /// 宣言の 1 行目が同じでも、宣言全体 (struct のフィールド・enum の variant・属性・
+    /// 複数行の引数リスト・trait の項目) が変わった移動は純粋な移動ではない。
+    /// 旧実装は 1 行目 (`pub struct Shape {` / `pub fn place(`) だけを比べて降格していた。
+    #[test]
+    fn covers_requires_whole_declaration_to_match() {
+        let shape = "pub struct Shape {\n    pub w: f32,\n}";
+        let place = "pub fn place(\n    a: i32,\n) -> i32 {\n    a\n}";
+        // (ラベル, 名前, 移動元で削除した宣言, 移動先で追加した宣言, 純粋な移動か)
+        let cases = [
+            (
+                "struct のフィールド追加",
+                "Shape",
+                shape,
+                "pub struct Shape {\n    pub w: f32,\n    pub h: f32,\n}",
+                false,
+            ),
+            (
+                "struct のフィールドの型変更",
+                "Shape",
+                shape,
+                "pub struct Shape {\n    pub w: f64,\n}",
+                false,
+            ),
+            (
+                "属性の追加",
+                "Shape",
+                shape,
+                "#[derive(Clone)]\npub struct Shape {\n    pub w: f32,\n}",
+                false,
+            ),
+            (
+                "enum の variant 追加",
+                "Mode",
+                "pub enum Mode {\n    A,\n}",
+                "pub enum Mode {\n    A,\n    B,\n}",
+                false,
+            ),
+            (
+                "複数行の引数リストへの引数追加",
+                "place",
+                place,
+                "pub fn place(\n    a: i32,\n    b: i32,\n) -> i32 {\n    a + b\n}",
+                false,
+            ),
+            (
+                "trait の default 本体の変更",
+                "Draw",
+                "pub trait Draw {\n    fn draw(&self) -> u8 {\n        1\n    }\n}",
+                "pub trait Draw {\n    fn draw(&self) -> u8 {\n        2\n    }\n}",
+                false,
+            ),
+            // 対照: 宣言全体が同じ移動は従来どおり純粋な移動。
+            ("struct をそのまま移動", "Shape", shape, shape, true),
+            (
+                "末尾カンマの有無だけが違う",
+                "Shape",
+                shape,
+                "pub struct Shape {\n    pub w: f32\n}",
+                true,
+            ),
+            (
+                "コメントだけが違う",
+                "Shape",
+                shape,
+                "/// 移動した\npub struct Shape {\n    // 幅\n    pub w: f32,\n}",
+                true,
+            ),
+            (
+                "関数の本体だけの変更",
+                "place",
+                place,
+                "pub fn place(\n    a: i32,\n) -> i32 {\n    a * 2\n}",
+                true,
+            ),
+            (
+                "定数の値だけの変更",
+                "LIMIT",
+                "pub const LIMIT: u32 = 1;",
+                "pub const LIMIT: u32 = 2;",
+                true,
+            ),
+        ];
+        for (label, name, removed, added, expected) in cases {
+            let diff = move_declaration_diff(name, removed, added);
+            let index = build_verified(&diff);
+            assert_eq!(
+                index.covers("src/game/consumer.rs", name, "src/game/background.rs"),
+                expected,
+                "{label}\n{diff}"
+            );
+        }
+    }
+
+    /// 宣言全体を照合できない (new 側を読めない / 旧ソースを復元できない) 場合は、
+    /// 移動と証明できないので降格しない (fail-closed)。
+    #[test]
+    fn covers_is_false_when_declarations_cannot_be_verified() {
+        let shape = "pub struct Shape {\n    pub w: f32,\n}";
+        let diff = move_declaration_diff("Shape", shape, shape);
+        let covers = |index: &ReexportMoveIndex| {
+            index.covers("src/game/consumer.rs", "Shape", "src/game/background.rs")
+        };
+        assert!(covers(&build_verified(&diff)), "前提: 照合できれば移動");
+        // 照合しない索引。
+        assert!(!covers(&ReexportMoveIndex::build(&diff)));
+        // new 側を読めない。
+        let mut index = ReexportMoveIndex::build(&diff);
+        index.verify_declarations(&diff, |_| None::<String>);
+        assert!(!covers(&index));
+        // new 側の内容が diff と食い違い、旧ソースを復元できない。
+        let mut index = ReexportMoveIndex::build(&diff);
+        let sources = new_sources_from_diff(&diff);
+        index.verify_declarations(&diff, |path| {
+            sources
+                .get(path)
+                .map(|source| format!("// 食い違う先頭行\n{source}"))
+        });
+        assert!(!covers(&index));
     }
 }

@@ -849,7 +849,12 @@ pub(super) fn reconcile_declaration_changes(
                 // (変更なし) を採る。複数行のヘッダは関数名の行しか比べていないので補う。
                 if !new_header.is_multi_line()
                     && matches!(symbol_change.kind.as_str(), "function" | "method")
-                    && text_path_compared(&mut changed_line_texts, input, &symbol_change.name)
+                    && text_path_compared(
+                        &mut changed_line_texts,
+                        input,
+                        &symbol_change.name,
+                        &new_header,
+                    )
                 {
                     continue;
                 }
@@ -1031,17 +1036,35 @@ fn unique_header_pair(
 }
 
 /// 行ベースの検出 (`detect_signature_changes`) が `name` の変更前後のシグネチャ行を
-/// 両方見つけられたか。見つけられたなら、1 行のヘッダについては行ベースの結論を採る。
+/// 両方見つけ、かつ `+` 側で選んだ行がこの宣言 (`header`) の名前の行そのものか。
+/// そのときだけ、1 行のヘッダについては行ベースの結論を採る。
+///
+/// 行ベースの検出は名前を含みシグネチャらしく見える最初の行を拾うので、移動しただけの
+/// 同一行 (`export const run = async () => foo(1);` など) が両側で先に見つかると、その囮行
+/// 同士を比べて「変更なし」になる。選んだ行が宣言自身の行でなければ AST の比較へ進める。
 fn text_path_compared(
     changed_line_texts: &mut Option<(Vec<String>, Vec<String>)>,
     input: &DeclarationChangeInput<'_>,
     name: &str,
+    header: &DeclarationHeader,
 ) -> bool {
     let (removed, added) = changed_line_texts.get_or_insert_with(|| {
         super::signature::collect_changed_line_texts(input.file_diff, input.file_path)
     });
-    find_signature_in_lines(removed, name, input.lang_id).is_some()
-        && find_signature_in_lines(added, name, input.lang_id).is_some()
+    if find_signature_in_lines(removed, name, input.lang_id).is_none() {
+        return false;
+    }
+    let Some(added_hit) = find_signature_in_lines(added, name, input.lang_id) else {
+        return false;
+    };
+    // `find_signature_in_lines` は trim 済みの行を返す。宣言の名前の行も trim して比べる
+    // (行末の `\r` もここで落ちる)。読めない行は一致とみなさない。
+    input
+        .source
+        .split(|&b| b == b'\n')
+        .nth(header.first_line)
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .is_some_and(|line| line.trim() == added_hit)
 }
 
 #[cfg(test)]
@@ -1939,5 +1962,70 @@ mod tests {
             "{affected:?}"
         );
         assert_eq!(sig_changes.len(), 1, "{sig_changes:?}");
+    }
+
+    /// 移動しただけの同一行 (名前を含みシグネチャらしく見える囮行) を、行ベースの検出が
+    /// 削除側・追加側の両方で最初に拾っても、それがこの宣言自身の行でなければ AST の
+    /// ヘッダ比較で補う。旧実装は「それらしい行が両側にある」だけで行比較の結論 (囮行同士が
+    /// 同じ = 変更なし) を採り、本物のヘッダの戻り値型・引数の変更を見逃していた。
+    #[test]
+    fn moved_decoy_line_does_not_hide_signature_change() {
+        let path = "src/a.ts";
+        let decoy = "export const run = async () => foo(1);\n";
+        let bar = "export function bar(): number {\n  return 2;\n}\n";
+        let foo = |header: &str, body: &str| format!("{header}\n  {body}\n}}\n");
+        let old = format!(
+            "{decoy}{bar}{}",
+            foo("export function foo(x: number): number {", "return x;")
+        );
+        for (label, header, body) in [
+            (
+                "戻り値型の変更",
+                "export function foo(x: number): string {",
+                "return String(x);",
+            ),
+            (
+                "引数の追加",
+                "export function foo(x: number, y: number): number {",
+                "return x + y;",
+            ),
+        ] {
+            let expected = header.trim_end_matches(" {");
+            // 囮行を foo の直前へ動かす (修正前に見逃した形) / 動かさない (対照)。
+            for (variant, new) in [
+                ("囮行を移動", format!("{bar}{decoy}{}", foo(header, body))),
+                (
+                    "囮行はそのまま",
+                    format!("{decoy}{bar}{}", foo(header, body)),
+                ),
+            ] {
+                let (affected, sig_changes) = run_pass1(LangId::Typescript, path, &old, &new, true);
+                assert_eq!(
+                    change_type_of(&affected, "foo"),
+                    Some("modified"),
+                    "{label} / {variant}: {affected:?}"
+                );
+                let change = sig_changes
+                    .iter()
+                    .find(|sc| sc.name == "foo")
+                    .unwrap_or_else(|| panic!("{label} / {variant}: {sig_changes:?}"));
+                // 行比較で検出した場合は行全体 (末尾の ` {` 付き)、AST 比較で補った場合は
+                // ヘッダだけが入る。どちらでも変更後のヘッダを指していることを確かめる。
+                assert!(
+                    change.new_signature.starts_with(expected),
+                    "{label} / {variant}: {change:?}"
+                );
+            }
+        }
+        // 対照: 囮行を動かしたうえで foo の本体だけを変えた場合はシグネチャ変更にしない。
+        let body_only = format!(
+            "{bar}{decoy}{}",
+            foo("export function foo(x: number): number {", "return x + 0;")
+        );
+        let (_, sig_changes) = run_pass1(LangId::Typescript, path, &old, &body_only, true);
+        assert!(
+            !sig_changes.iter().any(|sc| sc.name == "foo"),
+            "{sig_changes:?}"
+        );
     }
 }

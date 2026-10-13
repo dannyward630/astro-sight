@@ -547,20 +547,24 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
     service.validate_context_inputs(&diff_input, dir, &options)?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    out.write_all(b"{\"changes\":[")?;
-    let mut first = true;
+    // `{"changes":[` は最初の FileImpact を書く直前 (1 件も無ければ解析の完了後) に出す。
+    // 解析の前半 (参照走査の準備など) のエラーで先に出すと、main が出すエラー行が書きかけの
+    // JSON の後ろに付き、出力全体が壊れた JSON になる。
+    let mut opened = false;
     let mut changes_count = 0usize;
     service.analyze_context_streaming(&diff_input, dir, &options, |impact| {
-        if !first {
-            out.write_all(b",")
-                .map_err(|e| anyhow::anyhow!("stdout write failed: {e}"))?;
-        }
+        let separator: &[u8] = if opened { b"," } else { b"{\"changes\":[" };
+        out.write_all(separator)
+            .map_err(|e| anyhow::anyhow!("stdout write failed: {e}"))?;
+        opened = true;
         serde_json::to_writer(&mut out, &impact)
             .map_err(|e| anyhow::anyhow!("json serialization failed: {e}"))?;
-        first = false;
         changes_count += 1;
         Ok(())
     })?;
+    if !opened {
+        out.write_all(b"{\"changes\":[")?;
+    }
     out.write_all(b"]")?;
     // 打ち切りがあれば streaming 出力にも載せる (No silent caps)。空なら従来どおり省略。
     if !truncations.is_empty() {

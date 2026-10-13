@@ -360,6 +360,56 @@ fn impact_staged_analyzes_index_content_not_worktree() {
     );
 }
 
+/// `--staged` は new 側を index から読むので、作業ツリーで消した (移した) 変更ファイルも
+/// 解析する。旧実装は index から読む前に作業ツリーでの存在と境界を確かめてそのファイルを
+/// 読み飛ばし、`context` が空・`impact --hook` が exit 0 になっていた (同じ状態の
+/// `review --staged --hook` は検出するので、コマンド間で結果が食い違っていた)。
+/// 対照として、作業ツリーにファイルを残した場合も同じ結果になることを固定する。
+#[test]
+fn impact_staged_analyzes_file_removed_from_worktree() {
+    for remove_from_worktree in [true, false] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "src/a.ts",
+            "export function foo(x: number): number {\n  return x;\n}\n",
+        );
+        repo.write(
+            "src/use.ts",
+            "import { foo } from './a';\n\nexport function caller(): number {\n  return foo(1);\n}\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/a.ts",
+            "export function foo(x: number, y: number): number {\n  return x + y;\n}\n",
+        );
+        repo.git(["add", "src/a.ts"]);
+        if remove_from_worktree {
+            repo.remove_file("src/a.ts");
+        }
+
+        let context = repo.run_json("context", &["--git", "--staged"]);
+        let change = context["changes"]
+            .as_array()
+            .and_then(|changes| changes.iter().find(|c| c["path"] == "src/a.ts"))
+            .unwrap_or_else(|| {
+                panic!("remove={remove_from_worktree}: src/a.ts を解析すべき: {context}")
+            });
+        assert!(
+            change["impacted_callers"]
+                .as_array()
+                .is_some_and(|callers| callers.iter().any(|c| c["path"] == "src/use.ts")),
+            "remove={remove_from_worktree}: {context}"
+        );
+        let (ok, stderr) = impact_hook(&repo, &["--staged"]);
+        assert!(
+            !ok && stderr.contains("src/use.ts:4"),
+            "remove={remove_from_worktree}: stage した引数追加の呼び出し側でブロックすべき: {stderr}"
+        );
+    }
+}
+
 /// 変更ファイルと末尾が一致するだけの別ファイル (`packages/app/src/util.ts` と
 /// `src/util.ts`) の呼び出し側を、同じファイル内の参照として捨てない。
 #[test]

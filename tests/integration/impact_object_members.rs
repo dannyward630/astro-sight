@@ -715,3 +715,131 @@ fn impact_object_members_dynamic_dependencies_preserve_other_source_low_routing(
         }
     }
 }
+
+/// cross-file 検索に載らなかった (呼び出し元が 1 件も無い) ことを確かめる。
+fn assert_no_object_callers(repo: &TestRepo) {
+    let output = cargo_bin()
+        .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+        .output()
+        .expect("impact");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let context = repo.run_json("context", &["--git"]);
+    let change = &context["changes"][0];
+    for key in ["impacted_callers", "informational_callers"] {
+        assert!(change.get(key).is_none(), "{key}: {context}");
+    }
+}
+
+/// 複数行で書いたオブジェクトは名前が宣言ヘッダ行にしか無く、メンバーの削除・値の変更行には
+/// 名前が出ない。フィルタ 5 (変更行に名前が無いシンボルは cross-file 検索しない) で落とさず、
+/// 1 行で書いた同じ変更と同じ判定にする (旧実装は複数行の形だけ呼び出し元が 0 件で exit 0)。
+#[test]
+fn impact_object_members_multi_line_changes_match_one_line_form() {
+    fn one_line(members: &[&str]) -> String {
+        format!(
+            "export const recordLayout = {{ {} }};\n",
+            members.join(", ")
+        )
+    }
+    fn multi_line(members: &[&str]) -> String {
+        let body: String = members.iter().map(|m| format!("  {m},\n")).collect();
+        format!("export const recordLayout = {{\n{body}}};\n")
+    }
+    // (変更前のメンバー, 変更後のメンバー, 呼び出し側, blocking か)
+    let cases: [(&[&str], &[&str], &str, bool); 4] = [
+        // メンバー削除: 消したメンバーの読み取りは blocking、残ったメンバーは情報提供。
+        (
+            &["key: 1", "extra: 2"],
+            &["key: 1"],
+            "export const extra = recordLayout.extra;",
+            true,
+        ),
+        (
+            &["key: 1", "extra: 2"],
+            &["key: 1"],
+            "export const key = recordLayout.key;",
+            false,
+        ),
+        // 値の変更: 変わった値の読み取りは blocking、変わっていない値は情報提供。
+        (
+            &["key: 1", "options: { level: 10 }"],
+            &["key: 1", "options: { level: 20 }"],
+            "export const level = recordLayout.options.level;",
+            true,
+        ),
+        (
+            &["key: 1", "options: { level: 10 }"],
+            &["key: 1", "options: { level: 20 }"],
+            "export const key = recordLayout.key;",
+            false,
+        ),
+    ];
+    for extension in ["js", "ts", "tsx"] {
+        for (before, after, consumer, blocking) in cases {
+            for form in [one_line as fn(&[&str]) -> String, multi_line] {
+                let repo = object_repo(extension, &form(before), &form(after), consumer);
+                assert_object_impact(&repo, blocking);
+            }
+        }
+        // 対照: メンバーを足しただけの変更は従来どおり cross-file 検索に載せない (フィルタ 3c)。
+        let repo = object_repo(
+            extension,
+            &multi_line(&["key: 1"]),
+            &multi_line(&["key: 1", "extra: 2"]),
+            "export const key = recordLayout.key;",
+        );
+        assert_no_object_callers(&repo);
+    }
+    // `as const` で包んだ複数行のオブジェクトもメンバー削除は検索に載せる。
+    // 対照として、追加だけの変更は従来どおり載せない。
+    for extension in ["ts", "tsx"] {
+        let wrapped = |members: &[&str]| multi_line(members).replace("\n};\n", "\n} as const;\n");
+        let repo = object_repo(
+            extension,
+            &wrapped(&["key: 1", "extra: 2"]),
+            &wrapped(&["key: 1"]),
+            "export const extra = recordLayout.extra;",
+        );
+        assert_object_impact(&repo, true);
+        let repo = object_repo(
+            extension,
+            &wrapped(&["key: 1"]),
+            &wrapped(&["key: 1", "extra: 2"]),
+            "export const key = recordLayout.key;",
+        );
+        assert_no_object_callers(&repo);
+    }
+}
+
+/// JS/TS では `$` も識別子の文字。変更行の `$config` を `config` という語に分けて照合すると、
+/// `$config` の変更行に名前が無いと判定して cross-file 検索から落としていた (exit 0)。
+#[test]
+fn impact_object_members_dollar_identifier_is_matched_on_changed_lines() {
+    for name in ["$config", "config$", "config"] {
+        let repo = TestRepo::new();
+        repo.write(
+            "config.ts",
+            format!("export const {name} = {{ a: 1, b: 2 }};\n"),
+        );
+        repo.write(
+            "use.ts",
+            format!(
+                "import {{ {name} }} from './config';\n\nexport function readB(): number {{\n  return {name}.b;\n}}\n"
+            ),
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("config.ts", format!("export const {name} = {{ a: 1 }};\n"));
+        let output = cargo_bin()
+            .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+            .output()
+            .expect("impact");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{name}: {stderr}");
+        assert!(stderr.contains("→ use.ts:4"), "{name}: {stderr}");
+    }
+}

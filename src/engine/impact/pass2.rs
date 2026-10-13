@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
+use anyhow::Result;
 use lru::LruCache;
 
 use crate::engine::refs;
@@ -87,7 +88,7 @@ struct SymIndexes {
 }
 
 /// Pass 2 の走査開始前に 1 度だけ用意する構築物。いずれか 1 つでも構築に失敗したら
-/// 走査自体を行わない (呼び出し側は空結果を返す)。
+/// 走査自体を行わず、エラーを呼び出し側へ返す。
 struct Pass2Scan {
     ac: aho_corasick::AhoCorasick,
     files: Vec<std::path::PathBuf>,
@@ -161,13 +162,17 @@ fn build_sym_indexes(
 }
 
 /// AC 事前フィルタ / 走査対象ファイル / rayon pool を構築する。
-/// どれか 1 つでも失敗したら `None` (呼び出し側は cross-file 解析を打ち切る)。
+///
+/// どれか 1 つでも失敗したらエラーを返す (fail-closed)。構築の失敗は「呼び出し元が無い」
+/// 証拠ではないので、空結果として続けると `impact --hook` が未解決の呼び出し元を黙って
+/// 通してしまう (読めないディレクトリが 1 つあるだけで exit 0 になっていた)。
+/// `refs` / `dead-code` と同じく、走査のエラー (権限・不正な除外 glob 等) はそのまま返す。
 fn prepare_scan(
     all_symbol_names: &[String],
     dir: &Path,
     options: &crate::models::impact::ContextAnalysisOptions,
-) -> Option<Pass2Scan> {
-    let ac = refs::build_ac_case_insensitive(all_symbol_names).ok()?;
+) -> Result<Pass2Scan> {
+    let ac = refs::build_ac_case_insensitive(all_symbol_names)?;
 
     // vendor / node_modules / build artifact 等を impact のデフォルト除外にする。
     // 同名メソッドが大量にある 3rd-party 依存や生成物を含めると cross-file 参照が
@@ -194,8 +199,7 @@ fn prepare_scan(
     excluded_dirs.sort_unstable();
     excluded_dirs.dedup();
     let excluded_globs: Vec<&str> = options.exclude_globs.iter().map(String::as_str).collect();
-    let mut files =
-        refs::collect_files_with_excludes(dir, None, &excluded_dirs, &excluded_globs).ok()?;
+    let mut files = refs::collect_files_with_excludes(dir, None, &excluded_dirs, &excluded_globs)?;
     if cargo_aware_bin_exclusion {
         let mut cargo_package_roots: HashMap<std::path::PathBuf, bool> = HashMap::new();
         files.retain(|path| {
@@ -210,9 +214,9 @@ fn prepare_scan(
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(impact_worker_count())
         .build()
-        .ok()?;
+        .map_err(|e| anyhow::anyhow!("Failed to build impact worker pool: {e}"))?;
 
-    Some(Pass2Scan { ac, files, pool })
+    Ok(Pass2Scan { ac, files, pool })
 }
 
 /// 既定の除外リストの `bin` に当たるか (パスのどこかに `bin` セグメントがあるか)。
@@ -296,7 +300,7 @@ pub(super) fn stream_caller_maps_and_defs(
     method_parent_types: &HashMap<String, String>,
     dir: &Path,
     evidence: Pass2Evidence<'_>,
-) -> StreamCallerMaps {
+) -> Result<StreamCallerMaps> {
     let Pass2Evidence {
         options,
         reexport_moves,
@@ -310,7 +314,7 @@ pub(super) fn stream_caller_maps_and_defs(
     let n_sym = all_symbol_names.len();
     let n_fc = file_contexts.len();
 
-    // 解析を打ち切るときに返す空結果。CI 言語 skip と事前構築失敗の両方で使う。
+    // CI 言語 skip で解析を打ち切るときに返す空結果。
     let empty_result = || StreamCallerMaps {
         caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
         low_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
@@ -352,7 +356,7 @@ pub(super) fn stream_caller_maps_and_defs(
     );
     if all_ci && !force {
         crate::commands::log_phase("context.pass2.ci_skip", "applied", 0);
-        return empty_result();
+        return Ok(empty_result());
     }
 
     let SymIndexes {
@@ -360,14 +364,11 @@ pub(super) fn stream_caller_maps_and_defs(
         parent_ix_by_sym,
     } = build_sym_indexes(file_contexts, sym_ix, method_parent_types, n_sym);
 
-    let Some(Pass2Scan {
+    let Pass2Scan {
         ac,
         files,
         pool: rayon_pool,
-    }) = prepare_scan(all_symbol_names, dir, options)
-    else {
-        return empty_result();
-    };
+    } = prepare_scan(all_symbol_names, dir, options)?;
     let ts_barrels = if options.new_side == crate::models::impact::DiffNewSide::WorkingTree {
         TsBarrelIndex::build(dir, &files, file_contexts)
     } else {
@@ -525,13 +526,13 @@ pub(super) fn stream_caller_maps_and_defs(
     let pool = string_pool
         .into_inner()
         .expect("string pool mutex poisoned on unwrap");
-    StreamCallerMaps {
+    Ok(StreamCallerMaps {
         caller_maps: global_maps,
         low_caller_maps: global_low_maps,
         informational_caller_maps: global_informational_maps,
         def_paths_by_ix: global_defs,
         string_pool: pool,
-    }
+    })
 }
 
 /// 2 つの `Vec<TypedCallerMap>` をエントリ単位で重複排除しつつ merge する。

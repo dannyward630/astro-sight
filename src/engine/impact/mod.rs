@@ -206,8 +206,12 @@ where
         return Ok(());
     }
 
+    // `--staged` では変更ファイルを index の内容で解析する (`NewSideSource` 参照)。
+    let new_side_source = NewSideSource::open(options.new_side, dir);
     // 再輸出の移動と削除済み宣言・use の索引を diff 全体から一度だけ構築する。
-    let reexport_moves = ReexportMoveIndex::build(diff_input);
+    let mut reexport_moves = ReexportMoveIndex::build(diff_input);
+    // 「純粋な移動」の証拠として、移動元の旧宣言と移動先の新宣言の全体を AST で照合する。
+    reexport_moves.verify_declarations(diff_input, |path| new_side_source.read_checked(dir, path));
     let t = std::time::Instant::now();
     log_phase("context.pass1", "start", 0);
     let (file_contexts, all_symbol_names, method_parent_types, included_symbols) =
@@ -215,7 +219,7 @@ where
             diff_input,
             &diff_files,
             dir,
-            options.new_side,
+            &new_side_source,
             &reexport_moves,
         );
     log_phase("context.pass1", "end", t.elapsed().as_millis());
@@ -285,7 +289,7 @@ where
             rust_diff_files: &diff_files,
             rust_diff_input: diff_input,
         },
-    );
+    )?;
     log_phase("context.pass2", "end", t.elapsed().as_millis());
     let crate::engine::impact::pass2::StreamCallerMaps {
         mut caller_maps,
@@ -404,6 +408,32 @@ impl NewSideSource {
         }
     }
 
+    /// diff の new 側パス `rel_path` (`dir` 相対) を読んでよいか。
+    ///
+    /// 絶対パスと `..` は常に拒否する。作業ツリーから読むときだけ、実体の存在とワークスペース
+    /// 境界 (symlink で外を指していないか) を確かめる。`--staged` は new 側を index の blob から
+    /// 読み、作業ツリーのファイルを開かないので、作業ツリーで消した (移した) ファイルも読む
+    /// (blob の読み出しは作業ツリーの symlink を辿らない)。
+    fn accessible(&self, dir: &Path, rel_path: &str) -> bool {
+        if !is_safe_diff_path(rel_path) {
+            return false;
+        }
+        match self {
+            Self::WorkingTree => {
+                let file_path = dir.join(rel_path);
+                // fail-closed: canonicalize 失敗時も読まない
+                file_path.exists()
+                    && std::fs::canonicalize(&file_path)
+                        .ok()
+                        .zip(std::fs::canonicalize(dir).ok())
+                        .is_some_and(|(canonical, canonical_dir)| {
+                            canonical.starts_with(&canonical_dir)
+                        })
+            }
+            Self::Index(_) => true,
+        }
+    }
+
     /// 読めなければ食い違った内容で判定しないよう `None` (このファイルは解析しない)。
     fn read(&self, file_path: &Path, rel_path: &str) -> Option<parser::SourceBuf> {
         match self {
@@ -415,6 +445,13 @@ impl NewSideSource {
                 .map(parser::SourceBuf::Vec),
         }
     }
+
+    /// `accessible` を満たすときだけ `rel_path` を読む。
+    fn read_checked(&self, dir: &Path, rel_path: &str) -> Option<parser::SourceBuf> {
+        self.accessible(dir, rel_path)
+            .then(|| self.read(&dir.join(rel_path), rel_path))
+            .flatten()
+    }
 }
 
 /// Pass 1: 変更ファイルをパースし、シンボルを抽出し、cross-file 参照検索が必要なシンボル名を決定する。
@@ -422,7 +459,7 @@ fn collect_affected_symbols(
     diff_input: &str,
     diff_files: &[DiffFile],
     dir: &Path,
-    new_side: crate::models::impact::DiffNewSide,
+    new_side_source: &NewSideSource,
     reexport_moves: &ReexportMoveIndex,
 ) -> (
     Vec<FileContext>,
@@ -439,28 +476,15 @@ fn collect_affected_symbols(
     // 区間しか読まないので、diff 全体ではなく区間だけを渡す。diff 全体を渡すとファイル数 ×
     // diff 長の 2 乗になる (`FileSections` の doc 参照)。結果は diff 全体を渡した場合と同一。
     let file_sections = diff::FileSections::split(diff_input);
-    // `--staged` では変更ファイルを index の内容で解析する (`NewSideSource` 参照)。
-    let new_side_source = NewSideSource::open(new_side, dir);
 
     use crate::commands::log_phase;
     for df in diff_files {
-        if !is_safe_diff_path(&df.new_path) {
+        // 作業ツリーから読むときは実体の存在とワークスペース境界も確かめる。`--staged` は
+        // index から読むので、作業ツリーで消した (移した) ファイルも解析する (`accessible`)。
+        if !new_side_source.accessible(dir, &df.new_path) {
             continue;
         }
-
         let file_path = dir.join(&df.new_path);
-        if !file_path.exists() {
-            continue;
-        }
-
-        // fail-closed: canonicalize 失敗時もスキップ
-        let is_within_boundary = std::fs::canonicalize(&file_path)
-            .ok()
-            .zip(std::fs::canonicalize(dir).ok())
-            .is_some_and(|(canonical, canonical_dir)| canonical.starts_with(&canonical_dir));
-        if !is_within_boundary {
-            continue;
-        }
 
         log_phase(
             &format!("context.pass1.file path={}", df.new_path),
@@ -556,26 +580,19 @@ fn collect_affected_symbols(
         // テストシンボルとローカルスコープ変数を affected から除外。
         // ローカル変数（関数内 const/let 等）はファイル外への影響を持たないため、
         // affected_symbols 出力と cross-file 伝播の両方からノイズを除去する。
+        //
+        // 判定は affected を作った元のシンボル (`original`) で行い、以降の cross-file
+        // 収録判定と親型の解決にも同じ組を持ち回る。名前で「hunk に重なる最初の同名
+        // シンボル」を引き直すと、直前にある同名のローカル const・入れ子の関数・非公開
+        // メソッドを対象に判定し、本来の公開関数を落とす (全言語で起きる)。
         let t = std::time::Instant::now();
-        let mut affected: Vec<AffectedSymbol> = affected_raw
+        let (mut originals, mut affected): (Vec<&Symbol>, Vec<AffectedSymbol>) = affected_raw
             .into_iter()
-            .filter_map(|(original, affected)| {
-                // Rust の同名型宣言と impl owner は名前で引き直すと取り違える。
-                // 他言語は既存の名前引き規則を維持する。
-                let matched = if lang_id == LangId::Rust {
-                    Some(original)
-                } else {
-                    find_overlapping_symbol(&syms, &affected.name, &df.hunks)
-                };
-                if let Some(sym) = matched
-                    && (is_in_test_context(root, &source, &sym.range, lang_id, &df.new_path)
-                        || symbols::is_local_scope_symbol(root, &source, lang_id, &sym.range))
-                {
-                    return None;
-                }
-                Some(affected)
+            .filter(|(original, _)| {
+                !(is_in_test_context(root, &source, &original.range, lang_id, &df.new_path)
+                    || symbols::is_local_scope_symbol(root, &source, lang_id, &original.range))
             })
-            .collect();
+            .unzip();
         log_phase(
             &format!("context.pass1.filter n={}", affected.len()),
             "end",
@@ -604,13 +621,23 @@ fn collect_affected_symbols(
             let equivalent_names = crate::engine::rust_cfg::exclusive_const_names(root, &source);
             if !equivalent_names.is_empty() {
                 let mut seen = HashSet::new();
+                // `originals` は affected と同じ並びを保つ (retain は元の順に 1 度ずつ訪れる)。
+                let mut index = 0;
+                let mut kept_originals = Vec::with_capacity(originals.len());
                 affected.retain(|symbol| {
-                    symbol.kind != "constant"
+                    let keep = symbol.kind != "constant"
                         || !equivalent_names.contains(&symbol.name)
-                        || seen.insert((symbol.name.clone(), symbol.change_type.clone()))
+                        || seen.insert((symbol.name.clone(), symbol.change_type.clone()));
+                    if keep {
+                        kept_originals.push(originals[index]);
+                    }
+                    index += 1;
+                    keep
                 });
+                originals = kept_originals;
             }
         }
+        debug_assert_eq!(affected.len(), originals.len());
         let compatible_signature_keys: HashSet<String> = if lang_id == LangId::Rust {
             signature::compatible_rust_alias_signature_names(
                 file_diff,
@@ -738,8 +765,6 @@ fn collect_affected_symbols(
         // 判定材料のうち sym 以外は本ファイルに固定なので、コンテキストは
         // ループの外で 1 度だけ組み立てる。
         let cross_file_filter = filters::CrossFileFilterContext {
-            syms: &impact_syms,
-            hunks: &df.hunks,
             sig_changes: &sig_changes,
             rust_kind_changes: &declaration_proof.rust_kind_changes,
             rust_alias_changes: &declaration_proof.rust_alias_changes,
@@ -750,26 +775,55 @@ fn collect_affected_symbols(
             source: &source,
             lang_id,
             changed_new_lines,
+            deletion_gaps: &changed_line_facts.deletion_gaps,
         };
+        // 収録判定と親型は affected の元のシンボルごとに求める (affected と同じ並び)。
+        // 外側の `None` は cross-file 検索に載せないシンボル、`Some(親型)` は載せるシンボル
+        // (親型の無いシンボルは `Some(None)`)。
+        let included_parents: Vec<Option<Option<String>>> = affected
+            .iter()
+            .zip(&originals)
+            .map(|(sym, original)| {
+                cross_file_filter
+                    .should_include_for_cross_file(sym, original)
+                    .then(|| {
+                        find_parent_type_name(root, &source, &original.range, lang_id)
+                            .map(|parent| ci_key(lang_id, &parent))
+                    })
+            })
+            .collect();
+        // `method_parent_types` は名前だけを鍵にするので、同じファイルで同名の収録シンボルの
+        // 親型が 1 つに決まる場合だけ登録する。親型の無い同名シンボル (自由関数) や別の型の
+        // 同名メソッドが混ざる場合は、どれかの親型で呼び出し元を絞ると取り違えるため登録しない。
+        let mut agreed_parents: HashMap<String, Option<String>> = HashMap::new();
+        for (sym, parent) in affected.iter().zip(&included_parents) {
+            let Some(parent) = parent else {
+                continue;
+            };
+            agreed_parents
+                .entry(ci_key(lang_id, &sym.name))
+                .and_modify(|agreed| {
+                    if agreed != parent {
+                        *agreed = None;
+                    }
+                })
+                .or_insert_with(|| parent.clone());
+        }
         let mut cross_file_symbol_keys: HashSet<String> = HashSet::new();
-        for sym in &affected {
-            let sym_key = ci_key(lang_id, &sym.name);
-            if !cross_file_filter.should_include_for_cross_file(sym) {
+        for (sym, parent) in affected.iter().zip(&included_parents) {
+            if parent.is_none() {
                 continue;
             }
+            let sym_key = ci_key(lang_id, &sym.name);
             // この FileContext にとっての cross-file 検索対象に追加。
             // すでに別ファイル経由でグローバル set に登録済みでも、本ファイル
             // 固有のルーティング判定は失われない。
             cross_file_symbol_keys.insert(sym_key.clone());
             included_symbols.insert(sym_key.clone());
-            if let Some(orig) = find_overlapping_symbol(&syms, &sym.name, &df.hunks)
-                && let Some(parent_type) =
-                    find_parent_type_name(root, &source, &orig.range, lang_id)
-            {
-                let parent_key = ci_key(lang_id, &parent_type);
+            if let Some(Some(parent_key)) = agreed_parents.get(&sym_key) {
                 method_parent_types.insert(sym_key.clone(), parent_key.clone());
                 if symbol_name_set.insert(parent_key.clone()) {
-                    all_symbol_names.push(parent_key);
+                    all_symbol_names.push(parent_key.clone());
                 }
             }
             if symbol_name_set.insert(sym_key.clone()) {
@@ -1017,16 +1071,6 @@ fn symbol_overlaps_hunks(sym: &crate::models::symbol::Symbol, hunks: &[HunkInfo]
             hunk_start <= sym.range.end.line && hunk_end > sym.range.start.line
         }
     })
-}
-
-/// 指定名のシンボルのうち、いずれかの hunk とオーバーラップする最初のものを返す。
-fn find_overlapping_symbol<'a>(
-    syms: &'a [crate::models::symbol::Symbol],
-    name: &str,
-    hunks: &[HunkInfo],
-) -> Option<&'a crate::models::symbol::Symbol> {
-    syms.iter()
-        .find(|s| s.name == name && symbol_overlaps_hunks(s, hunks))
 }
 
 /// 指定されたソース範囲を包含する最深の AST ノードを返す。
