@@ -656,6 +656,11 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
     // なり、更新済みの呼び出し側で "Unresolved impacts found" と誤ってブロックする。
     // 変更ファイルのパスは事前に canonicalize してキャッシュする (O(M) syscall)。
     let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
+    // API 互換と判定された変更は impact の blocking 判定からも除く。
+    // 互換判定器は作業ツリーを読むため、`--staged` では index と作業ツリーが一致すると
+    // 確認できたときだけ使う (差異があれば保守的に従来どおり blocking を維持する)。
+    let compatible_symbols =
+        compatible_impact_symbols(dir, base, git, staged, &diff_files, &result.changes);
     let resolution = DiffCallerResolution::build(
         dir,
         result.changes.iter().map(|c| c.path.as_str()),
@@ -680,16 +685,33 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
 
         for caller in &change.impacted_callers {
             // caller が diff 内で未解決か (変更ファイル内 / 更新済みの呼び出し行でないか) を判定
-            if !resolution.is_resolved(dir, &caller.path, caller.line) {
-                unresolved
-                    .entry(change.path.clone())
-                    .or_default()
-                    .push(UnresolvedCaller {
-                        path: caller.path.clone(),
-                        line: caller.line,
-                        symbols: caller.symbols.clone(),
-                    });
+            if resolution.is_resolved(dir, &caller.path, caller.line) {
+                continue;
             }
+
+            // 1 つの caller が複数の変更シンボルを参照することがある。互換と証明できた
+            // シンボルだけを除き、残るシンボル (または空の証拠) は blocking のままにする。
+            let unresolved_symbols: Vec<String> = caller
+                .symbols
+                .iter()
+                .filter(|symbol| {
+                    !compatible_symbols
+                        .get(&change.path)
+                        .is_some_and(|names| names.contains(*symbol))
+                })
+                .cloned()
+                .collect();
+            if !caller.symbols.is_empty() && unresolved_symbols.is_empty() {
+                continue;
+            }
+            unresolved
+                .entry(change.path.clone())
+                .or_default()
+                .push(UnresolvedCaller {
+                    path: caller.path.clone(),
+                    line: caller.line,
+                    symbols: unresolved_symbols,
+                });
         }
     }
 
@@ -733,6 +755,71 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
     }
 
     std::process::exit(1);
+}
+
+/// review が互換と分類したシンボルを impact の非 blocking 集合へ変換する。
+fn compatible_impact_symbols(
+    dir: &str,
+    base: &str,
+    git: bool,
+    staged: bool,
+    diff_files: &[crate::models::impact::DiffFile],
+    changes: &[crate::models::impact::FileImpact],
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    let empty = std::collections::BTreeMap::new();
+    if !git
+        || !changes
+            .iter()
+            .any(|change| !change.signature_changes.is_empty())
+    {
+        return empty;
+    }
+    // detect_api_changes は新側ソースを作業ツリーから読む。index 差分の結果を別内容で
+    // 判定しないよう、staged mode では index と作業ツリーの一致を先に確認する。
+    if staged && !worktree_matches_index(dir) {
+        return empty;
+    }
+
+    api_changes::detect_api_changes(dir, base, diff_files)
+        .compatible_modified
+        .into_iter()
+        .fold(std::collections::BTreeMap::new(), |mut by_file, change| {
+            by_file
+                .entry(change.file)
+                .or_insert_with(std::collections::BTreeSet::new)
+                .insert(change.name);
+            by_file
+        })
+}
+
+/// 作業ツリーが index と異なる場合、staged impact に worktree ベースの API 判定を混ぜない。
+fn worktree_matches_index(dir: &str) -> bool {
+    if crate::git_support::index_snapshot_tree(dir).is_some() {
+        return false;
+    }
+    let mut diff = crate::git_support::git_command_for_dir(dir);
+    let Ok(status) = diff
+        .args(["diff", "--quiet", "--"])
+        .current_dir(dir)
+        .stderr(std::process::Stdio::null())
+        .status()
+    else {
+        return false;
+    };
+    if !status.success() {
+        return false;
+    }
+
+    let mut untracked = crate::git_support::git_command_for_dir(dir);
+    let Ok(output) = untracked
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .current_dir(dir)
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && output.stdout.is_empty()
 }
 
 pub fn cmd_doctor(output: OutputOptions) -> Result<()> {

@@ -6071,14 +6071,93 @@ fn impact_rust_new_marker_impl_keeps_its_owner() {
 
 /// `impact --git` を実行し、(exit code, stderr) を返す。
 fn run_impact_git(repo: &TestRepo) -> (Option<i32>, String) {
+    run_impact_git_with_args(repo, &[])
+}
+
+fn run_impact_git_with_args(repo: &TestRepo, extra_args: &[&str]) -> (Option<i32>, String) {
     let output = cargo_bin()
         .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+        .args(extra_args)
         .output()
         .expect("failed to run astro-sight");
     (
         output.status.code(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+/// review と同じ互換分類を impact に適用する。追加した末尾 default 引数を省略する
+/// 既存 call はそのまま有効なので、作業ツリー / index のどちらでも blocking にしない。
+#[test]
+fn impact_allows_unchanged_calls_after_compatible_defaulted_parameter() {
+    for staged in [false, true] {
+        let repo = TestRepo::new();
+        repo.write(
+            "library.ts",
+            "export function formatLabel(value: string) { return value.trim(); }\n",
+        );
+        repo.write(
+            "consumer.ts",
+            "import { formatLabel } from './library';\nconsole.log(formatLabel(' Ready '));\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "library.ts",
+            "export function formatLabel(value: string, options: { verbose?: boolean } = {}) {\n  return value.trim();\n}\n",
+        );
+        if staged {
+            repo.stage_all();
+        }
+
+        let review = if staged {
+            repo.run_json("review", &["--git", "--staged"])
+        } else {
+            repo.run_json("review", &["--git"])
+        };
+        assert!(
+            review["api_changes"]["compatible_modified"]
+                .as_array()
+                .is_some_and(|changes| {
+                    changes.iter().any(|change| {
+                        change["file"] == "library.ts"
+                            && change["name"] == "formatLabel"
+                            && change["reason"] == "trailing_optional_params"
+                    })
+                }),
+            "staged={staged}: {review}"
+        );
+
+        let extra_args = if staged { &["--staged"][..] } else { &[] };
+        let (code, stderr) = run_impact_git_with_args(&repo, extra_args);
+        assert_eq!(code, Some(0), "staged={staged}: {stderr}");
+        assert!(stderr.is_empty(), "staged={staged}: {stderr}");
+    }
+}
+
+/// 互換と判定されたシンボルだけを抑制し、同じ変更ファイルの必須引数追加は blocking に残す。
+#[test]
+fn impact_keeps_incompatible_symbols_blocking_beside_compatible_changes() {
+    let repo = TestRepo::new();
+    repo.write(
+        "library.ts",
+        "export function formatLabel(value: string) { return value.trim(); }\nexport function requireOption(value: string) { return value; }\n",
+    );
+    repo.write(
+        "consumer.ts",
+        "import { formatLabel, requireOption } from './library';\nconsole.log(formatLabel(' Ready '));\nconsole.log(requireOption(' Ready '));\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "library.ts",
+        "export function formatLabel(value: string, options: { verbose?: boolean } = {}) { return value.trim(); }\nexport function requireOption(value: string, required: boolean) { return value; }\n",
+    );
+
+    let (code, stderr) = run_impact_git(&repo);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("consumer.ts:3 [requireOption]"), "{stderr}");
+    assert!(!stderr.contains("consumer.ts:2 [formatLabel]"), "{stderr}");
 }
 
 /// 言語ごとに、変更する公開関数を呼ぶファイルを置く。
