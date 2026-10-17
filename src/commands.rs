@@ -656,17 +656,23 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
     // なり、更新済みの呼び出し側で "Unresolved impacts found" と誤ってブロックする。
     // 変更ファイルのパスは事前に canonicalize してキャッシュする (O(M) syscall)。
     let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
-    // API 互換と判定された変更は impact の blocking 判定からも除く。
-    // 互換判定器は作業ツリーを読むため、`--staged` では index と作業ツリーが一致すると
-    // 確認できたときだけ使う (差異があれば保守的に従来どおり blocking を維持する)。
-    let compatible_symbols =
-        compatible_impact_symbols(dir, base, git, staged, &diff_files, &result.changes);
     let resolution = DiffCallerResolution::build(
         dir,
         result.changes.iter().map(|c| c.path.as_str()),
         &diff_input,
         &diff_files,
     );
+    // 未解決 caller がある場合だけ API 互換証拠を確認する。関数ヘッダ差分は要求しない。
+    let compatible_symbols = if result.changes.iter().any(|change| {
+        change
+            .impacted_callers
+            .iter()
+            .any(|caller| !resolution.is_resolved(dir, &caller.path, caller.line))
+    }) {
+        compatible_impact_symbols(dir, base, git, staged, &diff_files)
+    } else {
+        std::collections::BTreeMap::new()
+    };
 
     // 未解決の影響をグループ化: diff に含まれないファイルの caller
     // caller ごとに影響シンボルを追跡
@@ -764,14 +770,9 @@ fn compatible_impact_symbols(
     git: bool,
     staged: bool,
     diff_files: &[crate::models::impact::DiffFile],
-    changes: &[crate::models::impact::FileImpact],
 ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
     let empty = std::collections::BTreeMap::new();
-    if !git
-        || !changes
-            .iter()
-            .any(|change| !change.signature_changes.is_empty())
-    {
+    if !git {
         return empty;
     }
     // detect_api_changes は新側ソースを作業ツリーから読む。index 差分の結果を別内容で
@@ -780,16 +781,7 @@ fn compatible_impact_symbols(
         return empty;
     }
 
-    api_changes::detect_api_changes(dir, base, diff_files)
-        .compatible_modified
-        .into_iter()
-        .fold(std::collections::BTreeMap::new(), |mut by_file, change| {
-            by_file
-                .entry(change.file)
-                .or_insert_with(std::collections::BTreeSet::new)
-                .insert(change.name);
-            by_file
-        })
+    api_changes::compatible_impact_names(dir, base, diff_files)
 }
 
 /// 作業ツリーが index と異なる場合、staged impact に worktree ベースの API 判定を混ぜない。
